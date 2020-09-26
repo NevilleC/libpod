@@ -2,16 +2,17 @@ package sysregistriesv2
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 
 	"github.com/BurntSushi/toml"
 	"github.com/containers/image/v5/docker/reference"
 	"github.com/containers/image/v5/types"
+	"github.com/containers/storage/pkg/homedir"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -26,6 +27,16 @@ var systemRegistriesConfPath = builtinRegistriesConfPath
 // DO NOT change this, instead see systemRegistriesConfPath above.
 const builtinRegistriesConfPath = "/etc/containers/registries.conf"
 
+// systemRegistriesConfDirPath is the path to the system-wide registry
+// configuration directory and is used to add/subtract potential registries for
+// obtaining images.  You can override this at build time with
+// -ldflags '-X github.com/containers/image/sysregistries.systemRegistriesConfDirecotyPath=$your_path'
+var systemRegistriesConfDirPath = builtinRegistriesConfDirPath
+
+// builtinRegistriesConfDirPath is the path to the registry configuration directory.
+// DO NOT change this, instead see systemRegistriesConfDirectoryPath above.
+const builtinRegistriesConfDirPath = "/etc/containers/registries.conf.d"
+
 // Endpoint describes a remote location of a registry.
 type Endpoint struct {
 	// The endpoint's remote location.
@@ -34,6 +45,12 @@ type Endpoint struct {
 	// connections will be allowed.
 	Insecure bool `toml:"insecure,omitempty"`
 }
+
+// userRegistriesFile is the path to the per user registry configuration file.
+var userRegistriesFile = filepath.FromSlash(".config/containers/registries.conf")
+
+// userRegistriesDir is the path to the per user registry configuration file.
+var userRegistriesDir = filepath.FromSlash(".config/containers/registries.conf.d")
 
 // rewriteReference will substitute the provided reference `prefix` to the
 // endpoints `location` from the `ref` and creates a new named reference from it.
@@ -49,7 +66,7 @@ func (e *Endpoint) rewriteReference(ref reference.Named, prefix string) (referen
 	if err != nil {
 		return nil, errors.Wrapf(err, "error rewriting reference")
 	}
-	logrus.Debugf("reference rewritten from '%v' to '%v'", refString, newParsedRef.String())
+
 	return newParsedRef, nil
 }
 
@@ -302,29 +319,114 @@ func (config *V2RegistriesConf) postProcess() error {
 		config.UnqualifiedSearchRegistries[i] = registry
 	}
 
+	// Registries are ordered and the first longest prefix always wins,
+	// rendering later items with the same prefix non-existent. We cannot error
+	// out anymore as this might break existing users, so let's just ignore them
+	// to guarantee that the same prefix exists only once.
+	knownPrefixes := make(map[string]bool)
+	uniqueRegistries := []Registry{}
+	for i := range config.Registries {
+		// TODO: should we warn if we see the same prefix being used multiple times?
+		if _, exists := knownPrefixes[config.Registries[i].Prefix]; !exists {
+			knownPrefixes[config.Registries[i].Prefix] = true
+			uniqueRegistries = append(uniqueRegistries, config.Registries[i])
+		}
+	}
+	config.Registries = uniqueRegistries
+
 	return nil
 }
 
 // ConfigPath returns the path to the system-wide registry configuration file.
+// Deprecated: This API implies configuration is read from files, and that there is only one.
+// Please use ConfigurationSourceDescription to obtain a string usable for error messages.
 func ConfigPath(ctx *types.SystemContext) string {
-	confPath := systemRegistriesConfPath
-	if ctx != nil {
-		if ctx.SystemRegistriesConfPath != "" {
-			confPath = ctx.SystemRegistriesConfPath
-		} else if ctx.RootForImplicitAbsolutePaths != "" {
-			confPath = filepath.Join(ctx.RootForImplicitAbsolutePaths, systemRegistriesConfPath)
-		}
+	return newConfigWrapper(ctx).configPath
+}
+
+// ConfigDirPath returns the path to the directory for drop-in
+// registry configuration files.
+// Deprecated: This API implies configuration is read from directories, and that there is only one.
+// Please use ConfigurationSourceDescription to obtain a string usable for error messages.
+func ConfigDirPath(ctx *types.SystemContext) string {
+	configWrapper := newConfigWrapper(ctx)
+	if configWrapper.userConfigDirPath != "" {
+		return configWrapper.userConfigDirPath
 	}
-	return confPath
+	return configWrapper.configDirPath
+}
+
+// configWrapper is used to store the paths from ConfigPath and ConfigDirPath
+// and acts as a key to the internal cache.
+type configWrapper struct {
+	// path to the registries.conf file
+	configPath string
+	// path to system-wide registries.conf.d directory, or "" if not used
+	configDirPath string
+	// path to user specificed registries.conf.d directory, or "" if not used
+	userConfigDirPath string
+}
+
+// newConfigWrapper returns a configWrapper for the specified SystemContext.
+func newConfigWrapper(ctx *types.SystemContext) configWrapper {
+	var wrapper configWrapper
+	userRegistriesFilePath := filepath.Join(homedir.Get(), userRegistriesFile)
+	userRegistriesDirPath := filepath.Join(homedir.Get(), userRegistriesDir)
+
+	// decide configPath using per-user path or system file
+	if ctx != nil && ctx.SystemRegistriesConfPath != "" {
+		wrapper.configPath = ctx.SystemRegistriesConfPath
+	} else if _, err := os.Stat(userRegistriesFilePath); err == nil {
+		// per-user registries.conf exists, not reading system dir
+		// return config dirs from ctx or per-user one
+		wrapper.configPath = userRegistriesFilePath
+		if ctx != nil && ctx.SystemRegistriesConfDirPath != "" {
+			wrapper.configDirPath = ctx.SystemRegistriesConfDirPath
+		} else {
+			wrapper.userConfigDirPath = userRegistriesDirPath
+		}
+		return wrapper
+	} else if ctx != nil && ctx.RootForImplicitAbsolutePaths != "" {
+		wrapper.configPath = filepath.Join(ctx.RootForImplicitAbsolutePaths, systemRegistriesConfPath)
+	} else {
+		wrapper.configPath = systemRegistriesConfPath
+	}
+
+	// potentially use both system and per-user dirs if not using per-user config file
+	if ctx != nil && ctx.SystemRegistriesConfDirPath != "" {
+		// dir explicitly chosen: use only that one
+		wrapper.configDirPath = ctx.SystemRegistriesConfDirPath
+	} else if ctx != nil && ctx.RootForImplicitAbsolutePaths != "" {
+		wrapper.configDirPath = filepath.Join(ctx.RootForImplicitAbsolutePaths, systemRegistriesConfDirPath)
+		wrapper.userConfigDirPath = userRegistriesDirPath
+	} else {
+		wrapper.configDirPath = systemRegistriesConfDirPath
+		wrapper.userConfigDirPath = userRegistriesDirPath
+	}
+
+	return wrapper
+}
+
+// ConfigurationSourceDescription returns a string containres paths of registries.conf and registries.conf.d
+func ConfigurationSourceDescription(ctx *types.SystemContext) string {
+	wrapper := newConfigWrapper(ctx)
+	configSources := []string{wrapper.configPath}
+	if wrapper.configDirPath != "" {
+		configSources = append(configSources, wrapper.configDirPath)
+	}
+	if wrapper.userConfigDirPath != "" {
+		configSources = append(configSources, wrapper.userConfigDirPath)
+	}
+	return strings.Join(configSources, ", ")
 }
 
 // configMutex is used to synchronize concurrent accesses to configCache.
 var configMutex = sync.Mutex{}
 
 // configCache caches already loaded configs with config paths as keys and is
-// used to avoid redudantly parsing configs. Concurrent accesses to the cache
+// used to avoid redundantly parsing configs. Concurrent accesses to the cache
 // are synchronized via configMutex.
-var configCache = make(map[string]*V2RegistriesConf)
+var configCache = make(map[configWrapper]*V2RegistriesConf)
 
 // InvalidateCache invalidates the registry cache.  This function is meant to be
 // used for long-running processes that need to reload potential changes made to
@@ -332,66 +434,118 @@ var configCache = make(map[string]*V2RegistriesConf)
 func InvalidateCache() {
 	configMutex.Lock()
 	defer configMutex.Unlock()
-	configCache = make(map[string]*V2RegistriesConf)
+	configCache = make(map[configWrapper]*V2RegistriesConf)
 }
 
 // getConfig returns the config object corresponding to ctx, loading it if it is not yet cached.
 func getConfig(ctx *types.SystemContext) (*V2RegistriesConf, error) {
-	configPath := ConfigPath(ctx)
-
+	wrapper := newConfigWrapper(ctx)
 	configMutex.Lock()
-	// if the config has already been loaded, return the cached registries
-	if config, inCache := configCache[configPath]; inCache {
+	if config, inCache := configCache[wrapper]; inCache {
 		configMutex.Unlock()
 		return config, nil
 	}
 	configMutex.Unlock()
 
-	return TryUpdatingCache(ctx)
+	return tryUpdatingCache(ctx, wrapper)
+}
+
+// dropInConfigs returns a slice of drop-in-configs from the registries.conf.d
+// directory.
+func dropInConfigs(wrapper configWrapper) ([]string, error) {
+	var (
+		configs  []string
+		dirPaths []string
+	)
+	if wrapper.configDirPath != "" {
+		dirPaths = append(dirPaths, wrapper.configDirPath)
+	}
+	if wrapper.userConfigDirPath != "" {
+		dirPaths = append(dirPaths, wrapper.userConfigDirPath)
+	}
+	for _, dirPath := range dirPaths {
+		err := filepath.Walk(dirPath,
+			// WalkFunc to read additional configs
+			func(path string, info os.FileInfo, err error) error {
+				switch {
+				case err != nil:
+					// return error (could be a permission problem)
+					return err
+				case info == nil:
+					// this should only happen when err != nil but let's be sure
+					return nil
+				case info.IsDir():
+					if path != dirPath {
+						// make sure to not recurse into sub-directories
+						return filepath.SkipDir
+					}
+					// ignore directories
+					return nil
+				default:
+					// only add *.conf files
+					if strings.HasSuffix(path, ".conf") {
+						configs = append(configs, path)
+					}
+					return nil
+				}
+			},
+		)
+
+		if err != nil && !os.IsNotExist(err) {
+			// Ignore IsNotExist errors: most systems won't have a registries.conf.d
+			// directory.
+			return nil, errors.Wrapf(err, "error reading registries.conf.d")
+		}
+	}
+
+	return configs, nil
 }
 
 // TryUpdatingCache loads the configuration from the provided `SystemContext`
 // without using the internal cache. On success, the loaded configuration will
 // be added into the internal registry cache.
 func TryUpdatingCache(ctx *types.SystemContext) (*V2RegistriesConf, error) {
-	configPath := ConfigPath(ctx)
+	return tryUpdatingCache(ctx, newConfigWrapper(ctx))
+}
 
+// tryUpdatingCache implements TryUpdatingCache with an additional configWrapper
+// argument to avoid redundantly calculating the config paths.
+func tryUpdatingCache(ctx *types.SystemContext, wrapper configWrapper) (*V2RegistriesConf, error) {
 	configMutex.Lock()
 	defer configMutex.Unlock()
 
 	// load the config
-	config, err := loadRegistryConf(configPath)
-	if err != nil {
-		// Return an empty []Registry if we use the default config,
-		// which implies that the config path of the SystemContext
-		// isn't set.  Note: if ctx.SystemRegistriesConfPath points to
-		// the default config, we will still return an error.
+	config := &tomlConfig{}
+	if err := config.loadConfig(wrapper.configPath, false); err != nil {
+		// Continue with an empty []Registry if we use the default config, which
+		// implies that the config path of the SystemContext isn't set.
+		//
+		// Note: if ctx.SystemRegistriesConfPath points to the default config,
+		// we will still return an error.
 		if os.IsNotExist(err) && (ctx == nil || ctx.SystemRegistriesConfPath == "") {
-			return &V2RegistriesConf{Registries: []Registry{}}, nil
+			config = &tomlConfig{}
+			config.V2RegistriesConf = V2RegistriesConf{Registries: []Registry{}}
+		} else {
+			return nil, errors.Wrapf(err, "error loading registries configuration %q", wrapper.configPath)
 		}
+	}
+
+	// Load the configs from the conf directory path.
+	dinConfigs, err := dropInConfigs(wrapper)
+	if err != nil {
 		return nil, err
+	}
+	for _, path := range dinConfigs {
+		// Enforce v2 format for drop-in-configs.
+		if err := config.loadConfig(path, true); err != nil {
+			return nil, errors.Wrapf(err, "error loading drop-in registries configuration %q", path)
+		}
 	}
 
 	v2Config := &config.V2RegistriesConf
 
-	// backwards compatibility for v1 configs
-	if config.V1RegistriesConf.Nonempty() {
-		if config.V2RegistriesConf.Nonempty() {
-			return nil, &InvalidRegistries{s: "mixing sysregistry v1/v2 is not supported"}
-		}
-		v2, err := config.V1RegistriesConf.ConvertToV2()
-		if err != nil {
-			return nil, err
-		}
-		v2Config = v2
-	}
-
-	if err := v2Config.postProcess(); err != nil {
-		return nil, err
-	}
-
 	// populate the cache
-	configCache[configPath] = v2Config
+	configCache[wrapper] = v2Config
 	return v2Config, nil
 }
 
@@ -470,16 +624,72 @@ func FindRegistry(ctx *types.SystemContext, ref string) (*Registry, error) {
 	return nil, nil
 }
 
-// Loads the registry configuration file from the filesystem and then unmarshals
-// it.  Returns the unmarshalled object.
-func loadRegistryConf(configPath string) (*tomlConfig, error) {
-	config := &tomlConfig{}
+// loadConfig loads and unmarshals the configuration at the specified path. Note
+// that v1 configs are translated into v2 and are cleared.  Use forceV2 if the
+// config must in the v2 format.
+//
+// Note that specified fields in path will replace already set fields in the
+// tomlConfig.  Only the [[registry]] tables are merged by prefix.
+func (c *tomlConfig) loadConfig(path string, forceV2 bool) error {
+	logrus.Debugf("Loading registries configuration %q", path)
 
-	configBytes, err := ioutil.ReadFile(configPath)
-	if err != nil {
-		return nil, err
+	// Save the registries before decoding the file where they could be lost.
+	// We merge them later again.
+	registryMap := make(map[string]Registry)
+	for i := range c.Registries {
+		registryMap[c.Registries[i].Prefix] = c.Registries[i]
 	}
 
-	err = toml.Unmarshal(configBytes, &config)
-	return config, err
+	// Load the tomlConfig. Note that `DecodeFile` will overwrite set fields.
+	c.Registries = nil // important to clear the memory to prevent us from overlapping fields
+	_, err := toml.DecodeFile(path, c)
+	if err != nil {
+		return err
+	}
+
+	if c.V1RegistriesConf.Nonempty() {
+		// Enforce the v2 format if requested.
+		if forceV2 {
+			return &InvalidRegistries{s: "registry must be in v2 format but is in v1"}
+		}
+
+		// Convert a v1 config into a v2 config.
+		if c.V2RegistriesConf.Nonempty() {
+			return &InvalidRegistries{s: "mixing sysregistry v1/v2 is not supported"}
+		}
+		v2, err := c.V1RegistriesConf.ConvertToV2()
+		if err != nil {
+			return err
+		}
+		c.V1RegistriesConf = V1RegistriesConf{}
+		c.V2RegistriesConf = *v2
+	}
+
+	// Post process registries, set the correct prefixes, sanity checks, etc.
+	if err := c.postProcess(); err != nil {
+		return err
+	}
+
+	// Merge the freshly loaded registries.
+	for i := range c.Registries {
+		registryMap[c.Registries[i].Prefix] = c.Registries[i]
+	}
+
+	// Go maps have a non-deterministic order when iterating the keys, so
+	// we dump them in a slice and sort it to enforce some order in
+	// Registries slice.  Some consumers of c/image (e.g., CRI-O) log the
+	// the configuration where a non-deterministic order could easily cause
+	// confusion.
+	prefixes := []string{}
+	for prefix := range registryMap {
+		prefixes = append(prefixes, prefix)
+	}
+	sort.Strings(prefixes)
+
+	c.Registries = []Registry{}
+	for _, prefix := range prefixes {
+		c.Registries = append(c.Registries, registryMap[prefix])
+	}
+
+	return nil
 }

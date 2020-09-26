@@ -1,9 +1,13 @@
 package integration
 
 import (
+	"fmt"
+	"io/ioutil"
 	"os"
+	"strconv"
+	"strings"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -26,7 +30,7 @@ var _ = Describe("Podman pod start", func() {
 	})
 
 	AfterEach(func() {
-		podmanTest.CleanupPod()
+		podmanTest.Cleanup()
 		f := CurrentGinkgoTestDescription()
 		processTestResult(f)
 
@@ -117,7 +121,11 @@ var _ = Describe("Podman pod start", func() {
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 
-		session = podmanTest.Podman([]string{"pod", "start", "--latest"})
+		podid := "--latest"
+		if IsRemote() {
+			podid = "foobar100"
+		}
+		session = podmanTest.Podman([]string{"pod", "start", podid})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 		Expect(podmanTest.NumberOfContainersRunning()).To(Equal(1))
@@ -135,4 +143,94 @@ var _ = Describe("Podman pod start", func() {
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(125))
 	})
+
+	It("podman pod start single pod via --pod-id-file", func() {
+		tmpDir, err := ioutil.TempDir("", "")
+		Expect(err).To(BeNil())
+		tmpFile := tmpDir + "podID"
+		defer os.RemoveAll(tmpDir)
+
+		podName := "rudolph"
+
+		// Create a pod with --pod-id-file.
+		session := podmanTest.Podman([]string{"pod", "create", "--name", podName, "--pod-id-file", tmpFile})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+
+		// Create container inside the pod.
+		session = podmanTest.Podman([]string{"create", "--pod", podName, ALPINE, "top"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+
+		session = podmanTest.Podman([]string{"pod", "start", "--pod-id-file", tmpFile})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		Expect(podmanTest.NumberOfContainersRunning()).To(Equal(2)) // infra+top
+	})
+
+	It("podman pod start multiple pods via --pod-id-file", func() {
+		tmpDir, err := ioutil.TempDir("", "")
+		Expect(err).To(BeNil())
+		defer os.RemoveAll(tmpDir)
+
+		podIDFiles := []string{}
+		for _, i := range "0123456789" {
+			tmpFile := tmpDir + "cid" + string(i)
+			podName := "rudolph" + string(i)
+			// Create a pod with --pod-id-file.
+			session := podmanTest.Podman([]string{"pod", "create", "--name", podName, "--pod-id-file", tmpFile})
+			session.WaitWithDefaultTimeout()
+			Expect(session.ExitCode()).To(Equal(0))
+
+			// Create container inside the pod.
+			session = podmanTest.Podman([]string{"create", "--pod", podName, ALPINE, "top"})
+			session.WaitWithDefaultTimeout()
+			Expect(session.ExitCode()).To(Equal(0))
+
+			// Append the id files along with the command.
+			podIDFiles = append(podIDFiles, "--pod-id-file")
+			podIDFiles = append(podIDFiles, tmpFile)
+		}
+
+		cmd := []string{"pod", "start"}
+		cmd = append(cmd, podIDFiles...)
+		session := podmanTest.Podman(cmd)
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		Expect(podmanTest.NumberOfContainersRunning()).To(Equal(20)) // 10*(infra+top)
+	})
+
+	It("podman pod create --infra-conmon-pod create + start", func() {
+		tmpDir, err := ioutil.TempDir("", "")
+		Expect(err).To(BeNil())
+		tmpFile := tmpDir + "podID"
+		defer os.RemoveAll(tmpDir)
+
+		podName := "rudolph"
+		// Create a pod with --infra-conmon-pid.
+		session := podmanTest.Podman([]string{"pod", "create", "--name", podName, "--infra-conmon-pidfile", tmpFile})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+
+		session = podmanTest.Podman([]string{"pod", "start", podName})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		Expect(podmanTest.NumberOfContainersRunning()).To(Equal(1)) // infra
+
+		readFirstLine := func(path string) string {
+			content, err := ioutil.ReadFile(path)
+			Expect(err).To(BeNil())
+			return strings.Split(string(content), "\n")[0]
+		}
+
+		// Read the infra-conmon-pidfile and perform some sanity checks
+		// on the pid.
+		infraConmonPID := readFirstLine(tmpFile)
+		_, err = strconv.Atoi(infraConmonPID) // Make sure it's a proper integer
+		Expect(err).To(BeNil())
+
+		cmdline := readFirstLine(fmt.Sprintf("/proc/%s/cmdline", infraConmonPID))
+		Expect(cmdline).To(ContainSubstring("/conmon"))
+	})
+
 })

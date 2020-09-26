@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/containers/libpod/libpod/define"
-	"github.com/containers/libpod/pkg/util"
+	"github.com/containers/podman/v2/libpod/define"
+	"github.com/containers/podman/v2/pkg/util"
 	"github.com/pkg/errors"
 )
 
@@ -90,18 +90,10 @@ func (r *Runtime) LookupPod(idOrName string) (*Pod, error) {
 // output. Multiple filters are handled by ANDing their output, so only pods
 // matching all filters are returned
 func (r *Runtime) Pods(filters ...PodFilter) ([]*Pod, error) {
-	r.lock.RLock()
-	defer r.lock.RUnlock()
-
-	if !r.valid {
-		return nil, define.ErrRuntimeStopped
-	}
-
-	pods, err := r.state.AllPods()
+	pods, err := r.GetAllPods()
 	if err != nil {
 		return nil, err
 	}
-
 	podsFiltered := make([]*Pod, 0, len(pods))
 	for _, pod := range pods {
 		include := true
@@ -181,4 +173,31 @@ func (r *Runtime) GetRunningPods() ([]*Pod, error) {
 		}
 	}
 	return runningPods, nil
+}
+
+// PrunePods removes unused pods and their containers from local storage.
+func (r *Runtime) PrunePods(ctx context.Context) (map[string]error, error) {
+	response := make(map[string]error)
+	states := []string{define.PodStateStopped, define.PodStateExited}
+	filterFunc := func(p *Pod) bool {
+		state, _ := p.GetPodStatus()
+		for _, status := range states {
+			if state == status {
+				return true
+			}
+		}
+		return false
+	}
+	pods, err := r.Pods(filterFunc)
+	if err != nil {
+		return nil, err
+	}
+	if len(pods) < 1 {
+		return response, nil
+	}
+	for _, pod := range pods {
+		err := r.removePod(context.TODO(), pod, true, false)
+		response[pod.ID()] = err
+	}
+	return response, nil
 }

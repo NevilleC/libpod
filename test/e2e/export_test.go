@@ -4,7 +4,7 @@ import (
 	"os"
 	"path/filepath"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -34,7 +34,6 @@ var _ = Describe("Podman export", func() {
 	})
 
 	It("podman export output flag", func() {
-		SkipIfRemote()
 		_, ec, cid := podmanTest.RunLsContainer("")
 		Expect(ec).To(Equal(0))
 
@@ -50,7 +49,6 @@ var _ = Describe("Podman export", func() {
 	})
 
 	It("podman container export output flag", func() {
-		SkipIfRemote()
 		_, ec, cid := podmanTest.RunLsContainer("")
 		Expect(ec).To(Equal(0))
 

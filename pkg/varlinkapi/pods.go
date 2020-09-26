@@ -5,17 +5,28 @@ package varlinkapi
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"syscall"
 
-	"github.com/containers/libpod/cmd/podman/shared"
-	"github.com/containers/libpod/cmd/podman/varlink"
-	"github.com/containers/libpod/libpod"
-	"github.com/containers/libpod/pkg/adapter/shortcuts"
+	"github.com/containers/podman/v2/libpod"
+	"github.com/containers/podman/v2/libpod/define"
+	iopodman "github.com/containers/podman/v2/pkg/varlink"
+	"github.com/cri-o/ocicni/pkg/ocicni"
+	"github.com/docker/go-connections/nat"
+	"github.com/pkg/errors"
 )
 
 // CreatePod ...
-func (i *LibpodAPI) CreatePod(call iopodman.VarlinkCall, create iopodman.PodCreate) error {
+func (i *VarlinkAPI) CreatePod(call iopodman.VarlinkCall, create iopodman.PodCreate) error {
 	var options []libpod.PodCreateOption
+	if create.Infra {
+		options = append(options, libpod.WithInfraContainer())
+		nsOptions, err := GetNamespaceOptions(create.Share)
+		if err != nil {
+			return err
+		}
+		options = append(options, nsOptions...)
+	}
 	if create.CgroupParent != "" {
 		options = append(options, libpod.WithPodCgroupParent(create.CgroupParent))
 	}
@@ -36,20 +47,12 @@ func (i *LibpodAPI) CreatePod(call iopodman.VarlinkCall, create iopodman.PodCrea
 		if !create.Infra {
 			return call.ReplyErrorOccurred("you must have an infra container to publish port bindings to the host")
 		}
-		portBindings, err := shared.CreatePortBindings(create.Publish)
+		portBindings, err := CreatePortBindings(create.Publish)
 		if err != nil {
 			return call.ReplyErrorOccurred(err.Error())
 		}
 		options = append(options, libpod.WithInfraContainerPorts(portBindings))
 
-	}
-	if create.Infra {
-		options = append(options, libpod.WithInfraContainer())
-		nsOptions, err := shared.GetNamespaceOptions(create.Share)
-		if err != nil {
-			return err
-		}
-		options = append(options, nsOptions...)
 	}
 	options = append(options, libpod.WithPodCgroups())
 
@@ -61,7 +64,7 @@ func (i *LibpodAPI) CreatePod(call iopodman.VarlinkCall, create iopodman.PodCrea
 }
 
 // ListPods ...
-func (i *LibpodAPI) ListPods(call iopodman.VarlinkCall) error {
+func (i *VarlinkAPI) ListPods(call iopodman.VarlinkCall) error {
 	var (
 		listPods []iopodman.ListPodData
 	)
@@ -70,7 +73,7 @@ func (i *LibpodAPI) ListPods(call iopodman.VarlinkCall) error {
 	if err != nil {
 		return call.ReplyErrorOccurred(err.Error())
 	}
-	opts := shared.PsOptions{}
+	opts := PsOptions{}
 	for _, pod := range pods {
 		listPod, err := makeListPod(pod, opts)
 		if err != nil {
@@ -82,12 +85,12 @@ func (i *LibpodAPI) ListPods(call iopodman.VarlinkCall) error {
 }
 
 // GetPod ...
-func (i *LibpodAPI) GetPod(call iopodman.VarlinkCall, name string) error {
+func (i *VarlinkAPI) GetPod(call iopodman.VarlinkCall, name string) error {
 	pod, err := i.Runtime.LookupPod(name)
 	if err != nil {
 		return call.ReplyPodNotFound(name, err.Error())
 	}
-	opts := shared.PsOptions{}
+	opts := PsOptions{}
 
 	listPod, err := makeListPod(pod, opts)
 	if err != nil {
@@ -98,9 +101,9 @@ func (i *LibpodAPI) GetPod(call iopodman.VarlinkCall, name string) error {
 }
 
 // GetPodsByStatus returns a slice of pods filtered by a libpod status
-func (i *LibpodAPI) GetPodsByStatus(call iopodman.VarlinkCall, statuses []string) error {
+func (i *VarlinkAPI) GetPodsByStatus(call iopodman.VarlinkCall, statuses []string) error {
 	filterFuncs := func(p *libpod.Pod) bool {
-		state, _ := shared.GetPodStatus(p)
+		state, _ := p.GetPodStatus()
 		for _, status := range statuses {
 			if state == status {
 				return true
@@ -120,7 +123,7 @@ func (i *LibpodAPI) GetPodsByStatus(call iopodman.VarlinkCall, statuses []string
 }
 
 // InspectPod ...
-func (i *LibpodAPI) InspectPod(call iopodman.VarlinkCall, name string) error {
+func (i *VarlinkAPI) InspectPod(call iopodman.VarlinkCall, name string) error {
 	pod, err := i.Runtime.LookupPod(name)
 	if err != nil {
 		return call.ReplyPodNotFound(name, err.Error())
@@ -137,7 +140,7 @@ func (i *LibpodAPI) InspectPod(call iopodman.VarlinkCall, name string) error {
 }
 
 // StartPod ...
-func (i *LibpodAPI) StartPod(call iopodman.VarlinkCall, name string) error {
+func (i *VarlinkAPI) StartPod(call iopodman.VarlinkCall, name string) error {
 	pod, err := i.Runtime.LookupPod(name)
 	if err != nil {
 		return call.ReplyPodNotFound(name, err.Error())
@@ -158,7 +161,7 @@ func (i *LibpodAPI) StartPod(call iopodman.VarlinkCall, name string) error {
 }
 
 // StopPod ...
-func (i *LibpodAPI) StopPod(call iopodman.VarlinkCall, name string, timeout int64) error {
+func (i *VarlinkAPI) StopPod(call iopodman.VarlinkCall, name string, timeout int64) error {
 	pod, err := i.Runtime.LookupPod(name)
 	if err != nil {
 		return call.ReplyPodNotFound(name, err.Error())
@@ -172,7 +175,7 @@ func (i *LibpodAPI) StopPod(call iopodman.VarlinkCall, name string, timeout int6
 }
 
 // RestartPod ...
-func (i *LibpodAPI) RestartPod(call iopodman.VarlinkCall, name string) error {
+func (i *VarlinkAPI) RestartPod(call iopodman.VarlinkCall, name string) error {
 	pod, err := i.Runtime.LookupPod(name)
 	if err != nil {
 		return call.ReplyPodNotFound(name, err.Error())
@@ -194,7 +197,7 @@ func (i *LibpodAPI) RestartPod(call iopodman.VarlinkCall, name string) error {
 
 // KillPod kills the running containers in a pod.  If you want to use the default SIGTERM signal,
 // just send a -1 for the signal arg.
-func (i *LibpodAPI) KillPod(call iopodman.VarlinkCall, name string, signal int64) error {
+func (i *VarlinkAPI) KillPod(call iopodman.VarlinkCall, name string, signal int64) error {
 	killSignal := uint(syscall.SIGTERM)
 	if signal != -1 {
 		killSignal = uint(signal)
@@ -213,7 +216,7 @@ func (i *LibpodAPI) KillPod(call iopodman.VarlinkCall, name string, signal int64
 }
 
 // PausePod ...
-func (i *LibpodAPI) PausePod(call iopodman.VarlinkCall, name string) error {
+func (i *VarlinkAPI) PausePod(call iopodman.VarlinkCall, name string) error {
 	pod, err := i.Runtime.LookupPod(name)
 	if err != nil {
 		return call.ReplyPodNotFound(name, err.Error())
@@ -227,7 +230,7 @@ func (i *LibpodAPI) PausePod(call iopodman.VarlinkCall, name string) error {
 }
 
 // UnpausePod ...
-func (i *LibpodAPI) UnpausePod(call iopodman.VarlinkCall, name string) error {
+func (i *VarlinkAPI) UnpausePod(call iopodman.VarlinkCall, name string) error {
 	pod, err := i.Runtime.LookupPod(name)
 	if err != nil {
 		return call.ReplyPodNotFound(name, err.Error())
@@ -241,7 +244,7 @@ func (i *LibpodAPI) UnpausePod(call iopodman.VarlinkCall, name string) error {
 }
 
 // RemovePod ...
-func (i *LibpodAPI) RemovePod(call iopodman.VarlinkCall, name string, force bool) error {
+func (i *VarlinkAPI) RemovePod(call iopodman.VarlinkCall, name string, force bool) error {
 	ctx := getContext()
 	pod, err := i.Runtime.LookupPod(name)
 	if err != nil {
@@ -255,12 +258,12 @@ func (i *LibpodAPI) RemovePod(call iopodman.VarlinkCall, name string, force bool
 }
 
 // GetPodStats ...
-func (i *LibpodAPI) GetPodStats(call iopodman.VarlinkCall, name string) error {
+func (i *VarlinkAPI) GetPodStats(call iopodman.VarlinkCall, name string) error {
 	pod, err := i.Runtime.LookupPod(name)
 	if err != nil {
 		return call.ReplyPodNotFound(name, err.Error())
 	}
-	prevStats := make(map[string]*libpod.ContainerStats)
+	prevStats := make(map[string]*define.ContainerStats)
 	podStats, err := pod.GetPodStats(prevStats)
 	if err != nil {
 		return call.ReplyErrorOccurred(err.Error())
@@ -290,11 +293,11 @@ func (i *LibpodAPI) GetPodStats(call iopodman.VarlinkCall, name string) error {
 	return call.ReplyGetPodStats(pod.ID(), containersStats)
 }
 
-// GetPodsByContext returns a slice of pod ids based on all, latest, or a list
-func (i *LibpodAPI) GetPodsByContext(call iopodman.VarlinkCall, all, latest bool, input []string) error {
+// getPodsByContext returns a slice of pod ids based on all, latest, or a list
+func (i *VarlinkAPI) GetPodsByContext(call iopodman.VarlinkCall, all, latest bool, input []string) error {
 	var podids []string
 
-	pods, err := shortcuts.GetPodsByContext(all, latest, input, i.Runtime)
+	pods, err := getPodsByContext(all, latest, input, i.Runtime)
 	if err != nil {
 		return call.ReplyErrorOccurred(err.Error())
 	}
@@ -305,7 +308,7 @@ func (i *LibpodAPI) GetPodsByContext(call iopodman.VarlinkCall, all, latest bool
 }
 
 // PodStateData returns a container's state data in string format
-func (i *LibpodAPI) PodStateData(call iopodman.VarlinkCall, name string) error {
+func (i *VarlinkAPI) PodStateData(call iopodman.VarlinkCall, name string) error {
 	pod, err := i.Runtime.LookupPod(name)
 	if err != nil {
 		return call.ReplyErrorOccurred(err.Error())
@@ -322,7 +325,7 @@ func (i *LibpodAPI) PodStateData(call iopodman.VarlinkCall, name string) error {
 }
 
 // TopPod provides the top stats for a given or latest pod
-func (i *LibpodAPI) TopPod(call iopodman.VarlinkCall, name string, latest bool, descriptors []string) error {
+func (i *VarlinkAPI) TopPod(call iopodman.VarlinkCall, name string, latest bool, descriptors []string) error {
 	var (
 		pod *libpod.Pod
 		err error
@@ -337,7 +340,7 @@ func (i *LibpodAPI) TopPod(call iopodman.VarlinkCall, name string, latest bool, 
 		return call.ReplyPodNotFound(name, err.Error())
 	}
 
-	podStatus, err := shared.GetPodStatus(pod)
+	podStatus, err := pod.GetPodStatus()
 	if err != nil {
 		return call.ReplyErrorOccurred(fmt.Sprintf("unable to get status for pod %s", pod.ID()))
 	}
@@ -349,4 +352,37 @@ func (i *LibpodAPI) TopPod(call iopodman.VarlinkCall, name string, latest bool, 
 		return call.ReplyErrorOccurred(err.Error())
 	}
 	return call.ReplyTopPod(reply)
+}
+
+// CreatePortBindings iterates ports mappings and exposed ports into a format CNI understands
+func CreatePortBindings(ports []string) ([]ocicni.PortMapping, error) {
+	var portBindings []ocicni.PortMapping
+	// The conversion from []string to natBindings is temporary while mheon reworks the port
+	// deduplication code.  Eventually that step will not be required.
+	_, natBindings, err := nat.ParsePortSpecs(ports)
+	if err != nil {
+		return nil, err
+	}
+	for containerPb, hostPb := range natBindings {
+		var pm ocicni.PortMapping
+		pm.ContainerPort = int32(containerPb.Int())
+		for _, i := range hostPb {
+			var hostPort int
+			var err error
+			pm.HostIP = i.HostIP
+			if i.HostPort == "" {
+				hostPort = containerPb.Int()
+			} else {
+				hostPort, err = strconv.Atoi(i.HostPort)
+				if err != nil {
+					return nil, errors.Wrapf(err, "unable to convert host port to integer")
+				}
+			}
+
+			pm.HostPort = int32(hostPort)
+			pm.Protocol = containerPb.Proto()
+			portBindings = append(portBindings, pm)
+		}
+	}
+	return portBindings, nil
 }

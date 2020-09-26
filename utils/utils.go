@@ -6,8 +6,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 
+	"github.com/containers/podman/v2/libpod/define"
 	"github.com/containers/storage/pkg/archive"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -50,7 +52,7 @@ func ExecCmdWithStdStreams(stdin io.Reader, stdout, stderr io.Writer, env []stri
 
 // ErrDetach is an error indicating that the user manually detached from the
 // container.
-var ErrDetach = errors.New("detached from container")
+var ErrDetach = define.ErrDetach
 
 // CopyDetachable is similar to io.Copy but support a detach key sequence to break out.
 func CopyDetachable(dst io.Writer, src io.Reader, keys []byte) (written int64, err error) {
@@ -65,7 +67,6 @@ func CopyDetachable(dst io.Writer, src io.Reader, keys []byte) (written int64, e
 					break
 				}
 				if i == len(keys)-1 {
-					// src.Close()
 					return 0, ErrDetach
 				}
 				nr, er = src.Read(buf)
@@ -125,4 +126,22 @@ func TarToFilesystem(source string, tarball *os.File) error {
 func Tar(source string) (io.ReadCloser, error) {
 	logrus.Debugf("creating tarball of %s", source)
 	return archive.Tar(source, archive.Uncompressed)
+}
+
+// RemoveScientificNotationFromFloat returns a float without any
+// scientific notation if the number has any.
+// golang does not handle conversion of float64s that have scientific
+// notation in them and otherwise stinks.  please replace this if you have
+// a better implementation.
+func RemoveScientificNotationFromFloat(x float64) (float64, error) {
+	bigNum := strconv.FormatFloat(x, 'g', -1, 64)
+	breakPoint := strings.IndexAny(bigNum, "Ee")
+	if breakPoint > 0 {
+		bigNum = bigNum[:breakPoint]
+	}
+	result, err := strconv.ParseFloat(bigNum, 64)
+	if err != nil {
+		return x, errors.Wrapf(err, "unable to remove scientific number from calculations")
+	}
+	return result, nil
 }

@@ -58,7 +58,7 @@ static const char *_max_user_namespaces = "/proc/sys/user/max_user_namespaces";
 static const char *_unprivileged_user_namespaces = "/proc/sys/kernel/unprivileged_userns_clone";
 
 static int open_files_max_fd;
-fd_set open_files_set;
+static fd_set *open_files_set;
 static uid_t rootless_uid_init;
 static gid_t rootless_gid_init;
 
@@ -108,10 +108,9 @@ do_pause ()
 }
 
 static char **
-get_cmd_line_args (pid_t pid)
+get_cmd_line_args ()
 {
   int fd;
-  char path[PATH_MAX];
   char *buffer;
   size_t allocated;
   size_t used = 0;
@@ -119,11 +118,7 @@ get_cmd_line_args (pid_t pid)
   int i, argc = 0;
   char **argv;
 
-  if (pid)
-    sprintf (path, "/proc/%d/cmdline", pid);
-  else
-    strcpy (path, "/proc/self/cmdline");
-  fd = open (path, O_RDONLY);
+  fd = open ("/proc/self/cmdline", O_RDONLY);
   if (fd < 0)
     return NULL;
 
@@ -196,8 +191,11 @@ can_use_shortcut ()
   return false;
 #endif
 
-  argv = get_cmd_line_args (0);
+  argv = get_cmd_line_args ();
   if (argv == NULL)
+    return false;
+
+  if (strstr (argv[0], "podman") == NULL)
     return false;
 
   for (argc = 0; argv[argc]; argc++)
@@ -207,7 +205,15 @@ can_use_shortcut ()
 
       if (strcmp (argv[argc], "mount") == 0
           || strcmp (argv[argc], "search") == 0
-          || strcmp (argv[argc], "system") == 0)
+          || (strcmp (argv[argc], "system") == 0 && argv[argc+1] && strcmp (argv[argc+1], "service") != 0))
+        {
+          ret = false;
+          break;
+        }
+
+      if (argv[argc+1] != NULL && (strcmp (argv[argc], "container") == 0 ||
+	   strcmp (argv[argc], "image") == 0) &&
+	   strcmp (argv[argc+1], "mount") == 0)
         {
           ret = false;
           break;
@@ -217,6 +223,16 @@ can_use_shortcut ()
   free (argv[0]);
   free (argv);
   return ret;
+}
+
+int
+is_fd_inherited(int fd)
+{
+  if (open_files_set == NULL || fd > open_files_max_fd || fd < 0)
+  {
+    return 0;
+  }
+  return FD_ISSET(fd % FD_SETSIZE, &(open_files_set[fd / FD_SETSIZE])) ? 1 : 0;
 }
 
 static void __attribute__((constructor)) init()
@@ -237,17 +253,39 @@ static void __attribute__((constructor)) init()
   if (d)
     {
       struct dirent *ent;
+      size_t size = 0;
 
-      FD_ZERO (&open_files_set);
       for (ent = readdir (d); ent; ent = readdir (d))
         {
-          int fd = atoi (ent->d_name);
-          if (fd != dirfd (d))
+          int fd;
+
+          if (ent->d_name[0] == '.')
+            continue;
+
+          fd = atoi (ent->d_name);
+          if (fd == dirfd (d))
+            continue;
+
+          if (fd >= size * FD_SETSIZE)
             {
-              if (fd > open_files_max_fd)
-                open_files_max_fd = fd;
-              FD_SET (fd, &open_files_set);
+              int i;
+              size_t new_size;
+
+              new_size = (fd / FD_SETSIZE) + 1;
+              open_files_set = realloc (open_files_set, new_size * sizeof (fd_set));
+              if (open_files_set == NULL)
+                _exit (EXIT_FAILURE);
+
+              for (i = size; i < new_size; i++)
+                FD_ZERO (&(open_files_set[i]));
+
+              size = new_size;
             }
+
+          if (fd > open_files_max_fd)
+            open_files_max_fd = fd;
+
+          FD_SET (fd % FD_SETSIZE, &(open_files_set[fd / FD_SETSIZE]));
         }
       closedir (d);
     }
@@ -266,6 +304,9 @@ static void __attribute__((constructor)) init()
       char path[PATH_MAX];
       const char *const suffix = "/libpod/pause.pid";
       char *cwd = getcwd (NULL, 0);
+      char uid_fmt[16];
+      char gid_fmt[16];
+      size_t len;
 
       if (cwd == NULL)
         {
@@ -273,13 +314,13 @@ static void __attribute__((constructor)) init()
           _exit (EXIT_FAILURE);
         }
 
-      if (strlen (xdg_runtime_dir) >= PATH_MAX - strlen (suffix))
+      len = snprintf (path, PATH_MAX, "%s%s", xdg_runtime_dir, suffix);
+      if (len >= PATH_MAX)
         {
           fprintf (stderr, "invalid value for XDG_RUNTIME_DIR: %s", strerror (ENAMETOOLONG));
           exit (EXIT_FAILURE);
         }
 
-      sprintf (path, "%s%s", xdg_runtime_dir, suffix);
       fd = open (path, O_RDONLY);
       if (fd < 0)
         {
@@ -323,6 +364,13 @@ static void __attribute__((constructor)) init()
           fprintf (stderr, "cannot open %s: %s", path, strerror (errno));
           exit (EXIT_FAILURE);
         }
+
+      sprintf (uid_fmt, "%d", uid);
+      sprintf (gid_fmt, "%d", gid);
+
+      setenv ("_CONTAINERS_USERNS_CONFIGURED", "init", 1);
+      setenv ("_CONTAINERS_ROOTLESS_UID", uid_fmt, 1);
+      setenv ("_CONTAINERS_ROOTLESS_GID", gid_fmt, 1);
 
       r = setns (fd, 0);
       if (r < 0)
@@ -505,14 +553,41 @@ create_pause_process (const char *pause_pid_file_path, char **argv)
     }
 }
 
-int
-reexec_userns_join (int userns, int mountns, char *pause_pid_file_path)
+static int
+open_namespace (int pid_to_join, const char *ns_file)
 {
-  pid_t ppid = getpid ();
+  char ns_path[PATH_MAX];
+  int ret;
+
+  ret = snprintf (ns_path, PATH_MAX, "/proc/%d/ns/%s", pid_to_join, ns_file);
+  if (ret == PATH_MAX)
+    {
+      fprintf (stderr, "internal error: namespace path too long\n");
+      return -1;
+    }
+
+  return open (ns_path, O_CLOEXEC | O_RDONLY);
+}
+
+static void
+join_namespace_or_die (const char *name, int ns_fd)
+{
+  if (setns (ns_fd, 0) < 0)
+    {
+      fprintf (stderr, "cannot set %s namespace\n", name);
+      _exit (EXIT_FAILURE);
+    }
+}
+
+int
+reexec_userns_join (int pid_to_join, char *pause_pid_file_path)
+{
   char uid[16];
   char gid[16];
   char **argv;
   int pid;
+  int mnt_ns = -1;
+  int user_ns = -1;
   char *cwd = getcwd (NULL, 0);
   sigset_t sigset, oldsigset;
 
@@ -525,11 +600,21 @@ reexec_userns_join (int userns, int mountns, char *pause_pid_file_path)
   sprintf (uid, "%d", geteuid ());
   sprintf (gid, "%d", getegid ());
 
-  argv = get_cmd_line_args (ppid);
+  argv = get_cmd_line_args ();
   if (argv == NULL)
     {
       fprintf (stderr, "cannot read argv: %s\n", strerror (errno));
       _exit (EXIT_FAILURE);
+    }
+
+  user_ns = open_namespace (pid_to_join, "user");
+  if (user_ns < 0)
+    return user_ns;
+  mnt_ns = open_namespace (pid_to_join, "mnt");
+  if (mnt_ns < 0)
+    {
+      close (user_ns);
+      return mnt_ns;
     }
 
   pid = fork ();
@@ -538,13 +623,15 @@ reexec_userns_join (int userns, int mountns, char *pause_pid_file_path)
 
   if (pid)
     {
-      /* We passed down these fds, close them.  */
       int f;
+
+      /* We passed down these fds, close them.  */
+      close (user_ns);
+      close (mnt_ns);
+
       for (f = 3; f < open_files_max_fd; f++)
-        {
-          if (FD_ISSET (f, &open_files_set))
-            close (f);
-        }
+        if (open_files_set == NULL || FD_ISSET (f % FD_SETSIZE, &(open_files_set[f / FD_SETSIZE])))
+          close (f);
       return pid;
     }
 
@@ -579,19 +666,10 @@ reexec_userns_join (int userns, int mountns, char *pause_pid_file_path)
       _exit (EXIT_FAILURE);
     }
 
-  if (setns (userns, 0) < 0)
-    {
-      fprintf (stderr, "cannot setns: %s\n", strerror (errno));
-      _exit (EXIT_FAILURE);
-    }
-  close (userns);
-
-  if (mountns >= 0 && setns (mountns, 0) < 0)
-    {
-      fprintf (stderr, "cannot setns: %s\n", strerror (errno));
-      _exit (EXIT_FAILURE);
-    }
-  close (mountns);
+  join_namespace_or_die ("user", user_ns);
+  join_namespace_or_die ("mnt", mnt_ns);
+  close (user_ns);
+  close (mnt_ns);
 
   if (syscall_setresgid (0, 0, 0) < 0)
     {
@@ -692,7 +770,6 @@ reexec_in_user_namespace (int ready, char *pause_pid_file_path, char *file_to_re
   int ret;
   pid_t pid;
   char b;
-  pid_t ppid = getpid ();
   char **argv;
   char uid[16];
   char gid[16];
@@ -735,10 +812,11 @@ reexec_in_user_namespace (int ready, char *pause_pid_file_path, char *file_to_re
           num_fds = strtol (listen_fds, NULL, 10);
           if (num_fds != LONG_MIN && num_fds != LONG_MAX)
             {
-              long i;
-              for (i = 3; i < num_fds + 3; i++)
-                if (FD_ISSET (i, &open_files_set))
-                  close (i);
+              int f;
+
+              for (f = 3; f < num_fds + 3; f++)
+                if (open_files_set == NULL || FD_ISSET (f % FD_SETSIZE, &(open_files_set[f / FD_SETSIZE])))
+                  close (f);
             }
           unsetenv ("LISTEN_PID");
           unsetenv ("LISTEN_FDS");
@@ -768,7 +846,7 @@ reexec_in_user_namespace (int ready, char *pause_pid_file_path, char *file_to_re
       _exit (EXIT_FAILURE);
     }
 
-  argv = get_cmd_line_args (ppid);
+  argv = get_cmd_line_args ();
   if (argv == NULL)
     {
       fprintf (stderr, "cannot read argv: %s\n", strerror (errno));
@@ -792,7 +870,7 @@ reexec_in_user_namespace (int ready, char *pause_pid_file_path, char *file_to_re
       fprintf (stderr, "cannot read from sync pipe: %s\n", strerror (errno));
       _exit (EXIT_FAILURE);
     }
-  if (b != '0')
+  if (ret != 1 || b != '0')
     _exit (EXIT_FAILURE);
 
   if (syscall_setresgid (0, 0, 0) < 0)

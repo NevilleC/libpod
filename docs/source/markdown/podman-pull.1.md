@@ -4,9 +4,13 @@
 podman\-pull - Pull an image from a registry
 
 ## SYNOPSIS
-**podman pull** [*options*] *name*[:*tag*|@*digest*]
+**podman pull** [*options*] *source*
 
-**podman image pull** [*options*] *name*[:*tag*|@*digest*]
+**podman image pull** [*options*] *source*
+
+**podman pull** [*options*] [*transport*]*name*[:*tag*|@*digest*]
+
+**podman image pull** [*options*] [*transport*]*name*[:*tag*|@*digest*]
 
 ## DESCRIPTION
 Copies an image from a registry onto the local machine. **podman pull** pulls an
@@ -17,12 +21,12 @@ print the full image ID.  **podman pull** can also pull an image
 using its digest **podman pull** *image*@*digest*. **podman pull** can be used to pull
 images from archives and local storage using different transports.
 
-## imageID
-Image stored in local container/storage
+## Image storage
+Images are stored in local image storage.
 
 ## SOURCE
 
- The SOURCE is a location to get container images
+ The SOURCE is the location from which the container images are pulled.
  The Image "SOURCE" uses a "transport":"details" format.
 
  Multiple transports are supported:
@@ -68,6 +72,22 @@ Default certificates directory is _/etc/containers/certs.d_. (Not available for 
 The [username[:password]] to use to authenticate with the registry if required.
 If one or both values are not supplied, a command line prompt will appear and the
 value can be entered.  The password is entered without echo.
+
+**--disable-content-trust**
+
+This is a Docker specific option to disable image verification to a Docker
+registry and is not supported by Podman.  This flag is a NOOP and provided
+solely for scripting compatibility.
+
+**--override-arch**=*ARCH*
+Override the architecture, defaults to hosts, of the image to be pulled. For example, `arm`.
+
+**--override-os**=*OS*
+Override the OS, defaults to hosts, of the image to be pulled. For example, `windows`.
+
+**--override-variant**=*VARIANT*
+
+Use _VARIANT_ instead of the default architecture variant of the container image.  Some images can use multiple variants of the arm architectures, such as arm/v5 and arm/v7.
 
 **--quiet**, **-q**
 
@@ -134,11 +154,25 @@ Writing manifest to image destination
 Storing signatures
 03290064078cb797f3e0a530e78c20c13dd22a3dd3adf84a5da2127b48df0438
 ```
+
+```
+$ podman pull --override-arch=arm arm32v7/debian:stretch
+Trying to pull docker.io/arm32v7/debian:stretch...
+Getting image source signatures
+Copying blob b531ae4a3925 done
+Copying config 3cba58dad5 done
+Writing manifest to image destination
+Storing signatures
+3cba58dad5d9b35e755b48b634acb3fdd185ab1c996ac11510cc72c17780e13c
+```
+
 ## FILES
 
 **registries.conf** (`/etc/containers/registries.conf`)
 
 	registries.conf is the configuration file which specifies which container registries should be consulted when completing image names which do not include a registry or domain portion.
+
+NOTE: Use the environment variable `TMPDIR` to change the temporary storage location of downloaded container images. Podman defaults to use `/var/tmp`.
 
 ## SEE ALSO
 podman(1), podman-push(1), podman-login(1), containers-registries.conf(5)

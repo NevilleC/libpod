@@ -14,28 +14,31 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/containers/common/pkg/retry"
 	cp "github.com/containers/image/v5/copy"
 	"github.com/containers/image/v5/directory"
+	"github.com/containers/image/v5/docker/archive"
 	dockerarchive "github.com/containers/image/v5/docker/archive"
 	"github.com/containers/image/v5/docker/reference"
 	"github.com/containers/image/v5/image"
 	"github.com/containers/image/v5/manifest"
 	ociarchive "github.com/containers/image/v5/oci/archive"
+	"github.com/containers/image/v5/oci/layout"
 	is "github.com/containers/image/v5/storage"
 	"github.com/containers/image/v5/tarball"
 	"github.com/containers/image/v5/transports"
 	"github.com/containers/image/v5/transports/alltransports"
 	"github.com/containers/image/v5/types"
-	"github.com/containers/libpod/libpod/driver"
-	"github.com/containers/libpod/libpod/events"
-	"github.com/containers/libpod/pkg/inspect"
-	"github.com/containers/libpod/pkg/registries"
-	"github.com/containers/libpod/pkg/util"
+	"github.com/containers/podman/v2/libpod/driver"
+	"github.com/containers/podman/v2/libpod/events"
+	"github.com/containers/podman/v2/pkg/inspect"
+	"github.com/containers/podman/v2/pkg/registries"
+	"github.com/containers/podman/v2/pkg/util"
 	"github.com/containers/storage"
-	"github.com/opencontainers/go-digest"
+	digest "github.com/opencontainers/go-digest"
 	imgspecv1 "github.com/opencontainers/image-spec/specs-go/v1"
 	ociv1 "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/opentracing/opentracing-go"
+	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -74,6 +77,8 @@ type InfoImage struct {
 	Layers []LayerInfo
 }
 
+const maxRetry = 3
+
 // ImageFilter is a function to determine whether a image is included
 // in command output. Images to be outputted are tested using the function.
 // A true return will include the image, a false return will exclude it.
@@ -99,10 +104,7 @@ func NewImageRuntimeFromOptions(options storage.StoreOptions) (*Runtime, error) 
 	if err != nil {
 		return nil, err
 	}
-
-	return &Runtime{
-		store: store,
-	}, nil
+	return NewImageRuntimeFromStore(store), nil
 }
 
 func setStore(options storage.StoreOptions) (storage.Store, error) {
@@ -114,30 +116,29 @@ func setStore(options storage.StoreOptions) (storage.Store, error) {
 	return store, nil
 }
 
-// newFromStorage creates a new image object from a storage.Image
-func (ir *Runtime) newFromStorage(img *storage.Image) *Image {
-	image := Image{
-		InputName:    img.ID,
+// newImage creates a new image object given an "input name" and a storage.Image
+func (ir *Runtime) newImage(inputName string, img *storage.Image) *Image {
+	return &Image{
+		InputName:    inputName,
 		imageruntime: ir,
 		image:        img,
 	}
-	return &image
+}
+
+// newFromStorage creates a new image object from a storage.Image. Its "input name" will be its ID.
+func (ir *Runtime) newFromStorage(img *storage.Image) *Image {
+	return ir.newImage(img.ID, img)
 }
 
 // NewFromLocal creates a new image object that is intended
 // to only deal with local images already in the store (or
 // its aliases)
 func (ir *Runtime) NewFromLocal(name string) (*Image, error) {
-	image := Image{
-		InputName:    name,
-		imageruntime: ir,
-	}
-	localImage, err := image.getLocalImage()
+	updatedInputName, localImage, err := ir.getLocalImage(name)
 	if err != nil {
 		return nil, err
 	}
-	image.image = localImage
-	return &image, nil
+	return ir.newImage(updatedInputName, localImage), nil
 }
 
 // New creates a new image object where the image could be local
@@ -148,15 +149,10 @@ func (ir *Runtime) New(ctx context.Context, name, signaturePolicyPath, authfile 
 	defer span.Finish()
 
 	// We don't know if the image is local or not ... check local first
-	newImage := Image{
-		InputName:    name,
-		imageruntime: ir,
-	}
 	if pullType != util.PullImageAlways {
-		localImage, err := newImage.getLocalImage()
+		newImage, err := ir.NewFromLocal(name)
 		if err == nil {
-			newImage.image = localImage
-			return &newImage, nil
+			return newImage, nil
 		} else if pullType == util.PullImageNever {
 			return nil, err
 		}
@@ -166,44 +162,205 @@ func (ir *Runtime) New(ctx context.Context, name, signaturePolicyPath, authfile 
 	if signaturePolicyPath == "" {
 		signaturePolicyPath = ir.SignaturePolicyPath
 	}
-	imageName, err := ir.pullImageFromHeuristicSource(ctx, name, writer, authfile, signaturePolicyPath, signingoptions, dockeroptions, label)
+	imageName, err := ir.pullImageFromHeuristicSource(ctx, name, writer, authfile, signaturePolicyPath, signingoptions, dockeroptions, &retry.RetryOptions{MaxRetry: maxRetry}, label)
 	if err != nil {
 		return nil, errors.Wrapf(err, "unable to pull %s", name)
 	}
 
-	newImage.InputName = imageName[0]
-	img, err := newImage.getLocalImage()
+	newImage, err := ir.NewFromLocal(imageName[0])
 	if err != nil {
 		return nil, errors.Wrapf(err, "error retrieving local image after pulling %s", name)
 	}
-	newImage.image = img
-	return &newImage, nil
+	return newImage, nil
+}
+
+// SaveImages stores one more images in a multi-image archive.
+// Note that only `docker-archive` supports storing multiple
+// image.
+func (ir *Runtime) SaveImages(ctx context.Context, namesOrIDs []string, format string, outputFile string, quiet bool) (finalErr error) {
+	if format != DockerArchive {
+		return errors.Errorf("multi-image archives are only supported in in the %q format", DockerArchive)
+	}
+
+	sys := GetSystemContext("", "", false)
+
+	archWriter, err := archive.NewWriter(sys, outputFile)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err := archWriter.Close()
+		if err == nil {
+			return
+		}
+		if finalErr == nil {
+			finalErr = err
+			return
+		}
+		finalErr = errors.Wrap(finalErr, err.Error())
+	}()
+
+	// Decide whether c/image's progress bars should use stderr or stdout.
+	// Use stderr in case we need to be quiet or if the output is set to
+	// stdout.  If the output is set of stdout, any log message there would
+	// corrupt the tarfile.
+	writer := os.Stdout
+	if quiet {
+		writer = os.Stderr
+	}
+
+	// extend an image with additional tags
+	type imageData struct {
+		*Image
+		tags []reference.NamedTagged
+	}
+
+	// Look up the images (and their tags) in the local storage.
+	imageMap := make(map[string]*imageData) // to group tags for an image
+	imageQueue := []string{}                // to preserve relative image order
+	for _, nameOrID := range namesOrIDs {
+		// Look up the name or ID in the local image storage.
+		localImage, err := ir.NewFromLocal(nameOrID)
+		if err != nil {
+			return err
+		}
+		id := localImage.ID()
+
+		iData, exists := imageMap[id]
+		if !exists {
+			imageQueue = append(imageQueue, id)
+			iData = &imageData{Image: localImage}
+			imageMap[id] = iData
+		}
+
+		// Unless we referred to an ID, add the input as a tag.
+		if !strings.HasPrefix(id, nameOrID) {
+			tag, err := NormalizedTag(nameOrID)
+			if err != nil {
+				return err
+			}
+			refTagged, isTagged := tag.(reference.NamedTagged)
+			if isTagged {
+				iData.tags = append(iData.tags, refTagged)
+			}
+		}
+	}
+
+	policyContext, err := getPolicyContext(sys)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := policyContext.Destroy(); err != nil {
+			logrus.Errorf("failed to destroy policy context: %q", err)
+		}
+	}()
+
+	// Now copy the images one-by-one.
+	for _, id := range imageQueue {
+		dest, err := archWriter.NewReference(nil)
+		if err != nil {
+			return err
+		}
+
+		img := imageMap[id]
+		copyOptions := getCopyOptions(sys, writer, nil, nil, SigningOptions{}, "", img.tags)
+		copyOptions.DestinationCtx.SystemRegistriesConfPath = registries.SystemRegistriesConfPath()
+
+		// For copying, we need a source reference that we can create
+		// from the image.
+		src, err := is.Transport.NewStoreReference(img.imageruntime.store, nil, id)
+		if err != nil {
+			return errors.Wrapf(err, "error getting source imageReference for %q", img.InputName)
+		}
+		_, err = cp.Image(ctx, policyContext, dest, src, copyOptions)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// LoadAllImagesFromDockerArchive loads all images from the docker archive that
+// fileName points to.
+func (ir *Runtime) LoadAllImagesFromDockerArchive(ctx context.Context, fileName string, signaturePolicyPath string, writer io.Writer) ([]*Image, error) {
+	if signaturePolicyPath == "" {
+		signaturePolicyPath = ir.SignaturePolicyPath
+	}
+
+	sc := GetSystemContext(signaturePolicyPath, "", false)
+	reader, err := archive.NewReader(sc, fileName)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		if err := reader.Close(); err != nil {
+			logrus.Errorf(err.Error())
+		}
+	}()
+
+	refLists, err := reader.List()
+	if err != nil {
+		return nil, err
+	}
+
+	refPairs := []pullRefPair{}
+	for _, refList := range refLists {
+		for _, ref := range refList {
+			pairs, err := ir.getPullRefPairsFromDockerArchiveReference(ctx, reader, ref, sc)
+			if err != nil {
+				return nil, err
+			}
+			refPairs = append(refPairs, pairs...)
+		}
+	}
+
+	goal := pullGoal{
+		pullAllPairs:         true,
+		usedSearchRegistries: false,
+		refPairs:             refPairs,
+		searchedRegistries:   nil,
+	}
+
+	defer goal.cleanUp()
+	imageNames, err := ir.doPullImage(ctx, sc, goal, writer, SigningOptions{}, &DockerRegistryOptions{}, &retry.RetryOptions{}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	newImages := make([]*Image, 0, len(imageNames))
+	for _, name := range imageNames {
+		newImage, err := ir.NewFromLocal(name)
+		if err != nil {
+			return nil, errors.Wrapf(err, "error retrieving local image after pulling %s", name)
+		}
+		newImages = append(newImages, newImage)
+	}
+	ir.newImageEvent(events.LoadFromArchive, "")
+	return newImages, nil
 }
 
 // LoadFromArchiveReference creates a new image object for images pulled from a tar archive and the like (podman load)
 // This function is needed because it is possible for a tar archive to have multiple tags for one image
 func (ir *Runtime) LoadFromArchiveReference(ctx context.Context, srcRef types.ImageReference, signaturePolicyPath string, writer io.Writer) ([]*Image, error) {
-	var newImages []*Image
-
 	if signaturePolicyPath == "" {
 		signaturePolicyPath = ir.SignaturePolicyPath
 	}
-	imageNames, err := ir.pullImageFromReference(ctx, srcRef, writer, "", signaturePolicyPath, SigningOptions{}, &DockerRegistryOptions{})
+
+	imageNames, err := ir.pullImageFromReference(ctx, srcRef, writer, "", signaturePolicyPath, SigningOptions{}, &DockerRegistryOptions{}, &retry.RetryOptions{})
 	if err != nil {
 		return nil, errors.Wrapf(err, "unable to pull %s", transports.ImageName(srcRef))
 	}
 
+	newImages := make([]*Image, 0, len(imageNames))
 	for _, name := range imageNames {
-		newImage := Image{
-			InputName:    name,
-			imageruntime: ir,
-		}
-		img, err := newImage.getLocalImage()
+		newImage, err := ir.NewFromLocal(name)
 		if err != nil {
 			return nil, errors.Wrapf(err, "error retrieving local image after pulling %s", name)
 		}
-		newImage.image = img
-		newImages = append(newImages, &newImage)
+		newImages = append(newImages, newImage)
 	}
 	ir.newImageEvent(events.LoadFromArchive, "")
 	return newImages, nil
@@ -234,7 +391,7 @@ func (i *Image) reloadImage() error {
 	if err != nil {
 		return errors.Wrapf(err, "unable to reload image")
 	}
-	i.image = newImage.image
+	i.image = newImage
 	return nil
 }
 
@@ -247,60 +404,60 @@ func stripSha256(name string) string {
 }
 
 // getLocalImage resolves an unknown input describing an image and
-// returns a storage.Image or an error. It is used by NewFromLocal.
-func (i *Image) getLocalImage() (*storage.Image, error) {
-	imageError := fmt.Sprintf("unable to find '%s' in local storage", i.InputName)
-	if i.InputName == "" {
-		return nil, errors.Errorf("input name is blank")
+// returns an updated input name, and a storage.Image, or an error. It is used by NewFromLocal.
+func (ir *Runtime) getLocalImage(inputName string) (string, *storage.Image, error) {
+	imageError := fmt.Sprintf("unable to find '%s' in local storage", inputName)
+	if inputName == "" {
+		return "", nil, errors.Errorf("input name is blank")
 	}
 	// Check if the input name has a transport and if so strip it
-	dest, err := alltransports.ParseImageName(i.InputName)
+	dest, err := alltransports.ParseImageName(inputName)
 	if err == nil && dest.DockerReference() != nil {
-		i.InputName = dest.DockerReference().String()
+		inputName = dest.DockerReference().String()
 	}
 
-	img, err := i.imageruntime.getImage(stripSha256(i.InputName))
+	img, err := ir.getImage(stripSha256(inputName))
 	if err == nil {
-		return img.image, err
+		return inputName, img, err
 	}
 
 	// container-storage wasn't able to find it in its current form
 	// check if the input name has a tag, and if not, run it through
 	// again
-	decomposedImage, err := decompose(i.InputName)
+	decomposedImage, err := decompose(inputName)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
 	// The image has a registry name in it and we made sure we looked for it locally
 	// with a tag.  It cannot be local.
 	if decomposedImage.hasRegistry {
-		return nil, errors.Wrapf(ErrNoSuchImage, imageError)
+		return "", nil, errors.Wrapf(ErrNoSuchImage, imageError)
 	}
 	// if the image is saved with the repository localhost, searching with localhost prepended is necessary
 	// We don't need to strip the sha because we have already determined it is not an ID
 	ref, err := decomposedImage.referenceWithRegistry(DefaultLocalRegistry)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
-	img, err = i.imageruntime.getImage(ref.String())
+	img, err = ir.getImage(ref.String())
 	if err == nil {
-		return img.image, err
+		return inputName, img, err
 	}
 
 	// grab all the local images
-	images, err := i.imageruntime.GetImages()
+	images, err := ir.GetImages()
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
 	// check the repotags of all images for a match
 	repoImage, err := findImageInRepotags(decomposedImage, images)
 	if err == nil {
-		return repoImage, nil
+		return inputName, repoImage, nil
 	}
 
-	return nil, errors.Wrapf(ErrNoSuchImage, err.Error())
+	return "", nil, errors.Wrapf(ErrNoSuchImage, err.Error())
 }
 
 // ID returns the image ID as a string
@@ -460,7 +617,7 @@ func (i *Image) Remove(ctx context.Context, force bool) error {
 // getImage retrieves an image matching the given name or hash from system
 // storage
 // If no matching image can be found, an error is returned
-func (ir *Runtime) getImage(image string) (*Image, error) {
+func (ir *Runtime) getImage(image string) (*storage.Image, error) {
 	var img *storage.Image
 	ref, err := is.Transport.ParseStoreReference(ir.store, image)
 	if err == nil {
@@ -476,8 +633,15 @@ func (ir *Runtime) getImage(image string) (*Image, error) {
 		}
 		img = img2
 	}
-	newImage := ir.newFromStorage(img)
-	return newImage, nil
+	return img, nil
+}
+
+func (ir *Runtime) ImageNames(id string) ([]string, error) {
+	myImage, err := ir.getImage(id)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error getting image %s ", id)
+	}
+	return myImage.Names, nil
 }
 
 // GetImages retrieves all images present in storage
@@ -492,11 +656,11 @@ func (ir *Runtime) GetRWImages() ([]*Image, error) {
 
 // getImages retrieves all images present in storage
 func (ir *Runtime) getImages(rwOnly bool) ([]*Image, error) {
-	var newImages []*Image
 	images, err := ir.store.Images()
 	if err != nil {
 		return nil, err
 	}
+	newImages := []*Image{}
 	for _, i := range images {
 		if rwOnly && i.ReadOnly {
 			continue
@@ -529,8 +693,8 @@ func getImageDigest(ctx context.Context, src types.ImageReference, sc *types.Sys
 	return "@" + imageDigest.Hex(), nil
 }
 
-// normalizedTag returns the canonical version of tag for use in Image.Names()
-func normalizedTag(tag string) (reference.Named, error) {
+// NormalizedTag returns the canonical version of tag for use in Image.Names()
+func NormalizedTag(tag string) (reference.Named, error) {
 	decomposedTag, err := decompose(tag)
 	if err != nil {
 		return nil, err
@@ -558,7 +722,7 @@ func (i *Image) TagImage(tag string) error {
 	if err := i.reloadImage(); err != nil {
 		return err
 	}
-	ref, err := normalizedTag(tag)
+	ref, err := NormalizedTag(tag)
 	if err != nil {
 		return err
 	}
@@ -577,15 +741,24 @@ func (i *Image) TagImage(tag string) error {
 	return nil
 }
 
-// UntagImage removes a tag from the given image
+// UntagImage removes the specified tag from the image.
+// If the tag does not exist, ErrNoSuchTag is returned.
 func (i *Image) UntagImage(tag string) error {
 	if err := i.reloadImage(); err != nil {
 		return err
 	}
+
+	// Normalize the tag as we do with TagImage.
+	ref, err := NormalizedTag(tag)
+	if err != nil {
+		return err
+	}
+	tag = ref.String()
+
 	var newTags []string
 	tags := i.Names()
 	if !util.StringInSlice(tag, tags) {
-		return nil
+		return errors.Wrapf(ErrNoSuchTag, "%q", tag)
 	}
 	for _, t := range tags {
 		if tag != t {
@@ -702,18 +875,12 @@ func (i *Image) toImageSourceRef(ctx context.Context) (types.ImageSource, error)
 
 //Size returns the size of the image
 func (i *Image) Size(ctx context.Context) (*uint64, error) {
-	if i.image == nil {
-		localImage, err := i.getLocalImage()
-		if err != nil {
-			return nil, err
-		}
-		i.image = localImage
-	}
-	if sum, err := i.imageruntime.store.ImageSize(i.ID()); err == nil && sum >= 0 {
+	sum, err := i.imageruntime.store.ImageSize(i.ID())
+	if err == nil && sum >= 0 {
 		usum := uint64(sum)
 		return &usum, nil
 	}
-	return nil, errors.Errorf("unable to determine size")
+	return nil, errors.Wrap(err, "unable to determine size")
 }
 
 // toImageRef returns an Image Reference type from an image
@@ -781,6 +948,7 @@ type History struct {
 	CreatedBy string     `json:"createdBy"`
 	Size      int64      `json:"size"`
 	Comment   string     `json:"comment"`
+	Tags      []string   `json:"tags"`
 }
 
 // History gets the history of an image and the IDs of images that are part of
@@ -830,7 +998,8 @@ func (i *Image) History(ctx context.Context) ([]*History, error) {
 		id := "<missing>"
 		if x == numHistories {
 			id = i.ID()
-		} else if layer != nil {
+		}
+		if layer != nil {
 			if !oci.History[x].EmptyLayer {
 				size = layer.UncompressedSize
 			}
@@ -840,14 +1009,17 @@ func (i *Image) History(ctx context.Context) ([]*History, error) {
 				delete(topLayerMap, layer.ID)
 			}
 		}
-
-		allHistory = append(allHistory, &History{
+		h := History{
 			ID:        id,
 			Created:   oci.History[x].Created,
 			CreatedBy: oci.History[x].CreatedBy,
 			Size:      size,
 			Comment:   oci.History[x].Comment,
-		})
+		}
+		if layer != nil {
+			h.Tags = layer.Names
+		}
+		allHistory = append(allHistory, &h)
 
 		if layer != nil && layer.Parent != "" && !oci.History[x].EmptyLayer {
 			layer, err = i.imageruntime.store.Layer(layer.Parent)
@@ -865,22 +1037,77 @@ func (i *Image) Dangling() bool {
 	return len(i.Names()) == 0
 }
 
+// User returns the image's user
+func (i *Image) User(ctx context.Context) (string, error) {
+	imgInspect, err := i.inspect(ctx, false)
+	if err != nil {
+		return "", err
+	}
+	return imgInspect.Config.User, nil
+}
+
+// StopSignal returns the image's StopSignal
+func (i *Image) StopSignal(ctx context.Context) (string, error) {
+	imgInspect, err := i.inspect(ctx, false)
+	if err != nil {
+		return "", err
+	}
+	return imgInspect.Config.StopSignal, nil
+}
+
+// WorkingDir returns the image's WorkingDir
+func (i *Image) WorkingDir(ctx context.Context) (string, error) {
+	imgInspect, err := i.inspect(ctx, false)
+	if err != nil {
+		return "", err
+	}
+	return imgInspect.Config.WorkingDir, nil
+}
+
+// Cmd returns the image's cmd
+func (i *Image) Cmd(ctx context.Context) ([]string, error) {
+	imgInspect, err := i.inspect(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	return imgInspect.Config.Cmd, nil
+}
+
+// Entrypoint returns the image's entrypoint
+func (i *Image) Entrypoint(ctx context.Context) ([]string, error) {
+	imgInspect, err := i.inspect(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	return imgInspect.Config.Entrypoint, nil
+}
+
+// Env returns the image's env
+func (i *Image) Env(ctx context.Context) ([]string, error) {
+	imgInspect, err := i.imageInspectInfo(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return imgInspect.Env, nil
+}
+
 // Labels returns the image's labels
 func (i *Image) Labels(ctx context.Context) (map[string]string, error) {
 	imgInspect, err := i.imageInspectInfo(ctx)
 	if err != nil {
-		return nil, nil
+		return nil, err
 	}
 	return imgInspect.Labels, nil
 }
 
 // GetLabel Returns a case-insensitive match of a given label
 func (i *Image) GetLabel(ctx context.Context, label string) (string, error) {
-	imageLabels, err := i.Labels(ctx)
+	labels, err := i.Labels(ctx)
 	if err != nil {
 		return "", err
 	}
-	for k, v := range imageLabels {
+
+	for k, v := range labels {
 		if strings.ToLower(k) == strings.ToLower(label) {
 			return v, nil
 		}
@@ -898,8 +1125,7 @@ func (i *Image) Annotations(ctx context.Context) (map[string]string, error) {
 		}
 	}
 	annotations := make(map[string]string)
-	switch manifestType {
-	case ociv1.MediaTypeImageManifest:
+	if manifestType == ociv1.MediaTypeImageManifest {
 		var m ociv1.Manifest
 		if err := json.Unmarshal(imageManifest, &m); err == nil {
 			for k, v := range m.Annotations {
@@ -935,12 +1161,7 @@ func (i *Image) imageInspectInfo(ctx context.Context) (*types.ImageInspectInfo, 
 	return i.inspectInfo, nil
 }
 
-// Inspect returns an image's inspect data
-func (i *Image) Inspect(ctx context.Context) (*inspect.ImageData, error) {
-	span, _ := opentracing.StartSpanFromContext(ctx, "imageInspect")
-	span.SetTag("type", "image")
-	defer span.Finish()
-
+func (i *Image) inspect(ctx context.Context, calculateSize bool) (*inspect.ImageData, error) {
 	ociv1Img, err := i.ociv1Image(ctx)
 	if err != nil {
 		ociv1Img = &ociv1.Image{}
@@ -955,8 +1176,10 @@ func (i *Image) Inspect(ctx context.Context) (*inspect.ImageData, error) {
 	}
 
 	size := int64(-1)
-	if usize, err := i.Size(ctx); err == nil {
-		size = int64(*usize)
+	if calculateSize {
+		if usize, err := i.Size(ctx); err == nil {
+			size = int64(*usize)
+		}
 	}
 
 	repoTags, err := i.RepoTags()
@@ -1007,8 +1230,38 @@ func (i *Image) Inspect(ctx context.Context) (*inspect.ImageData, error) {
 		ManifestType: manifestType,
 		User:         ociv1Img.Config.User,
 		History:      ociv1Img.History,
+		NamesHistory: i.NamesHistory(),
+	}
+	if manifestType == manifest.DockerV2Schema2MediaType {
+		hc, err := i.GetHealthCheck(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if hc != nil {
+			data.HealthCheck = hc
+		}
 	}
 	return data, nil
+}
+
+// Inspect returns an image's inspect data
+func (i *Image) Inspect(ctx context.Context) (*inspect.ImageData, error) {
+	span, _ := opentracing.StartSpanFromContext(ctx, "imageInspect")
+
+	span.SetTag("type", "image")
+	defer span.Finish()
+
+	return i.inspect(ctx, true)
+}
+
+// InspectNoSize returns an image's inspect data without calculating the size for the image
+func (i *Image) InspectNoSize(ctx context.Context) (*inspect.ImageData, error) {
+	span, _ := opentracing.StartSpanFromContext(ctx, "imageInspectNoSize")
+
+	span.SetTag("type", "image")
+	defer span.Finish()
+
+	return i.inspect(ctx, false)
 }
 
 // Import imports and image into the store and returns an image
@@ -1031,7 +1284,7 @@ func (ir *Runtime) Import(ctx context.Context, path, reference string, writer io
 		return nil, errors.Wrapf(err, "error updating image config")
 	}
 
-	sc := GetSystemContext("", "", false)
+	sc := GetSystemContext(ir.SignaturePolicyPath, "", false)
 
 	// if reference not given, get the image digest
 	if reference == "" {
@@ -1122,7 +1375,7 @@ func splitString(input string) string {
 // the parent of any other layer in store. Double check that image with that
 // layer exists as well.
 func (i *Image) IsParent(ctx context.Context) (bool, error) {
-	children, err := i.getChildren(ctx, 1)
+	children, err := i.getChildren(ctx, false)
 	if err != nil {
 		if errors.Cause(err) == ErrImageIsBareList {
 			return false, nil
@@ -1171,6 +1424,14 @@ func areParentAndChild(parent, child *imgspecv1.Image) bool {
 	// the child and candidate parent should share all of the
 	// candidate parent's diff IDs, which together would have
 	// controlled which layers were used
+
+	// Both, child and parent, may be nil when the storage is left in an
+	// incoherent state.  Issue #7444 describes such a case when a build
+	// has been killed.
+	if child == nil || parent == nil {
+		return false
+	}
+
 	if len(parent.RootFS.DiffIDs) > len(child.RootFS.DiffIDs) {
 		return false
 	}
@@ -1197,63 +1458,16 @@ func areParentAndChild(parent, child *imgspecv1.Image) bool {
 
 // GetParent returns the image ID of the parent. Return nil if a parent is not found.
 func (i *Image) GetParent(ctx context.Context) (*Image, error) {
-	var childLayer *storage.Layer
-	images, err := i.imageruntime.GetImages()
+	tree, err := i.imageruntime.layerTree()
 	if err != nil {
 		return nil, err
 	}
-	if i.TopLayer() != "" {
-		if childLayer, err = i.imageruntime.store.Layer(i.TopLayer()); err != nil {
-			return nil, err
-		}
-	}
-	// fetch the configuration for the child image
-	child, err := i.ociv1Image(ctx)
-	if err != nil {
-		if errors.Cause(err) == ErrImageIsBareList {
-			return nil, nil
-		}
-		return nil, err
-	}
-	for _, img := range images {
-		if img.ID() == i.ID() {
-			continue
-		}
-		candidateLayer := img.TopLayer()
-		// as a child, our top layer, if we have one, is either the
-		// candidate parent's layer, or one that's derived from it, so
-		// skip over any candidate image where we know that isn't the
-		// case
-		if childLayer != nil {
-			// The child has at least one layer, so a parent would
-			// have a top layer that's either the same as the child's
-			// top layer or the top layer's recorded parent layer,
-			// which could be an empty value.
-			if candidateLayer != childLayer.Parent && candidateLayer != childLayer.ID {
-				continue
-			}
-		} else {
-			// The child has no layers, but the candidate does.
-			if candidateLayer != "" {
-				continue
-			}
-		}
-		// fetch the configuration for the candidate image
-		candidate, err := img.ociv1Image(ctx)
-		if err != nil {
-			return nil, err
-		}
-		// compare them
-		if areParentAndChild(candidate, child) {
-			return img, nil
-		}
-	}
-	return nil, nil
+	return tree.parent(ctx, i)
 }
 
 // GetChildren returns a list of the imageIDs that depend on the image
 func (i *Image) GetChildren(ctx context.Context) ([]string, error) {
-	children, err := i.getChildren(ctx, 0)
+	children, err := i.getChildren(ctx, true)
 	if err != nil {
 		if errors.Cause(err) == ErrImageIsBareList {
 			return nil, nil
@@ -1263,62 +1477,15 @@ func (i *Image) GetChildren(ctx context.Context) ([]string, error) {
 	return children, nil
 }
 
-// getChildren returns a list of at most "max" imageIDs that depend on the image
-func (i *Image) getChildren(ctx context.Context, max int) ([]string, error) {
-	var children []string
-
-	if _, err := i.toImageRef(ctx); err != nil {
-		return nil, nil
-	}
-
-	images, err := i.imageruntime.GetImages()
+// getChildren returns a list of imageIDs that depend on the image. If all is
+// false, only the first child image is returned.
+func (i *Image) getChildren(ctx context.Context, all bool) ([]string, error) {
+	tree, err := i.imageruntime.layerTree()
 	if err != nil {
 		return nil, err
 	}
 
-	// fetch the configuration for the parent image
-	parent, err := i.ociv1Image(ctx)
-	if err != nil {
-		return nil, err
-	}
-	parentLayer := i.TopLayer()
-
-	for _, img := range images {
-		if img.ID() == i.ID() {
-			continue
-		}
-		if img.TopLayer() == "" {
-			if parentLayer != "" {
-				// this image has no layers, but we do, so
-				// it can't be derived from this one
-				continue
-			}
-		} else {
-			candidateLayer, err := img.Layer()
-			if err != nil {
-				return nil, err
-			}
-			// if this image's top layer is not our top layer, and is not
-			// based on our top layer, we can skip it
-			if candidateLayer.Parent != parentLayer && candidateLayer.ID != parentLayer {
-				continue
-			}
-		}
-		// fetch the configuration for the candidate image
-		candidate, err := img.ociv1Image(ctx)
-		if err != nil {
-			return nil, err
-		}
-		// compare them
-		if areParentAndChild(parent, candidate) {
-			children = append(children, img.ID())
-		}
-		// if we're not building an exhaustive list, maybe we're done?
-		if max > 0 && len(children) >= max {
-			break
-		}
-	}
-	return children, nil
+	return tree.children(ctx, i, all)
 }
 
 // InputIsID returns a bool if the user input for an image
@@ -1392,9 +1559,10 @@ func (i *Image) Save(ctx context.Context, source, format, output string, moreTag
 			return errors.Wrapf(err, "error getting OCI archive ImageReference for (%q, %q)", output, destImageName)
 		}
 	case "oci-dir":
-		destRef, err = directory.NewReference(output)
+		destImageName := imageNameForSaveDestination(i, source)
+		destRef, err = layout.NewReference(output, destImageName) // destImageName may be ""
 		if err != nil {
-			return errors.Wrapf(err, "error getting directory ImageReference for %q", output)
+			return errors.Wrapf(err, "error getting the OCI directory ImageReference for (%q, %q)", output, destImageName)
 		}
 		manifestType = imgspecv1.MediaTypeImageManifest
 	case "docker-dir":
@@ -1404,14 +1572,14 @@ func (i *Image) Save(ctx context.Context, source, format, output string, moreTag
 		}
 		manifestType = manifest.DockerV2Schema2MediaType
 	case "docker-archive", "":
-		dst := output
 		destImageName := imageNameForSaveDestination(i, source)
-		if destImageName != "" {
-			dst = fmt.Sprintf("%s:%s", dst, destImageName)
-		}
-		destRef, err = dockerarchive.ParseReference(dst) // FIXME? Add dockerarchive.NewReference
+		ref, err := dockerArchiveDstReference(destImageName)
 		if err != nil {
-			return errors.Wrapf(err, "error getting Docker archive ImageReference for %q", dst)
+			return err
+		}
+		destRef, err = dockerarchive.NewReference(output, ref)
+		if err != nil {
+			return errors.Wrapf(err, "error getting Docker archive ImageReference for %s:%v", output, ref)
 		}
 	default:
 		return errors.Errorf("unknown format option %q", format)
@@ -1429,6 +1597,23 @@ func (i *Image) Save(ctx context.Context, source, format, output string, moreTag
 	}
 	i.newImageEvent(events.Save)
 	return nil
+}
+
+// dockerArchiveDestReference returns a NamedTagged reference for a tagged image and nil for untagged image.
+func dockerArchiveDstReference(normalizedInput string) (reference.NamedTagged, error) {
+	if normalizedInput == "" {
+		return nil, nil
+	}
+	ref, err := reference.ParseNormalizedNamed(normalizedInput)
+	if err != nil {
+		return nil, errors.Wrapf(err, "docker-archive parsing reference %s", normalizedInput)
+	}
+	ref = reference.TagNameOnly(ref)
+	namedTagged, isTagged := ref.(reference.NamedTagged)
+	if !isTagged {
+		namedTagged = nil
+	}
+	return namedTagged, nil
 }
 
 // GetConfigBlob returns a schema2image.  If the image is not a schema2, then
@@ -1483,6 +1668,63 @@ func (i *Image) newImageEvent(status events.Status) {
 	}
 }
 
+// Mount mounts a image's filesystem on the host
+// The path where the image has been mounted is returned
+func (i *Image) Mount(options []string, mountLabel string) (string, error) {
+	defer i.newImageEvent(events.Mount)
+	return i.mount(options, mountLabel)
+}
+
+// Unmount unmounts a image's filesystem on the host
+func (i *Image) Unmount(force bool) error {
+	defer i.newImageEvent(events.Unmount)
+	return i.unmount(force)
+}
+
+// Mounted returns whether the image is mounted and the path it is mounted
+// at (if it is mounted).
+// If the image is not mounted, no error is returned, and the mountpoint
+// will be set to "".
+func (i *Image) Mounted() (bool, string, error) {
+	mountedTimes, err := i.imageruntime.store.Mounted(i.TopLayer())
+	if err != nil {
+		return false, "", err
+	}
+
+	if mountedTimes > 0 {
+		layer, err := i.imageruntime.store.Layer(i.TopLayer())
+		if err != nil {
+			return false, "", err
+		}
+		return true, layer.MountPoint, nil
+	}
+
+	return false, "", nil
+}
+
+// mount mounts the container's root filesystem
+func (i *Image) mount(options []string, mountLabel string) (string, error) {
+	mountPoint, err := i.imageruntime.store.MountImage(i.ID(), options, mountLabel)
+	if err != nil {
+		return "", errors.Wrapf(err, "error mounting storage for image %s", i.ID())
+	}
+	mountPoint, err = filepath.EvalSymlinks(mountPoint)
+	if err != nil {
+		return "", errors.Wrapf(err, "error resolving storage path for image %s", i.ID())
+	}
+	return mountPoint, nil
+}
+
+// unmount unmounts the image's root filesystem
+func (i *Image) unmount(force bool) error {
+	// Also unmount storage
+	if _, err := i.imageruntime.store.UnmountImage(i.ID(), force); err != nil {
+		return errors.Wrapf(err, "error unmounting image %s root filesystem", i.ID())
+	}
+
+	return nil
+}
+
 // LayerInfo keeps information of single layer
 type LayerInfo struct {
 	// Layer ID
@@ -1500,6 +1742,7 @@ type LayerInfo struct {
 
 // GetLayersMapWithImageInfo returns map of image-layers, with associated information like RepoTags, parent and list of child layers.
 func GetLayersMapWithImageInfo(imageruntime *Runtime) (map[string]*LayerInfo, error) {
+	// TODO: evaluate if we can reuse `layerTree` here.
 
 	// Memory allocated to store map of layers with key LayerID.
 	// Map will build dependency chain with ParentID and ChildID(s)
@@ -1523,7 +1766,7 @@ func GetLayersMapWithImageInfo(imageruntime *Runtime) (map[string]*LayerInfo, er
 		}
 	}
 
-	// scan all layers & add all childs for each layers to layerInfo
+	// scan all layers & add all childid's for each layers to layerInfo
 	for _, layer := range layers {
 		_, ok := layerInfoMap[layer.ID]
 		if ok {

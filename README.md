@@ -1,38 +1,40 @@
 ![PODMAN logo](logo/podman-logo-source.svg)
 
-# Library and tool for running OCI-based containers in Pods
+# Podman: A tool for managing OCI containers and pods
 
-Libpod provides a library for applications looking to use the Container Pod concept,
-popularized by Kubernetes.  Libpod also contains the Pod Manager tool `(Podman)`. Podman manages pods, containers, container images, and container volumes.
+Podman (the POD MANager) is a tool for managing containers and images, volumes mounted into those containers, and pods made from groups of containers.
+Podman is based on libpod, a library for container lifecycle management that is also contained in this repository. The libpod library provides APIs for managing containers, pods, container images, and volumes.
 
-* [Latest Version: 1.6.3](https://github.com/containers/libpod/releases/latest)
-* [Continuous Integration:](contrib/cirrus/README.md) [![Build Status](https://api.cirrus-ci.com/github/containers/libpod.svg)](https://cirrus-ci.com/github/containers/libpod/master)
-* [GoDoc: ![GoDoc](https://godoc.org/github.com/containers/libpod/libpod?status.svg)](https://godoc.org/github.com/containers/libpod/libpod)
-* Automated continuous release downloads (including remote-client):
-  * [Latest remote client for Windows](https://storage.googleapis.com/libpod-master-releases/podman-remote-latest-master-windows-amd64.msi)
-  * [Latest remote client for MacOS](https://storage.googleapis.com/libpod-master-releases/podman-remote-latest-master-darwin-amd64.zip)
-  * [Latest Snap package](https://snapcraft.io/podman)
+* [Latest Version: 2.1.0](https://github.com/containers/podman/releases/latest)
+  * Latest Remote client for Windows
+  * Latest Remote client for MacOs
+  * Latest Static Remote client for Linux
+
+* [Continuous Integration:](contrib/cirrus/README.md) [![Build Status](https://api.cirrus-ci.com/github/containers/podman.svg)](https://cirrus-ci.com/github/containers/podman/master)
+* [GoDoc: ![GoDoc](https://godoc.org/github.com/containers/podman/libpod?status.svg)](https://godoc.org/github.com/containers/podman/libpod)
 
 ## Overview and scope
 
-At a high level, the scope of libpod and Podman is the following:
+At a high level, the scope of Podman and libpod is the following:
 
-* Support multiple image formats including the OCI and Docker image formats.
-* Support for multiple means to download images including trust & image verification.
-* Container image management (managing image layers, overlay filesystems, etc).
-* Full management of container lifecycle.
-* Support for pods to manage groups of containers together.
+* Support for multiple container image formats, including OCI and Docker images.
+* Full management of those images, including pulling from various sources (including trust and verification), creating (built via Containerfile or Dockerfile or committed from a container), and pushing to registries and other storage backends.
+* Full management of container lifecycle, including creation (both from an image and from an exploded root filesystem), running, checkpointing and restoring (via CRIU), and removal.
+* Support for pods, groups of containers that share resources and are managed together.
+* Support for running containers and pods without root or other elevated privileges.
 * Resource isolation of containers and pods.
-* Support for a Docker-compatible CLI interface through Podman.
-* Integration with CRI-O to share containers and backend code.
+* Support for a Docker-compatible CLI interface.
+* No manager daemon, for improved security and lower resource utilization at idle.
+* Support for a REST API providing both a Docker-compatible interface and an improved interface exposing advanced Podman functionality.
+* In the future, integration with [CRI-O](https://github.com/cri-o/cri-o) to share containers and backend code.
 
-This project tests all builds against each supported version of Fedora, the latest released version of Red Hat Enterprise Linux, and the latest Ubuntu Long Term Support release. The community has also reported success with other Linux flavors.
+Podman presently only supports running containers on Linux. However, we are building a remote client which can run on Windows and OS X and manage Podman containers on a Linux system via the REST API using SSH tunneling.
 
 ## Roadmap
 
-1. Integrate libpod into CRI-O to replace its existing container management backend
-1. Further work on the podman pod command
-1. Further improvements on rootless containers
+1. Further improvements to the REST API, with a focus on bugfixes and implementing missing functionality
+1. Integrate libpod into [CRI-O](https://github.com/cri-o/cri-o) to replace its existing container management backend
+1. Improvements on rootless containers, with a focus on improving the user experience and exposing presently-unavailable features when possible
 
 ## Communications
 
@@ -43,13 +45,13 @@ For general questions and discussion, please use the
 IRC `#podman` channel on `irc.freenode.net`.
 
 For discussions around issues/bugs and features, you can use the GitHub
-[issues](https://github.com/containers/libpod/issues)
+[issues](https://github.com/containers/podman/issues)
 and
-[PRs](https://github.com/containers/libpod/pulls)
+[PRs](https://github.com/containers/podman/pulls)
 tracking system.
 
 There is also a [mailing list](https://lists.podman.io/archives/) at `lists.podman.io`.
-You can subscribe by sending a message to `podman@lists.podman.io` with the subject `subscribe`.
+You can subscribe by sending a message to `podman-join@lists.podman.io` with the subject `subscribe`.
 
 ## Rootless
 Podman can be easily run as a normal user, without requiring a setuid binary.
@@ -58,40 +60,42 @@ Rootless Podman runs locked-down containers with no privileges that the user run
 Some of these restrictions can be lifted (via `--privileged`, for example), but rootless containers will never have more privileges than the user that launched them.
 If you run Podman as your user and mount in `/etc/passwd` from the host, you still won't be able to change it, since your user doesn't have permission to do so.
 
-Almost all normal Podman functionality is available, though there are some [shortcomings](https://github.com/containers/libpod/blob/master/rootless.md).
-Any recent Podman release should be able to run rootless without any additional configuration, though your operating system may require some additional configuration detailed in the [install guide](https://github.com/containers/libpod/blob/master/install.md).
+Almost all normal Podman functionality is available, though there are some [shortcomings](https://github.com/containers/podman/blob/master/rootless.md).
+Any recent Podman release should be able to run rootless without any additional configuration, though your operating system may require some additional configuration detailed in the [install guide](https://github.com/containers/podman/blob/master/install.md).
 
-A little configuration by an administrator is required before rootless Podman can be used, the necessary setup is documented [here](https://github.com/containers/libpod/blob/master/docs/tutorials/rootless_tutorial.md).
+A little configuration by an administrator is required before rootless Podman can be used, the necessary setup is documented [here](https://github.com/containers/podman/blob/master/docs/tutorials/rootless_tutorial.md).
 
 ## Out of scope
 
-* Specializing in signing and pushing images to various storage backends.
+* Specialized signing and pushing of images to various storage backends.
   See [Skopeo](https://github.com/containers/skopeo/) for those tasks.
-* Container runtimes daemons for working with the Kubernetes CRI interface.
-  [CRI-O](https://github.com/cri-o/cri-o) specializes in that.
+* Support for the Kubernetes CRI interface for container management.
+  The [CRI-O](https://github.com/cri-o/cri-o) daemon specializes in that.
 * Supporting `docker-compose`.  We believe that Kubernetes is the defacto
   standard for composing Pods and for orchestrating containers, making
   Kubernetes YAML a defacto standard file format. Hence, Podman allows the
   creation and execution of Pods from a Kubernetes YAML file (see
-  [podman-play-kube](https://github.com/containers/libpod/blob/master/docs/podman-play-kube.1.md)).
+  [podman-play-kube](https://github.com/containers/podman/blob/master/docs/source/markdown/podman-play-kube.1.md)).
   Podman can also generate Kubernetes YAML based on a container or Pod (see
-  [podman-generate-kube](https://github.com/containers/libpod/blob/master/docs/podman-generate-kube.1.md)),
+  [podman-generate-kube](https://github.com/containers/podman/blob/master/docs/source/markdown/podman-generate-kube.1.md)),
   which allows for an easy transition from a local development environment
   to a production Kubernetes cluster. If Kubernetes does not fit your requirements,
   there are other third-party tools that support the docker-compose format such as
   [kompose](https://github.com/kubernetes/kompose/) and
   [podman-compose](https://github.com/muayyad-alsadi/podman-compose)
-  that might be appropriate for your environment.
+  that might be appropriate for your environment. This situation may change with
+  the addition of the REST API.
 
 ## OCI Projects Plans
 
 The plan is to use OCI projects and best of breed libraries for different aspects:
-- Runtime: [runc](https://github.com/opencontainers/runc) (or any OCI compliant runtime) and [OCI runtime tools](https://github.com/opencontainers/runtime-tools) to generate the spec
-- Images: Image management using [containers/image](https://github.com/containers/image)
-- Storage: Container and image storage is managed by [containers/storage](https://github.com/containers/storage)
-- Networking: Networking support through use of [CNI](https://github.com/containernetworking/cni)
+- Runtime: We use the [OCI runtime tools](https://github.com/opencontainers/runtime-tools) to generate OCI runtime configurations that can be used with any OCI-compliant runtime, like [crun](https://github.com/containers/crun/) and [runc](https://github.com/opencontainers/runc/).
+- Images: Image management uses the [containers/image](https://github.com/containers/image) library.
+- Storage: Container and image storage is managed by [containers/storage](https://github.com/containers/storage).
+- Networking: Networking support through use of [CNI](https://github.com/containernetworking/cni).
 - Builds: Builds are supported via [Buildah](https://github.com/containers/buildah).
-- Conmon: [Conmon](https://github.com/containers/conmon) is a tool for monitoring OCI runtimes.
+- Conmon: [Conmon](https://github.com/containers/conmon) is a tool for monitoring OCI runtimes, used by both Podman and CRI-O.
+- Seccomp: A unified [Seccomp](https://github.com/seccomp/containers-golang) policy for Podman, Buildah, and CRI-O.
 
 ## Podman Information for Developers
 
@@ -103,8 +107,8 @@ Information on how to install Podman in your environment.
 **[OCI Hooks Support](pkg/hooks/README.md)**
 Information on how Podman configures [OCI Hooks][spec-hooks] to run when launching a container.
 
-**[Podman API](API.md)**
-Documentation on the Podman API using [Varlink](https://www.varlink.org/).
+**[Podman API](http://docs.podman.io/en/latest/_static/api.html)**
+Documentation on the Podman REST API. Please note that the API is still in its early stages and not yet stable.
 
 **[Podman Commands](https://podman.readthedocs.io/en/latest/Commands.html)**
 A list of the Podman commands with links to their man pages and in many cases videos
@@ -120,10 +124,10 @@ includes tables showing Docker commands and their Podman equivalent commands.
 **[Tutorials](docs/tutorials)**
 Tutorials on using Podman.
 
-**[Remote Client](https://github.com/containers/libpod/blob/master/docs/tutorials/remote_client.md)**
+**[Remote Client](https://github.com/containers/podman/blob/master/docs/tutorials/remote_client.md)**
 A brief how-to on using the Podman remote-client.
 
-**[Basic Setup and Use of Podman in a Rootless environment](https://github.com/containers/libpod/blob/master/docs/tutorials/rootless_tutorial.md)**
+**[Basic Setup and Use of Podman in a Rootless environment](https://github.com/containers/podman/blob/master/docs/tutorials/rootless_tutorial.md)**
 A tutorial showing the setup and configuration necessary to run Rootless Podman.
 
 **[Release Notes](RELEASE_NOTES.md)**
@@ -140,7 +144,7 @@ Buildah and Podman are two complementary open-source projects that are
 available on most Linux platforms and both projects reside at
 [GitHub.com](https://github.com) with Buildah
 [here](https://github.com/containers/buildah) and Podman
-[here](https://github.com/containers/libpod).  Both, Buildah and Podman are
+[here](https://github.com/containers/podman).  Both, Buildah and Podman are
 command line tools that work on Open Container Initiative (OCI) images and
 containers.  The two projects differentiate in their specialization.
 
@@ -171,3 +175,15 @@ In short, Buildah is an efficient way to create OCI images while Podman allows
 you to manage and maintain those images and containers in a production environment using
 familiar container cli commands.  For more details, see the
 [Container Tools Guide](https://github.com/containers/buildah/tree/master/docs/containertools).
+
+## Podman Legacy API (Varlink)
+Podman offers a [Varlink-based API](https://github.com/containers/podman/blob/master/docs/tutorials/varlink_remote_client.md)
+for remote management of containers. However, this API has been deprecated by the REST API.
+Varlink support is in maintenance mode, and will be removed in a future release.
+For more details, you can see [this blog](https://podman.io/blogs/2020/01/17/podman-new-api.html).
+
+## Static Binary Builds
+The Cirrus CI integration within this repository contains a `static_build` job
+which produces a static Podman binary for testing purposes. Please note that
+this binary is not officially supported with respect to feature-completeness
+and functionality and should be only used for testing.

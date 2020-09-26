@@ -1,9 +1,11 @@
+// +build varlink
+
 package endpoint
 
 import (
 	"os"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )

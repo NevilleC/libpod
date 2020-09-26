@@ -3,13 +3,13 @@ package image
 import (
 	"context"
 	"fmt"
-	"github.com/pkg/errors"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/containers/libpod/pkg/inspect"
+	"github.com/containers/podman/v2/pkg/inspect"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -27,6 +27,26 @@ func CreatedBeforeFilter(createTime time.Time) ResultFilter {
 	return func(i *Image) bool {
 		return i.Created().Before(createTime)
 	}
+}
+
+// IntermediateFilter returns filter for intermediate images (i.e., images
+// with children and no tags).
+func (ir *Runtime) IntermediateFilter(ctx context.Context, images []*Image) (ResultFilter, error) {
+	tree, err := ir.layerTree()
+	if err != nil {
+		return nil, err
+	}
+	return func(i *Image) bool {
+		if len(i.Names()) > 0 {
+			return true
+		}
+		children, err := tree.children(ctx, i, false)
+		if err != nil {
+			logrus.Error(err.Error())
+			return false
+		}
+		return len(children) == 0
+	}, nil
 }
 
 // CreatedAfterFilter allows you to filter on images created after
@@ -102,6 +122,13 @@ func ReferenceFilter(ctx context.Context, referenceFilter string) ResultFilter {
 	}
 }
 
+// IDFilter allows you to filter by image Id
+func IDFilter(idFilter string) ResultFilter {
+	return func(i *Image) bool {
+		return i.ID() == idFilter
+	}
+}
+
 // OutputImageFilter allows you to filter by an a specific image name
 func OutputImageFilter(userImage *Image) ResultFilter {
 	return func(i *Image) bool {
@@ -141,7 +168,7 @@ func (ir *Runtime) createFilterFuncs(filters []string, img *Image) ([]ResultFilt
 				return nil, errors.Wrapf(err, "unable to find image %s in local stores", splitFilter[1])
 			}
 			filterFuncs = append(filterFuncs, CreatedBeforeFilter(before.Created()))
-		case "after":
+		case "since", "after":
 			after, err := ir.NewFromLocal(splitFilter[1])
 			if err != nil {
 				return nil, errors.Wrapf(err, "unable to find image %s in local stores", splitFilter[1])
@@ -163,8 +190,9 @@ func (ir *Runtime) createFilterFuncs(filters []string, img *Image) ([]ResultFilt
 			labelFilter := strings.Join(splitFilter[1:], "=")
 			filterFuncs = append(filterFuncs, LabelFilter(ctx, labelFilter))
 		case "reference":
-			referenceFilter := strings.Join(splitFilter[1:], "=")
-			filterFuncs = append(filterFuncs, ReferenceFilter(ctx, referenceFilter))
+			filterFuncs = append(filterFuncs, ReferenceFilter(ctx, splitFilter[1]))
+		case "id":
+			filterFuncs = append(filterFuncs, IDFilter(splitFilter[1]))
 		default:
 			return nil, errors.Errorf("invalid filter %s ", splitFilter[0])
 		}

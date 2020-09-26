@@ -1,6 +1,6 @@
 # io.podman
 Podman Service Interface and API description.  The master version of this document can be found
-in the [API.md](https://github.com/containers/libpod/blob/master/API.md) file in the upstream libpod repository.
+in the [API.md](https://github.com/containers/podman/blob/master/API.md) file in the upstream libpod repository.
 ## Index
 
 [func Attach(name: string, detachKeys: string, start: bool) ](#Attach)
@@ -95,6 +95,8 @@ in the [API.md](https://github.com/containers/libpod/blob/master/API.md) file in
 
 [func ImageSave(options: ImageSaveOptions) MoreResponse](#ImageSave)
 
+[func ImageTree(name: string, whatRequires: bool) string](#ImageTree)
+
 [func ImagesPrune(all: bool, filter: []string) []string](#ImagesPrune)
 
 [func ImportImage(source: string, reference: string, message: string, changes: []string, delete: bool) string](#ImportImage)
@@ -139,7 +141,7 @@ in the [API.md](https://github.com/containers/libpod/blob/master/API.md) file in
 
 [func Ps(opts: PsOpts) PsContainer](#Ps)
 
-[func PullImage(name: string) MoreResponse](#PullImage)
+[func PullImage(name: string, creds: AuthConfig) MoreResponse](#PullImage)
 
 [func PushImage(name: string, tag: string, compress: bool, format: string, removeSignatures: bool, signBy: string) MoreResponse](#PushImage)
 
@@ -185,6 +187,8 @@ in the [API.md](https://github.com/containers/libpod/blob/master/API.md) file in
 
 [func UnpausePod(name: string) string](#UnpausePod)
 
+[func UntagImage(name: string, tag: string) string](#UntagImage)
+
 [func VolumeCreate(options: VolumeCreateOpts) string](#VolumeCreate)
 
 [func VolumeRemove(options: VolumeRemoveOpts) []string, map[string]](#VolumeRemove)
@@ -192,6 +196,8 @@ in the [API.md](https://github.com/containers/libpod/blob/master/API.md) file in
 [func VolumesPrune() []string, []string](#VolumesPrune)
 
 [func WaitContainer(name: string, interval: int) int](#WaitContainer)
+
+[type AuthConfig](#AuthConfig)
 
 [type BuildInfo](#BuildInfo)
 
@@ -234,6 +240,8 @@ in the [API.md](https://github.com/containers/libpod/blob/master/API.md) file in
 [type InfoHost](#InfoHost)
 
 [type InfoPodmanBinary](#InfoPodmanBinary)
+
+[type InfoRegistry](#InfoRegistry)
 
 [type InfoStore](#InfoStore)
 
@@ -771,6 +779,18 @@ $ varlink call -m unix:/run/podman/io.podman/io.podman.ImageExists '{"name": "im
 
 method ImageSave(options: [ImageSaveOptions](#ImageSaveOptions)) [MoreResponse](#MoreResponse)</div>
 ImageSave allows you to save an image from the local image storage to a tarball
+### <a name="ImageTree"></a>func ImageTree
+<div style="background-color: #E8E8E8; padding: 15px; margin: 10px; border-radius: 10px;">
+
+method ImageTree(name: [string](https://godoc.org/builtin#string), whatRequires: [bool](https://godoc.org/builtin#bool)) [string](https://godoc.org/builtin#string)</div>
+ImageTree returns the image tree for the provided image name or ID
+#### Example
+~~~
+$ varlink call -m unix:/run/podman/io.podman/io.podman.ImageTree '{"name": "alpine"}'
+{
+  "tree":  "Image ID: e7d92cdc71fe\nTags:     [docker.io/library/alpine:latest]\nSize:     5.861MB\nImage Layers\n└──  ID: 5216338b40a7 Size: 5.857MB Top Layer of: [docker.io/library/alpine:latest]\n"
+}
+~~~
 ### <a name="ImagesPrune"></a>func ImagesPrune
 <div style="background-color: #E8E8E8; padding: 15px; margin: 10px; border-radius: 10px;">
 
@@ -1009,7 +1029,7 @@ method Ps(opts: [PsOpts](#PsOpts)) [PsContainer](#PsContainer)</div>
 ### <a name="PullImage"></a>func PullImage
 <div style="background-color: #E8E8E8; padding: 15px; margin: 10px; border-radius: 10px;">
 
-method PullImage(name: [string](https://godoc.org/builtin#string)) [MoreResponse](#MoreResponse)</div>
+method PullImage(name: [string](https://godoc.org/builtin#string), creds: [AuthConfig](#AuthConfig)) [MoreResponse](#MoreResponse)</div>
 PullImage pulls an image from a repository to local storage.  After a successful pull, the image id and logs
 are returned as a [MoreResponse](#MoreResponse).  This connection also will handle a WantsMores request to send
 status as it occurs.
@@ -1061,7 +1081,7 @@ varlink call -m unix:/run/podman/io.podman/io.podman.RemoveImage '{"name": "regi
 
 method RemoveImageWithResponse(name: [string](https://godoc.org/builtin#string), force: [bool](https://godoc.org/builtin#bool)) [RemoveImageResponse](#RemoveImageResponse)</div>
 RemoveImageWithResponse takes the name or ID of an image as well as a boolean that determines if containers using that image
-should be deleted.  If the image cannot be found, an [ImageNotFound](#ImageNotFound) error will be returned. The reponse is
+should be deleted.  If the image cannot be found, an [ImageNotFound](#ImageNotFound) error will be returned. The response is
 in the form of a RemoveImageResponse .
 ### <a name="RemovePod"></a>func RemovePod
 <div style="background-color: #E8E8E8; padding: 15px; margin: 10px; border-radius: 10px;">
@@ -1234,6 +1254,14 @@ $ varlink call -m unix:/run/podman/io.podman/io.podman.UnpausePod '{"name": "foo
   "pod": "1840835294cf076a822e4e12ba4152411f131bd869e7f6a4e8b16df9b0ea5c7f"
 }
 ~~~
+### <a name="UntagImage"></a>func UntagImage
+<div style="background-color: #E8E8E8; padding: 15px; margin: 10px; border-radius: 10px;">
+
+method UntagImage(name: [string](https://godoc.org/builtin#string), tag: [string](https://godoc.org/builtin#string)) [string](https://godoc.org/builtin#string)</div>
+UntagImage takes the name or ID of an image in local storage as well as the
+tag name to be removed.  If the image cannot be found, an
+[ImageNotFound](#ImageNotFound) error will be returned; otherwise, the ID of
+the image is returned on success.
 ### <a name="VolumeCreate"></a>func VolumeCreate
 <div style="background-color: #E8E8E8; padding: 15px; margin: 10px; border-radius: 10px;">
 
@@ -1257,9 +1285,20 @@ WaitContainer takes the name or ID of a container and waits the given interval i
 stops.  Upon stopping, the return code of the container is returned. If the container container cannot be found by ID
 or name, a [ContainerNotFound](#ContainerNotFound) error is returned.
 ## Types
+### <a name="AuthConfig"></a>type AuthConfig
+
+
+
+username [string](https://godoc.org/builtin#string)
+
+password [string](https://godoc.org/builtin#string)
 ### <a name="BuildInfo"></a>type BuildInfo
 
 BuildInfo is used to describe user input for building images
+
+architecture [string](https://godoc.org/builtin#string)
+
+addCapabilities [[]string](#[]string)
 
 additionalTags [[]string](#[]string)
 
@@ -1279,7 +1318,11 @@ contextDir [string](https://godoc.org/builtin#string)
 
 defaultsMountFilePath [string](https://godoc.org/builtin#string)
 
+devices [[]string](#[]string)
+
 dockerfiles [[]string](#[]string)
+
+dropCapabilities [[]string](#[]string)
 
 err [string](https://godoc.org/builtin#string)
 
@@ -1292,6 +1335,8 @@ label [[]string](#[]string)
 layers [bool](https://godoc.org/builtin#bool)
 
 nocache [bool](https://godoc.org/builtin#bool)
+
+os [string](https://godoc.org/builtin#string)
 
 out [string](https://godoc.org/builtin#string)
 
@@ -1309,7 +1354,13 @@ reportWriter [string](https://godoc.org/builtin#string)
 
 runtimeArgs [[]string](#[]string)
 
+signBy [string](https://godoc.org/builtin#string)
+
 squash [bool](https://godoc.org/builtin#bool)
+
+target [string](https://godoc.org/builtin#string)
+
+transientMounts [[]string](#[]string)
 ### <a name="BuildOptions"></a>type BuildOptions
 
 BuildOptions are are used to describe describe physical attributes of the build
@@ -1575,8 +1626,6 @@ memorySwappiness [?int](#?int)
 
 name [?string](#?string)
 
-net [?string](#?string)
-
 network [?string](#?string)
 
 noHosts [?bool](#?bool)
@@ -1840,9 +1889,18 @@ go_version [string](https://godoc.org/builtin#string)
 podman_version [string](https://godoc.org/builtin#string)
 
 git_commit [string](https://godoc.org/builtin#string)
+### <a name="InfoRegistry"></a>type InfoRegistry
+
+InfoRegistry describes the host's registry information
+
+search [[]string](#[]string)
+
+insecure [[]string](#[]string)
+
+blocked [[]string](#[]string)
 ### <a name="InfoStore"></a>type InfoStore
 
-InfoStore describes the host's storage informatoin
+InfoStore describes the host's storage information
 
 containers [int](https://godoc.org/builtin#int)
 
@@ -1952,9 +2010,7 @@ PodmanInfo describes the Podman host and build
 
 host [InfoHost](#InfoHost)
 
-registries [[]string](#[]string)
-
-insecure_registries [[]string](#[]string)
+registries [InfoRegistry](#InfoRegistry)
 
 store [InfoStore](#InfoStore)
 

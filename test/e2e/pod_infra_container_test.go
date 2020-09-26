@@ -1,12 +1,10 @@
-// +build !remoteclient
-
 package integration
 
 import (
 	"os"
 	"strconv"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -29,7 +27,7 @@ var _ = Describe("Podman pod create", func() {
 	})
 
 	AfterEach(func() {
-		podmanTest.CleanupPod()
+		podmanTest.Cleanup()
 		f := CurrentGinkgoTestDescription()
 		processTestResult(f)
 
@@ -94,12 +92,17 @@ var _ = Describe("Podman pod create", func() {
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 
-		check := podmanTest.Podman([]string{"ps", "-a", "--no-trunc", "--ns", "--format", "{{.IPC}} {{.NET}}"})
+		check := podmanTest.Podman([]string{"ps", "-a", "--no-trunc", "--ns", "--format", "{{.Namespaces.IPC}} {{.Namespaces.NET}}"})
 		check.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 		Expect(len(check.OutputToStringArray())).To(Equal(2))
 		Expect(check.OutputToStringArray()[0]).To(Equal(check.OutputToStringArray()[1]))
 
+		check = podmanTest.Podman([]string{"ps", "-a", "--no-trunc", "--ns", "--format", "{{.IPC}} {{.NET}}"})
+		check.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		Expect(len(check.OutputToStringArray())).To(Equal(2))
+		Expect(check.OutputToStringArray()[0]).To(Equal(check.OutputToStringArray()[1]))
 	})
 
 	It("podman pod correctly sets up NetNS", func() {
@@ -222,6 +225,7 @@ var _ = Describe("Podman pod create", func() {
 	})
 
 	It("podman pod container can override pod pid NS", func() {
+		SkipIfRemote("FIXME This should work on podman-remote")
 		session := podmanTest.Podman([]string{"pod", "create", "--share", "pid"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
@@ -235,10 +239,16 @@ var _ = Describe("Podman pod create", func() {
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 
-		check := podmanTest.Podman([]string{"ps", "-a", "--ns", "--format", "{{.PIDNS}}"})
+		check := podmanTest.Podman([]string{"ps", "-a", "--ns", "--format", "{{.Namespaces.PIDNS}}"})
 		check.WaitWithDefaultTimeout()
 		Expect(check.ExitCode()).To(Equal(0))
 		outputArray := check.OutputToStringArray()
+		Expect(len(outputArray)).To(Equal(2))
+
+		check = podmanTest.Podman([]string{"ps", "-a", "--ns", "--format", "{{.PIDNS}}"})
+		check.WaitWithDefaultTimeout()
+		Expect(check.ExitCode()).To(Equal(0))
+		outputArray = check.OutputToStringArray()
 		Expect(len(outputArray)).To(Equal(2))
 
 		PID1 := outputArray[0]
@@ -247,6 +257,7 @@ var _ = Describe("Podman pod create", func() {
 	})
 
 	It("podman pod container can override pod not sharing pid", func() {
+		SkipIfRemote("FIXME This should work on podman-remote")
 		session := podmanTest.Podman([]string{"pod", "create", "--share", "net"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
@@ -272,6 +283,7 @@ var _ = Describe("Podman pod create", func() {
 	})
 
 	It("podman pod container can override pod ipc NS", func() {
+		SkipIfRemote("FIXME This should work on podman-remote")
 		session := podmanTest.Podman([]string{"pod", "create", "--share", "ipc"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
@@ -368,6 +380,7 @@ var _ = Describe("Podman pod create", func() {
 	})
 
 	It("podman run --add-host in pod", func() {
+		SkipIfRemote("FIXME This should work on podman-remote")
 		session := podmanTest.Podman([]string{"pod", "create"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))

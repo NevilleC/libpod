@@ -1,28 +1,23 @@
-// +build !remoteclient
-
 package integration
 
 import (
 	"os"
 
-	"github.com/containers/libpod/pkg/cgroups"
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
 
 var _ = Describe("Podman pod stats", func() {
 	var (
+		err        error
 		tempdir    string
 		podmanTest *PodmanTestIntegration
 	)
 
 	BeforeEach(func() {
-		cgroupsv2, err := cgroups.IsCgroup2UnifiedMode()
-		Expect(err).To(BeNil())
-
-		if os.Geteuid() != 0 && !cgroupsv2 {
-			Skip("This function is not enabled for rootless podman not running on cgroups v2")
+		if os.Geteuid() != 0 {
+			SkipIfCgroupV2()
 		}
 
 		tempdir, err = CreateTempDirInTempDir()
@@ -35,7 +30,7 @@ var _ = Describe("Podman pod stats", func() {
 	})
 
 	AfterEach(func() {
-		podmanTest.CleanupPod()
+		podmanTest.Cleanup()
 		f := CurrentGinkgoTestDescription()
 		processTestResult(f)
 
@@ -178,4 +173,21 @@ var _ = Describe("Podman pod stats", func() {
 		Expect(stats).To(ExitWithError())
 	})
 
+	It("podman stats on net=host post", func() {
+		// --net=host not supported for rootless pods at present
+		SkipIfRootless()
+		podName := "testPod"
+		podCreate := podmanTest.Podman([]string{"pod", "create", "--net=host", "--name", podName})
+		podCreate.WaitWithDefaultTimeout()
+		Expect(podCreate.ExitCode()).To(Equal(0))
+
+		ctrRun := podmanTest.Podman([]string{"run", "-d", "--pod", podName, ALPINE, "top"})
+		ctrRun.WaitWithDefaultTimeout()
+		Expect(ctrRun.ExitCode()).To(Equal(0))
+
+		stats := podmanTest.Podman([]string{"pod", "stats", "--format", "json", "--no-stream", podName})
+		stats.WaitWithDefaultTimeout()
+		Expect(stats.ExitCode()).To(Equal(0))
+		Expect(stats.IsJSONOutputValid()).To(BeTrue())
+	})
 })

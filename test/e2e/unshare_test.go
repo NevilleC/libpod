@@ -3,7 +3,7 @@ package integration
 import (
 	"os"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -15,7 +15,7 @@ var _ = Describe("Podman unshare", func() {
 		podmanTest *PodmanTestIntegration
 	)
 	BeforeEach(func() {
-		SkipIfRemote()
+		SkipIfRemote("podman-remote unshare is not supported")
 		if _, err := os.Stat("/proc/self/uid_map"); err != nil {
 			Skip("User namespaces not supported.")
 		}

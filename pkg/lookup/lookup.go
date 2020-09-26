@@ -4,7 +4,7 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/cyphar/filepath-securejoin"
+	securejoin "github.com/cyphar/filepath-securejoin"
 	"github.com/opencontainers/runc/libcontainer/user"
 	"github.com/sirupsen/logrus"
 )
@@ -79,7 +79,6 @@ func GetContainerGroups(groups []string, containerMount string, override *Overri
 	var (
 		groupDest string
 		err       error
-		uintgids  []uint32
 	)
 
 	groupPath := etcgroup
@@ -96,6 +95,7 @@ func GetContainerGroups(groups []string, containerMount string, override *Overri
 	if err != nil {
 		return nil, err
 	}
+	uintgids := make([]uint32, 0, len(gids))
 	// For libpod, we want []uint32s
 	for _, gid := range gids {
 		uintgids = append(uintgids, uint32(gid))

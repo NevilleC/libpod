@@ -1,5 +1,3 @@
-// +build !remoteclient
-
 package integration
 
 import (
@@ -11,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	"github.com/onsi/ginkgo/config"
 	. "github.com/onsi/gomega"
@@ -19,14 +17,16 @@ import (
 
 var _ = Describe("Podman login and logout", func() {
 	var (
-		tempdir    string
-		err        error
-		podmanTest *PodmanTestIntegration
-		authPath   string
-		certPath   string
-		port       int
-		server     string
-		testImg    string
+		tempdir                  string
+		err                      error
+		podmanTest               *PodmanTestIntegration
+		authPath                 string
+		certPath                 string
+		certDirPath              string
+		port                     int
+		server                   string
+		testImg                  string
+		registriesConfWithSearch []byte
 	)
 
 	BeforeEach(func() {
@@ -53,7 +53,7 @@ var _ = Describe("Podman login and logout", func() {
 			}
 		}
 
-		session := podmanTest.Podman([]string{"run", "--entrypoint", "htpasswd", "registry:2", "-Bbn", "podmantest", "test"})
+		session := podmanTest.Podman([]string{"run", "--entrypoint", "htpasswd", "registry:2.6", "-Bbn", "podmantest", "test"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 
@@ -64,14 +64,17 @@ var _ = Describe("Podman login and logout", func() {
 		f.Sync()
 		port = 4999 + config.GinkgoConfig.ParallelNode
 		server = strings.Join([]string{"localhost", strconv.Itoa(port)}, ":")
+
+		registriesConfWithSearch = []byte(fmt.Sprintf("[registries.search]\nregistries = ['%s']", server))
+
 		testImg = strings.Join([]string{server, "test-apline"}, "/")
 
-		os.MkdirAll(filepath.Join("/etc/containers/certs.d", server), os.ModePerm)
-
+		certDirPath = filepath.Join(os.Getenv("HOME"), ".config/containers/certs.d", server)
+		os.MkdirAll(certDirPath, os.ModePerm)
 		cwd, _ := os.Getwd()
 		certPath = filepath.Join(cwd, "../", "certs")
 
-		setup := SystemExec("cp", []string{filepath.Join(certPath, "domain.crt"), filepath.Join("/etc/containers/certs.d", server, "ca.crt")})
+		setup := SystemExec("cp", []string{filepath.Join(certPath, "domain.crt"), filepath.Join(certDirPath, "ca.crt")})
 		setup.WaitWithDefaultTimeout()
 
 		session = podmanTest.Podman([]string{"run", "-d", "-p", strings.Join([]string{strconv.Itoa(port), strconv.Itoa(port)}, ":"),
@@ -79,7 +82,7 @@ var _ = Describe("Podman login and logout", func() {
 			strings.Join([]string{authPath, "/auth"}, ":"), "-e", "REGISTRY_AUTH=htpasswd", "-e",
 			"REGISTRY_AUTH_HTPASSWD_REALM=Registry Realm", "-e", "REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd",
 			"-v", strings.Join([]string{certPath, "/certs"}, ":"), "-e", "REGISTRY_HTTP_TLS_CERTIFICATE=/certs/domain.crt",
-			"-e", "REGISTRY_HTTP_TLS_KEY=/certs/domain.key", "registry:2"})
+			"-e", "REGISTRY_HTTP_TLS_KEY=/certs/domain.key", "registry:2.6"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 
@@ -91,7 +94,7 @@ var _ = Describe("Podman login and logout", func() {
 	AfterEach(func() {
 		podmanTest.Cleanup()
 		os.RemoveAll(authPath)
-		os.RemoveAll(filepath.Join("/etc/containers/certs.d", server))
+		os.RemoveAll(certDirPath)
 	})
 
 	It("podman login and logout", func() {
@@ -110,6 +113,38 @@ var _ = Describe("Podman login and logout", func() {
 		session = podmanTest.Podman([]string{"push", ALPINE, testImg})
 		session.WaitWithDefaultTimeout()
 		Expect(session).To(ExitWithError())
+	})
+
+	It("podman login and logout without registry parameter", func() {
+		SkipIfRootless()
+
+		registriesConf, err := ioutil.TempFile("", "TestLoginWithoutParameter")
+		Expect(err).To(BeNil())
+		defer registriesConf.Close()
+		defer os.Remove(registriesConf.Name())
+
+		err = ioutil.WriteFile(registriesConf.Name(), []byte(registriesConfWithSearch), os.ModePerm)
+		Expect(err).To(BeNil())
+
+		// Environment is per-process, so this looks very unsafe; actually it seems fine because tests are not
+		// run in parallel unless they opt in by calling t.Parallel().  So don’t do that.
+		oldRCP, hasRCP := os.LookupEnv("REGISTRIES_CONFIG_PATH")
+		defer func() {
+			if hasRCP {
+				os.Setenv("REGISTRIES_CONFIG_PATH", oldRCP)
+			} else {
+				os.Unsetenv("REGISTRIES_CONFIG_PATH")
+			}
+		}()
+		os.Setenv("REGISTRIES_CONFIG_PATH", registriesConf.Name())
+
+		session := podmanTest.Podman([]string{"login", "-u", "podmantest", "-p", "test"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To((Equal(0)))
+
+		session = podmanTest.Podman([]string{"logout"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
 	})
 
 	It("podman login and logout with flag --authfile", func() {
@@ -168,7 +203,7 @@ var _ = Describe("Podman login and logout", func() {
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 
-		session = podmanTest.Podman([]string{"push", ALPINE, testImg})
+		session = podmanTest.Podman([]string{"push", "--cert-dir", certDir, ALPINE, testImg})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 
@@ -177,20 +212,21 @@ var _ = Describe("Podman login and logout", func() {
 		Expect(session.ExitCode()).To(Equal(0))
 	})
 	It("podman login and logout with multi registry", func() {
-		os.MkdirAll("/etc/containers/certs.d/localhost:9001", os.ModePerm)
+		certDir := filepath.Join(os.Getenv("HOME"), ".config/containers/certs.d", "localhost:9001")
+		os.MkdirAll(certDir, os.ModePerm)
 
 		cwd, _ := os.Getwd()
 		certPath = filepath.Join(cwd, "../", "certs")
 
-		setup := SystemExec("cp", []string{filepath.Join(certPath, "domain.crt"), "/etc/containers/certs.d/localhost:9001/ca.crt"})
+		setup := SystemExec("cp", []string{filepath.Join(certPath, "domain.crt"), filepath.Join(certDir, "ca.crt")})
 		setup.WaitWithDefaultTimeout()
-		defer os.RemoveAll("/etc/containers/certs.d/localhost:9001")
+		defer os.RemoveAll(certDir)
 
 		session := podmanTest.Podman([]string{"run", "-d", "-p", "9001:9001", "-e", "REGISTRY_HTTP_ADDR=0.0.0.0:9001", "--name", "registry1", "-v",
 			strings.Join([]string{authPath, "/auth"}, ":"), "-e", "REGISTRY_AUTH=htpasswd", "-e",
 			"REGISTRY_AUTH_HTPASSWD_REALM=Registry Realm", "-e", "REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd",
 			"-v", strings.Join([]string{certPath, "/certs"}, ":"), "-e", "REGISTRY_HTTP_TLS_CERTIFICATE=/certs/domain.crt",
-			"-e", "REGISTRY_HTTP_TLS_KEY=/certs/domain.key", "registry:2"})
+			"-e", "REGISTRY_HTTP_TLS_KEY=/certs/domain.key", "registry:2.6"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 

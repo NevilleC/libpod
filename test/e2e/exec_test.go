@@ -1,10 +1,11 @@
 package integration
 
 import (
+	"fmt"
 	"os"
 	"strings"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -66,13 +67,14 @@ var _ = Describe("Podman exec", func() {
 	})
 
 	It("podman exec simple command using latest", func() {
-		// the remote client doesn't use latest
-		SkipIfRemote()
 		setup := podmanTest.RunTopContainer("test1")
 		setup.WaitWithDefaultTimeout()
 		Expect(setup.ExitCode()).To(Equal(0))
-
-		session := podmanTest.Podman([]string{"exec", "-l", "ls"})
+		cid := "-l"
+		if IsRemote() {
+			cid = "test1"
+		}
+		session := podmanTest.Podman([]string{"exec", cid, "ls"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 	})
@@ -97,7 +99,6 @@ var _ = Describe("Podman exec", func() {
 
 	It("podman exec os.Setenv env", func() {
 		// remote doesn't properly interpret os.Setenv
-		SkipIfRemote()
 		setup := podmanTest.RunTopContainer("test1")
 		setup.WaitWithDefaultTimeout()
 		Expect(setup.ExitCode()).To(Equal(0))
@@ -119,6 +120,18 @@ var _ = Describe("Podman exec", func() {
 		session := podmanTest.Podman([]string{"exec", "test1", "sh", "-c", "exit 100"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(100))
+	})
+
+	It("podman exec terminal doesn't hang", func() {
+		setup := podmanTest.Podman([]string{"run", "-dti", "--name", "test1", fedoraMinimal, "sleep", "+Inf"})
+		setup.WaitWithDefaultTimeout()
+		Expect(setup.ExitCode()).To(Equal(0))
+
+		for i := 0; i < 5; i++ {
+			session := podmanTest.Podman([]string{"exec", "-ti", "test1", "true"})
+			session.WaitWithDefaultTimeout()
+			Expect(session.ExitCode()).To(Equal(0))
+		}
 	})
 
 	It("podman exec pseudo-terminal sanity check", func() {
@@ -231,17 +244,98 @@ var _ = Describe("Podman exec", func() {
 	})
 
 	It("podman exec preserve fds sanity check", func() {
-		// TODO: add this test once crun adds the --preserve-fds flag for exec
-		if strings.Contains(podmanTest.OCIRuntime, "crun") {
-			Skip("Test only works on crun")
-		}
 		setup := podmanTest.RunTopContainer("test1")
 		setup.WaitWithDefaultTimeout()
 		Expect(setup.ExitCode()).To(Equal(0))
 
-		session := podmanTest.Podman([]string{"exec", "--preserve-fds", "1", "test1", "ls"})
+		devNull, err := os.Open("/dev/null")
+		Expect(err).To(BeNil())
+		defer devNull.Close()
+		files := []*os.File{
+			devNull,
+		}
+		session := podmanTest.PodmanExtraFiles([]string{"exec", "--preserve-fds", "1", "test1", "ls"}, files)
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 	})
 
+	It("podman exec preserves --group-add groups", func() {
+		groupName := "group1"
+		gid := "4444"
+		ctrName1 := "ctr1"
+		ctr1 := podmanTest.Podman([]string{"run", "-ti", "--name", ctrName1, fedoraMinimal, "groupadd", "-g", gid, groupName})
+		ctr1.WaitWithDefaultTimeout()
+		Expect(ctr1.ExitCode()).To(Equal(0))
+
+		imgName := "img1"
+		commit := podmanTest.Podman([]string{"commit", ctrName1, imgName})
+		commit.WaitWithDefaultTimeout()
+		Expect(commit.ExitCode()).To(Equal(0))
+
+		ctrName2 := "ctr2"
+		ctr2 := podmanTest.Podman([]string{"run", "-d", "--name", ctrName2, "--group-add", groupName, imgName, "sleep", "300"})
+		ctr2.WaitWithDefaultTimeout()
+		Expect(ctr2.ExitCode()).To(Equal(0))
+
+		exec := podmanTest.Podman([]string{"exec", "-ti", ctrName2, "id"})
+		exec.WaitWithDefaultTimeout()
+		Expect(exec.ExitCode()).To(Equal(0))
+		Expect(strings.Contains(exec.OutputToString(), fmt.Sprintf("%s(%s)", gid, groupName))).To(BeTrue())
+	})
+
+	It("podman exec preserves container groups with --user and --group-add", func() {
+		SkipIfRemote("FIXME: This is broken SECCOMP Failues?")
+
+		dockerfile := `FROM fedora-minimal
+RUN groupadd -g 4000 first
+RUN groupadd -g 4001 second
+RUN useradd -u 1000 auser`
+		imgName := "testimg"
+		podmanTest.BuildImage(dockerfile, imgName, "false")
+
+		ctrName := "testctr"
+		ctr := podmanTest.Podman([]string{"run", "-t", "-i", "-d", "--name", ctrName, "--user", "auser:first", "--group-add", "second", imgName, "sleep", "300"})
+		ctr.WaitWithDefaultTimeout()
+		Expect(ctr.ExitCode()).To(Equal(0))
+
+		exec := podmanTest.Podman([]string{"exec", "-t", ctrName, "id"})
+		exec.WaitWithDefaultTimeout()
+		Expect(exec.ExitCode()).To(Equal(0))
+		output := exec.OutputToString()
+		Expect(strings.Contains(output, "4000(first)")).To(BeTrue())
+		Expect(strings.Contains(output, "4001(second)")).To(BeTrue())
+		Expect(strings.Contains(output, "1000(auser)")).To(BeTrue())
+
+		// Kill the container just so the test does not take 15 seconds to stop.
+		kill := podmanTest.Podman([]string{"kill", ctrName})
+		kill.WaitWithDefaultTimeout()
+		Expect(kill.ExitCode()).To(Equal(0))
+	})
+
+	It("podman exec --detach", func() {
+		ctrName := "testctr"
+		ctr := podmanTest.Podman([]string{"run", "-t", "-i", "-d", "--name", ctrName, ALPINE, "top"})
+		ctr.WaitWithDefaultTimeout()
+		Expect(ctr.ExitCode()).To(Equal(0))
+
+		exec1 := podmanTest.Podman([]string{"exec", "-t", "-i", "-d", ctrName, "top"})
+		exec1.WaitWithDefaultTimeout()
+		Expect(ctr.ExitCode()).To(Equal(0))
+
+		data := podmanTest.InspectContainer(ctrName)
+		Expect(len(data)).To(Equal(1))
+		Expect(len(data[0].ExecIDs)).To(Equal(1))
+		Expect(strings.Contains(exec1.OutputToString(), data[0].ExecIDs[0])).To(BeTrue())
+
+		exec2 := podmanTest.Podman([]string{"exec", "-t", "-i", ctrName, "ps", "-a"})
+		exec2.WaitWithDefaultTimeout()
+		Expect(ctr.ExitCode()).To(Equal(0))
+		Expect(strings.Count(exec2.OutputToString(), "top")).To(Equal(2))
+
+		// Ensure that stop with a running detached exec session is
+		// clean.
+		stop := podmanTest.Podman([]string{"stop", ctrName})
+		stop.WaitWithDefaultTimeout()
+		Expect(stop.ExitCode()).To(Equal(0))
+	})
 })

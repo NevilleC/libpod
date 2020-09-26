@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	"github.com/docker/go-units"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -101,17 +101,31 @@ var _ = Describe("Podman ps", func() {
 	})
 
 	It("podman ps latest flag", func() {
+		SkipIfRemote("--latest is not supported on podman-remote")
 		_, ec, _ := podmanTest.RunLsContainer("")
 		Expect(ec).To(Equal(0))
+		_, ec, _ = podmanTest.RunLsContainer("")
+		Expect(ec).To(Equal(0))
 
-		result := podmanTest.Podman([]string{"ps", "--latest"})
+		result := podmanTest.Podman([]string{"ps", "-q", "--latest"})
 		result.WaitWithDefaultTimeout()
 		Expect(result.ExitCode()).To(Equal(0))
-		Expect(len(result.OutputToStringArray())).Should(BeNumerically(">", 0))
+		Expect(len(result.OutputToStringArray())).Should(Equal(1))
 	})
 
 	It("podman ps last flag", func() {
 		Skip("--last flag nonfunctional and disabled")
+
+		// Make sure that non-running containers are being counted as
+		// well.
+		session := podmanTest.Podman([]string{"create", "alpine", "top"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+
+		result := podmanTest.Podman([]string{"ps", "--last", "2"})
+		result.WaitWithDefaultTimeout()
+		Expect(result.ExitCode()).To(Equal(0))
+		Expect(len(result.OutputToStringArray())).Should(Equal(2)) // 1 container
 
 		_, ec, _ := podmanTest.RunLsContainer("test1")
 		Expect(ec).To(Equal(0))
@@ -122,10 +136,20 @@ var _ = Describe("Podman ps", func() {
 		_, ec, _ = podmanTest.RunLsContainer("test3")
 		Expect(ec).To(Equal(0))
 
-		result := podmanTest.Podman([]string{"ps", "--last", "2"})
+		result = podmanTest.Podman([]string{"ps", "--last", "2"})
 		result.WaitWithDefaultTimeout()
 		Expect(result.ExitCode()).To(Equal(0))
-		Expect(len(result.OutputToStringArray())).Should(Equal(3))
+		Expect(len(result.OutputToStringArray())).Should(Equal(3)) // 2 containers
+
+		result = podmanTest.Podman([]string{"ps", "--last", "3"})
+		result.WaitWithDefaultTimeout()
+		Expect(result.ExitCode()).To(Equal(0))
+		Expect(len(result.OutputToStringArray())).Should(Equal(4)) // 3 containers
+
+		result = podmanTest.Podman([]string{"ps", "--last", "100"})
+		result.WaitWithDefaultTimeout()
+		Expect(result.ExitCode()).To(Equal(0))
+		Expect(len(result.OutputToStringArray())).Should(Equal(5)) // 4 containers (3 running + 1 created)
 	})
 
 	It("podman ps no-trunc", func() {
@@ -166,14 +190,31 @@ var _ = Describe("Podman ps", func() {
 		Expect(result.IsJSONOutputValid()).To(BeTrue())
 	})
 
-	It("podman ps namespace flag with go template format", func() {
+	It("podman ps print a human-readable `Status` with json format", func() {
 		_, ec, _ := podmanTest.RunLsContainer("test1")
 		Expect(ec).To(Equal(0))
 
-		result := podmanTest.Podman([]string{"ps", "-a", "--format", "table {{.ID}} {{.Image}} {{.Labels}}"})
+		result := podmanTest.Podman([]string{"ps", "-a", "--format", "json"})
+		result.WaitWithDefaultTimeout()
+		Expect(result.ExitCode()).To(Equal(0))
+		Expect(result.IsJSONOutputValid()).To(BeTrue())
+		// must contain "Status"
+		match, StatusLine := result.GrepString(`Status`)
+		Expect(match).To(BeTrue())
+		// container is running or exit, so it must contain `ago`
+		Expect(StatusLine[0]).To(ContainSubstring("ago"))
+	})
+
+	It("podman ps namespace flag with go template format", func() {
+		Skip(v2fail)
+		_, ec, _ := podmanTest.RunLsContainer("test1")
+		Expect(ec).To(Equal(0))
+
+		result := podmanTest.Podman([]string{"ps", "-a", "--format", "table {{.ID}} {{.Image}} {{.ImageID}} {{.Labels}}"})
 		result.WaitWithDefaultTimeout()
 		Expect(strings.Contains(result.OutputToStringArray()[0], "table")).To(BeFalse())
 		Expect(strings.Contains(result.OutputToStringArray()[0], "ID")).To(BeTrue())
+		Expect(strings.Contains(result.OutputToStringArray()[0], "ImageID")).To(BeTrue())
 		Expect(strings.Contains(result.OutputToStringArray()[1], "alpine:latest")).To(BeTrue())
 		Expect(result.ExitCode()).To(Equal(0))
 	})
@@ -225,6 +266,35 @@ var _ = Describe("Podman ps", func() {
 		output := result.OutputToStringArray()
 		Expect(len(output)).To(Equal(1))
 		Expect(output[0]).To(Equal(fullCid))
+	})
+
+	It("podman ps filter by exited does not need all", func() {
+		ctr := podmanTest.Podman([]string{"run", "-t", "-i", ALPINE, "ls", "/"})
+		ctr.WaitWithDefaultTimeout()
+		Expect(ctr.ExitCode()).To(Equal(0))
+
+		psAll := podmanTest.Podman([]string{"ps", "-aq", "--no-trunc"})
+		psAll.WaitWithDefaultTimeout()
+		Expect(psAll.ExitCode()).To(Equal(0))
+
+		psFilter := podmanTest.Podman([]string{"ps", "--no-trunc", "--quiet", "--filter", "status=exited"})
+		psFilter.WaitWithDefaultTimeout()
+		Expect(psFilter.ExitCode()).To(Equal(0))
+
+		Expect(psAll.OutputToString()).To(Equal(psFilter.OutputToString()))
+	})
+
+	It("podman filter without status does not find non-running", func() {
+		ctrName := "aContainerName"
+		ctr := podmanTest.Podman([]string{"create", "--name", ctrName, "-t", "-i", ALPINE, "ls", "/"})
+		ctr.WaitWithDefaultTimeout()
+		Expect(ctr.ExitCode()).To(Equal(0))
+
+		psFilter := podmanTest.Podman([]string{"ps", "--no-trunc", "--quiet", "--format", "{{.Names}}", "--filter", fmt.Sprintf("name=%s", ctrName)})
+		psFilter.WaitWithDefaultTimeout()
+		Expect(psFilter.ExitCode()).To(Equal(0))
+
+		Expect(strings.Contains(psFilter.OutputToString(), ctrName)).To(BeFalse())
 	})
 
 	It("podman ps mutually exclusive flags", func() {
@@ -309,8 +379,6 @@ var _ = Describe("Podman ps", func() {
 	})
 
 	It("podman --pod with a non-empty pod name", func() {
-		SkipIfRemote()
-
 		podName := "testPodName"
 		_, ec, podid := podmanTest.CreatePod(podName)
 		Expect(ec).To(Equal(0))
@@ -397,5 +465,41 @@ var _ = Describe("Podman ps", func() {
 		output := result.OutputToStringArray()
 		Expect(len(output)).To(Equal(1))
 		Expect(output[0]).To(Equal(ctrName))
+	})
+
+	It("podman ps test with port shared with pod", func() {
+		podName := "testPod"
+		pod := podmanTest.Podman([]string{"pod", "create", "-p", "8080:80", "--name", podName})
+		pod.WaitWithDefaultTimeout()
+		Expect(pod.ExitCode()).To(Equal(0))
+
+		ctrName := "testCtr"
+		session := podmanTest.Podman([]string{"run", "--name", ctrName, "-dt", "--pod", podName, ALPINE, "top"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+
+		ps := podmanTest.Podman([]string{"ps", "--filter", fmt.Sprintf("name=%s", ctrName), "--format", "{{.Ports}}"})
+		ps.WaitWithDefaultTimeout()
+		Expect(ps.ExitCode()).To(Equal(0))
+		Expect(ps.OutputToString()).To(ContainSubstring("0.0.0.0:8080->80/tcp"))
+	})
+
+	It("podman ps truncate long create command", func() {
+		session := podmanTest.Podman([]string{"run", ALPINE, "echo", "very", "long", "create", "command"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+
+		session = podmanTest.Podman([]string{"ps", "-a"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.OutputToString()).To(ContainSubstring("echo very long cr..."))
+	})
+	It("podman ps --format {{RunningFor}}", func() {
+		_, ec, _ := podmanTest.RunLsContainer("")
+		Expect(ec).To(Equal(0))
+
+		result := podmanTest.Podman([]string{"ps", "-a", "--format", "{{.RunningFor}}"})
+		result.WaitWithDefaultTimeout()
+		Expect(result.ExitCode()).To(Equal(0))
+		Expect(result.OutputToString()).To(ContainSubstring("ago"))
 	})
 })

@@ -3,8 +3,8 @@ package libpod
 import (
 	"context"
 
-	"github.com/containers/libpod/libpod/define"
-	"github.com/containers/libpod/libpod/events"
+	"github.com/containers/podman/v2/libpod/define"
+	"github.com/containers/podman/v2/libpod/events"
 	"github.com/pkg/errors"
 )
 
@@ -35,10 +35,6 @@ func (r *Runtime) RemoveVolume(ctx context.Context, v *Volume, force bool) error
 			return nil
 		}
 	}
-
-	v.lock.Lock()
-	defer v.lock.Unlock()
-
 	return r.removeVolume(ctx, v, force)
 }
 
@@ -133,26 +129,22 @@ func (r *Runtime) GetAllVolumes() ([]*Volume, error) {
 }
 
 // PruneVolumes removes unused volumes from the system
-func (r *Runtime) PruneVolumes(ctx context.Context) ([]string, []error) {
-	var (
-		prunedIDs   []string
-		pruneErrors []error
-	)
+func (r *Runtime) PruneVolumes(ctx context.Context) (map[string]error, error) {
+	reports := make(map[string]error)
 	vols, err := r.GetAllVolumes()
 	if err != nil {
-		pruneErrors = append(pruneErrors, err)
-		return nil, pruneErrors
+		return nil, err
 	}
 
 	for _, vol := range vols {
 		if err := r.RemoveVolume(ctx, vol, false); err != nil {
 			if errors.Cause(err) != define.ErrVolumeBeingUsed && errors.Cause(err) != define.ErrVolumeRemoved {
-				pruneErrors = append(pruneErrors, err)
+				reports[vol.Name()] = err
 			}
 			continue
 		}
 		vol.newVolumeEvent(events.Prune)
-		prunedIDs = append(prunedIDs, vol.Name())
+		reports[vol.Name()] = nil
 	}
-	return prunedIDs, pruneErrors
+	return reports, nil
 }

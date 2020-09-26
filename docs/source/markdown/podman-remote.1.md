@@ -17,13 +17,15 @@ Podman uses Buildah(1) internally to create container images. Both tools share i
 (not container) storage, hence each can use or manipulate images (but not containers)
 created by the other.
 
-Podman-remote provides a local client interacting with a Podman backend node through a varlink ssh connection. In this context, a Podman node is a Linux system with Podman installed on it and the varlink service activated. Credentials for this session can be passed in using flags, environment variables, or in `podman-remote.conf`
+Podman-remote provides a local client interacting with a Podman backend node through a RESTful API tunneled through a ssh connection. In this context, a Podman node is a Linux system with Podman installed on it and the API service activated. Credentials for this session can be passed in using flags, environment variables, or in `containers.conf`.
+
+The `containers.conf` file should be placed under `$HOME/.config/containers/containers.conf` on Linux and Mac and `%APPDATA%\containers\containers.conf` on Windows.
 
 **podman [GLOBAL OPTIONS]**
 
 ## GLOBAL OPTIONS
 
-**--connection**=*name*
+**--connection**=*name*, **-c**
 
 Remote connection name
 
@@ -31,29 +33,39 @@ Remote connection name
 
 Print usage statement
 
+**--identity**=*path*
+
+Path to ssh identity file. If the identity file has been encrypted, Podman prompts the user for the passphrase.
+If no identity file is provided and no user is given, Podman defaults to the user running the podman command.
+Podman prompts for the login password on the remote server.
+
+Identity value resolution precedence:
+ - command line value
+ - environment variable `CONTAINER_SSHKEY`, if `CONTAINER_HOST` is found
+ - `containers.conf`
+
 **--log-level**=*level*
 
 Log messages above specified level: debug, info, warn, error (default), fatal or panic
 
-**--port**=*integer*
+**--url**=*value*
 
-Use an alternative port for the ssh connections.  The default port is 22
+URL to access Podman service (default from `containers.conf`, rootless "unix://run/user/$UID/podman/podman.sock" or as root "unix://run/podman/podman.sock).
 
-**--remote-config-path**=*path*
+ - `CONTAINER_HOST` is of the format `<schema>://[<user[:<password>]@]<host>[:<port>][<path>]`
 
-Alternate path for configuration file
+Details:
+ - `user` will default to either `root` or current running user
+ - `password` has no default
+ - `host` must be provided and is either the IP or name of the machine hosting the Podman service
+ - `port` defaults to 22
+ - `path` defaults to either `/run/podman/podman.sock`, or `/run/user/<uid>/podman/podman.sock` if running rootless.
 
-**--remote-host**=*ip*
-
-Remote host IP
-
-**--syslog**
-
-Output logging information to syslog as well as the console
-
-**--username**=*string*
-
-Username on the remote host (defaults to current username)
+URL value resolution precedence:
+ - command line value
+ - environment variable `CONTAINER_HOST`
+ - `containers.conf`
+ - `unix://run/podman/podman.sock`
 
 **--version**
 
@@ -65,27 +77,27 @@ The exit code from `podman` gives information about why the container
 failed to run or why it exited.  When `podman` commands exit with a non-zero code,
 the exit codes follow the `chroot` standard, see below:
 
-**_125_** if the error is with podman **_itself_**
+  **125** The error is with podman itself
 
     $ podman run --foo busybox; echo $?
     Error: unknown flag: --foo
-      125
+    125
 
-**_126_** if executing a **_contained command_** and the **_command_** cannot be invoked
+  **126** Executing a _contained command_ and the _command_ cannot be invoked
 
     $ podman run busybox /etc; echo $?
     Error: container_linux.go:346: starting container process caused "exec: \"/etc\": permission denied": OCI runtime error
-      126
+    126
 
-**_127_** if executing a **_contained command_** and the **_command_** cannot be found
+  **127** Executing a _contained command_ and the _command_ cannot be found
     $ podman run busybox foo; echo $?
     Error: container_linux.go:346: starting container process caused "exec: \"foo\": executable file not found in $PATH": OCI runtime error
-      127
+    127
 
-**_Exit code_** of **_contained command_** otherwise
+  **Exit code** _contained command_ exit code
 
-    $ podman run busybox /bin/sh -c 'exit 3'
-    # 3
+    $ podman run busybox /bin/sh -c 'exit 3'; echo $?
+    3
 
 
 ## COMMANDS
@@ -132,14 +144,15 @@ the exit codes follow the `chroot` standard, see below:
 | [podman-unpause(1)](podman-unpause.1.md)         | Unpause one or more containers.                                             |
 | [podman-version(1)](podman-version.1.md)         | Display the Podman version information.                                     |
 | [podman-volume(1)](podman-volume.1.md)           | Manage Volumes.                                                             |
-
 ## FILES
 
-**podman-remote.conf** (`~/.config/containers/podman-remote.conf`)
+**containers.conf** (`$HOME/.config/containers/containers.conf`)
 
-    The podman-remote.conf file is the default configuration file for the podman
-    remote client.  It is in the TOML format.  It is primarily used to keep track
-    of the user's remote connections.
+Podman has builtin defaults for command line options. These defaults can be overridden using the containers.conf configuration files.
+
+Users can modify defaults by creating the `$HOME/.config/containers/containers.conf` file. Podman merges its builtin defaults with the specified fields from this file, if it exists. Fields specified in the users file override the built-in defaults.
+
+Podman uses builtin defaults if no containers.conf file is found.
 
 ## SEE ALSO
-`podman-remote.conf(5)`
+`containers.conf(5)`

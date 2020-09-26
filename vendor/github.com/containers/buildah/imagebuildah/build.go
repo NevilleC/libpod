@@ -11,15 +11,18 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/containers/buildah"
+	"github.com/containers/common/pkg/config"
 	"github.com/containers/image/v5/docker/reference"
 	"github.com/containers/image/v5/types"
+	encconfig "github.com/containers/ocicrypt/config"
 	"github.com/containers/storage"
 	"github.com/containers/storage/pkg/archive"
-	"github.com/opencontainers/runc/libcontainer/configs"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/openshift/imagebuilder"
+	"github.com/openshift/imagebuilder/dockerfile/parser"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -66,7 +69,7 @@ type BuildOptions struct {
 	// RuntimeArgs adds global arguments for the runtime.
 	RuntimeArgs []string
 	// TransientMounts is a list of mounts that won't be kept in the image.
-	TransientMounts []Mount
+	TransientMounts []string
 	// Compression specifies the type of compression which is applied to
 	// layer blobs.  The default is to not use compression, but
 	// archive.Gzip is recommended.
@@ -129,7 +132,8 @@ type BuildOptions struct {
 	// when handling RUN instructions. If a capability appears in both lists, it
 	// will be dropped.
 	DropCapabilities []string
-	CommonBuildOpts  *buildah.CommonBuildOptions
+	// CommonBuildOpts is *required*.
+	CommonBuildOpts *buildah.CommonBuildOptions
 	// DefaultMountsFilePath is the file path holding the mounts to be mounted in "host-path:container-path" format
 	DefaultMountsFilePath string
 	// IIDFile tells the builder to write the image ID to the specified file
@@ -156,10 +160,31 @@ type BuildOptions struct {
 	ForceRmIntermediateCtrs bool
 	// BlobDirectory is a directory which we'll use for caching layer blobs.
 	BlobDirectory string
-	// Target the targeted FROM in the Dockerfile to build
+	// Target the targeted FROM in the Dockerfile to build.
 	Target string
-	// Devices are the additional devices to add to the containers
-	Devices []configs.Device
+	// Devices are the additional devices to add to the containers.
+	Devices []string
+	// SignBy is the fingerprint of a GPG key to use for signing images.
+	SignBy string
+	// Architecture specifies the target architecture of the image to be built.
+	Architecture string
+	// Timestamp sets the created timestamp to the specified time, allowing
+	// for deterministic, content-addressable builds.
+	Timestamp *time.Time
+	// OS is the specifies the operating system of the image to be built.
+	OS string
+	// MaxPullPushRetries is the maximum number of attempts we'll make to pull or push any one
+	// image from or to an external registry if the first attempt fails.
+	MaxPullPushRetries int
+	// PullPushRetryDelay is how long to wait before retrying a pull or push attempt.
+	PullPushRetryDelay time.Duration
+	// OciDecryptConfig contains the config that can be used to decrypt an image if it is
+	// encrypted if non-nil. If nil, it does not attempt to decrypt an image.
+	OciDecryptConfig *encconfig.DecryptConfig
+	// Jobs is the number of stages to run in parallel.  If not specified it defaults to 1.
+	Jobs *int
+	// LogRusage logs resource usage for each step.
+	LogRusage bool
 }
 
 // BuildDockerfiles parses a set of one or more Dockerfiles (which may be
@@ -238,6 +263,9 @@ func BuildDockerfiles(ctx context.Context, store storage.Store, options BuildOpt
 	if err != nil {
 		return "", nil, errors.Wrapf(err, "error parsing main Dockerfile")
 	}
+
+	warnOnUnsetBuildArgs(mainNode, options.Args)
+
 	for _, d := range dockerfiles[1:] {
 		additionalNode, err := imagebuilder.ParseDockerfile(d)
 		if err != nil {
@@ -250,6 +278,11 @@ func BuildDockerfiles(ctx context.Context, store storage.Store, options BuildOpt
 		return "", nil, errors.Wrapf(err, "error creating build executor")
 	}
 	b := imagebuilder.NewBuilder(options.Args)
+	defaultContainerConfig, err := config.Default()
+	if err != nil {
+		return "", nil, errors.Wrapf(err, "failed to get container config")
+	}
+	b.Env = append(defaultContainerConfig.GetDefaultEnv(), b.Env...)
 	stages, err := imagebuilder.NewStages(mainNode, b)
 	if err != nil {
 		return "", nil, errors.Wrap(err, "error reading multiple stages")
@@ -262,6 +295,20 @@ func BuildDockerfiles(ctx context.Context, store storage.Store, options BuildOpt
 		stages = stagesTargeted
 	}
 	return exec.Build(ctx, stages)
+}
+
+func warnOnUnsetBuildArgs(node *parser.Node, args map[string]string) {
+	for _, child := range node.Children {
+		switch strings.ToUpper(child.Value) {
+		case "ARG":
+			argName := child.Next.Value
+			if _, ok := args[argName]; !strings.Contains(argName, "=") && !ok {
+				logrus.Warnf("missing %q build argument. Try adding %q to the command line", argName, fmt.Sprintf("--build-arg %s=<VALUE>", argName))
+			}
+		default:
+			continue
+		}
+	}
 }
 
 // preprocessDockerfileContents runs CPP(1) in preprocess-only mode on the input
@@ -280,7 +327,7 @@ func preprocessDockerfileContents(r io.Reader, ctxDir string) (rdrCloser *io.Rea
 	stdout := bytes.Buffer{}
 	stderr := bytes.Buffer{}
 
-	cmd := exec.Command(cppPath, "-E", "-iquote", ctxDir, "-")
+	cmd := exec.Command(cppPath, "-E", "-iquote", ctxDir, "-traditional", "-undef", "-")
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
@@ -306,7 +353,7 @@ func preprocessDockerfileContents(r io.Reader, ctxDir string) (rdrCloser *io.Rea
 	pipe.Close()
 	if err = cmd.Wait(); err != nil {
 		if stderr.Len() > 0 {
-			err = fmt.Errorf("%v: %s", err, strings.TrimSpace(stderr.String()))
+			err = errors.Wrapf(err, "%v", strings.TrimSpace(stderr.String()))
 		}
 		return nil, errors.Wrapf(err, "error pre-processing Dockerfile")
 	}

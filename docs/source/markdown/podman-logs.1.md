@@ -11,7 +11,7 @@ podman\-logs - Display the logs of one or more containers
 ## DESCRIPTION
 The podman logs command batch-retrieves whatever logs are present for one or more containers at the time of execution.
 This does not guarantee execution order when combined with podman run (i.e. your run may not have generated
-any logs at the time you execute podman logs
+any logs at the time you execute podman logs).
 
 ## OPTIONS
 
@@ -29,6 +29,10 @@ Instead of providing the container name or ID, use the last created container. I
 to run containers such as CRI-O, the last started container could be from either of those methods.
 
 The latest option is not supported on the remote client.
+
+**-n**, **--names**
+
+Output the container name in the log
 
 **--since**=*TIMESTAMP*
 

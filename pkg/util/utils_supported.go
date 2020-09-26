@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/containers/libpod/pkg/rootless"
+	"github.com/containers/podman/v2/pkg/rootless"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -33,7 +33,7 @@ func GetRuntimeDir() (string, error) {
 				logrus.Debugf("unable to make temp dir %s", tmpDir)
 			}
 			st, err := os.Stat(tmpDir)
-			if err == nil && int(st.Sys().(*syscall.Stat_t).Uid) == os.Geteuid() && st.Mode().Perm() == 0700 {
+			if err == nil && int(st.Sys().(*syscall.Stat_t).Uid) == os.Geteuid() && (st.Mode().Perm()&0700 == 0700) {
 				runtimeDir = tmpDir
 			}
 		}
@@ -43,7 +43,7 @@ func GetRuntimeDir() (string, error) {
 				logrus.Debugf("unable to make temp dir %s", tmpDir)
 			}
 			st, err := os.Stat(tmpDir)
-			if err == nil && int(st.Sys().(*syscall.Stat_t).Uid) == os.Geteuid() && st.Mode().Perm() == 0700 {
+			if err == nil && int(st.Sys().(*syscall.Stat_t).Uid) == os.Geteuid() && (st.Mode().Perm()&0700 == 0700) {
 				runtimeDir = tmpDir
 			}
 		}
@@ -83,9 +83,6 @@ func GetRootlessConfigHomeDir() (string, error) {
 				return
 			}
 			tmpDir := filepath.Join(resolvedHome, ".config")
-			if err := os.MkdirAll(tmpDir, 0755); err != nil {
-				logrus.Errorf("unable to make temp dir %s", tmpDir)
-			}
 			st, err := os.Stat(tmpDir)
 			if err == nil && int(st.Sys().(*syscall.Stat_t).Uid) == os.Geteuid() && st.Mode().Perm() >= 0700 {
 				cfgHomeDir = tmpDir

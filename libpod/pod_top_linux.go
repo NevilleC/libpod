@@ -6,8 +6,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/containers/libpod/libpod/define"
-	"github.com/containers/libpod/pkg/rootless"
+	"github.com/containers/podman/v2/libpod/define"
+	"github.com/containers/podman/v2/pkg/rootless"
 	"github.com/containers/psgo"
 )
 
@@ -41,12 +41,23 @@ func (p *Pod) GetPodPidInformation(descriptors []string) ([]string, error) {
 		}
 		c.lock.Unlock()
 	}
+
+	// Also support comma-separated input.
+	psgoDescriptors := []string{}
+	for _, d := range descriptors {
+		for _, s := range strings.Split(d, ",") {
+			if s != "" {
+				psgoDescriptors = append(psgoDescriptors, s)
+			}
+		}
+	}
+
 	// TODO: psgo returns a [][]string to give users the ability to apply
 	//       filters on the data.  We need to change the API here and the
 	//       varlink API to return a [][]string if we want to make use of
 	//       filtering.
 	opts := psgo.JoinNamespaceOpts{FillMappings: rootless.IsRootless()}
-	output, err := psgo.JoinNamespaceAndProcessInfoByPidsWithOptions(pids, descriptors, &opts)
+	output, err := psgo.JoinNamespaceAndProcessInfoByPidsWithOptions(pids, psgoDescriptors, &opts)
 	if err != nil {
 		return nil, err
 	}

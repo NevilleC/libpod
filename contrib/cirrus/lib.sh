@@ -6,11 +6,16 @@
 # Global details persist here
 source /etc/environment  # not always loaded under all circumstances
 
+# Automation environment doesn't automatically load for Ubuntu 18
+if [[ -r '/usr/share/automation/environment' ]]; then
+    source '/usr/share/automation/environment'
+fi
+
 # Under some contexts these values are not set, make sure they are.
-USER="$(whoami)"
-HOME="$(getent passwd $USER | cut -d : -f 6)"
-[[ -n "$UID" ]] || UID=$(getent passwd $USER | cut -d : -f 3)
-GID=$(getent passwd $USER | cut -d : -f 4)
+export USER="$(whoami)"
+export HOME="$(getent passwd $USER | cut -d : -f 6)"
+[[ -n "$UID" ]] || export UID=$(getent passwd $USER | cut -d : -f 3)
+export GID=$(getent passwd $USER | cut -d : -f 4)
 
 # Essential default paths, many are overridden when executing under Cirrus-CI
 export GOPATH="${GOPATH:-/var/tmp/go}"
@@ -24,16 +29,16 @@ then
     # Ensure compiled tooling is reachable
     export PATH="$PATH:$GOPATH/bin"
 fi
-CIRRUS_WORKING_DIR="${CIRRUS_WORKING_DIR:-$GOPATH/src/github.com/containers/libpod}"
+CIRRUS_WORKING_DIR="${CIRRUS_WORKING_DIR:-$GOPATH/src/github.com/containers/podman}"
 export GOSRC="${GOSRC:-$CIRRUS_WORKING_DIR}"
 export PATH="$HOME/bin:$GOPATH/bin:/usr/local/bin:$PATH"
 export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 # Saves typing / in case location ever moves
 SCRIPT_BASE=${SCRIPT_BASE:-./contrib/cirrus}
-PACKER_BASE=${PACKER_BASE:-./contrib/cirrus/packer}
 # Important filepaths
 SETUP_MARKER_FILEPATH="${SETUP_MARKER_FILEPATH:-/var/tmp/.setup_environment_sh_complete}"
-AUTHOR_NICKS_FILEPATH="${CIRRUS_WORKING_DIR}/${SCRIPT_BASE}/git_authors_to_irc_nicks.csv"
+# Downloaded, but not installed packages.
+PACKAGE_DOWNLOAD_DIR=/var/cache/download
 
 # Log remote-client system test varlink output here
 export VARLINK_LOG=/var/tmp/varlink.log
@@ -54,41 +59,40 @@ CONTINUOUS_INTEGRATION="${CONTINUOUS_INTEGRATION:-false}"
 CIRRUS_REPO_NAME=${CIRRUS_REPO_NAME:-libpod}
 CIRRUS_BASE_SHA=${CIRRUS_BASE_SHA:-unknown$(date +%s)}  # difficult to reliably discover
 CIRRUS_BUILD_ID=${CIRRUS_BUILD_ID:-$RANDOM$(date +%s)}  # must be short and unique
-# Vars. for image-building
-PACKER_VER="1.4.2"
-# CSV of cache-image names to build (see $PACKER_BASE/libpod_images.json)
 
-# Base-images rarely change, define them here so they're out of the way.
-export PACKER_BUILDS="${PACKER_BUILDS:-ubuntu-18,ubuntu-19,fedora-30,xfedora-30,fedora-29}"
-# Google-maintained base-image names
-export UBUNTU_BASE_IMAGE="ubuntu-1904-disco-v20190724"
-export PRIOR_UBUNTU_BASE_IMAGE="ubuntu-1804-bionic-v20190722a"
-# Manually produced base-image names (see $SCRIPT_BASE/README.md)
-export FEDORA_BASE_IMAGE="fedora-cloud-base-30-1-2-1565360543"
-export PRIOR_FEDORA_BASE_IMAGE="fedora-cloud-base-29-1-2-1565360543"
-export BUILT_IMAGE_SUFFIX="${BUILT_IMAGE_SUFFIX:--$CIRRUS_REPO_NAME-${CIRRUS_BUILD_ID}}"
+OS_RELEASE_ID="$(source /etc/os-release; echo $ID)"
+# GCE image-name compatible string representation of distribution _major_ version
+OS_RELEASE_VER="$(source /etc/os-release; echo $VERSION_ID | cut -d '.' -f 1)"
+# Combined to ease soe usage
+OS_REL_VER="${OS_RELEASE_ID}-${OS_RELEASE_VER}"
+
 # IN_PODMAN container image
-IN_PODMAN_IMAGE="quay.io/libpod/in_podman:latest"
+IN_PODMAN_IMAGE="quay.io/libpod/${OS_RELEASE_ID}_podman:$_BUILT_IMAGE_SUFFIX"
 # Image for uploading releases
-UPLDREL_IMAGE="quay.io/libpod/upldrel:latest"
+UPLDREL_IMAGE="quay.io/libpod/upldrel:master"
+
+# This is needed under some environments/contexts
+SUDO=''
+[[ "$UID" -eq 0 ]] || \
+    SUDO='sudo -E'
 
 # Avoid getting stuck waiting for user input
 export DEBIAN_FRONTEND="noninteractive"
-SUDOAPTGET="ooe.sh sudo -E apt-get -qq --yes"
-SUDOAPTADD="ooe.sh sudo -E add-apt-repository --yes"
+SUDOAPTGET="$SUDO apt-get -qq --yes"
+SUDOAPTADD="$SUDO add-apt-repository --yes"
 # Regex that finds enabled periodic apt configuration items
 PERIODIC_APT_RE='^(APT::Periodic::.+")1"\;'
 # Short-cuts for retrying/timeout calls
-LILTO="timeout_attempt_delay_command 24s 5 30s"
-BIGTO="timeout_attempt_delay_command 300s 5 30s"
+LILTO="timeout_attempt_delay_command 120s 5 30s"
+BIGTO="timeout_attempt_delay_command 300s 5 60s"
 
 # Safe env. vars. to transfer from root -> $ROOTLESS_USER  (go env handled separately)
-ROOTLESS_ENV_RE='(CIRRUS_.+)|(ROOTLESS_.+)|(.+_IMAGE.*)|(.+_BASE)|(.*DIRPATH)|(.*FILEPATH)|(SOURCE.*)|(DEPEND.*)|(.+_DEPS_.+)|(OS_REL.*)|(.+_ENV_RE)|(TRAVIS)|(CI.+)|(TEST_REMOTE.*)'
+ROOTLESS_ENV_RE='(CIRRUS_.+)|(ROOTLESS_.+)|(.+_IMAGE.*)|(.+_BASE)|(.*DIRPATH)|(.*FILEPATH)|(SOURCE.*)|(DEPEND.*)|(.+_DEPS_.+)|(OS_REL.*)|(.+_ENV_RE)|(TRAVIS)|(CI.+)|(REMOTE.*)'
 # Unsafe env. vars for display
-SECRET_ENV_RE='(IRCID)|(ACCOUNT)|(GC[EP]..+)|(SSH)'
+SECRET_ENV_RE='(ACCOUNT)|(GC[EP]..+)|(SSH)'
 
 SPECIALMODE="${SPECIALMODE:-none}"
-TEST_REMOTE_CLIENT="${TEST_REMOTE_CLIENT:-false}"
+RCLI="${RCLI:-false}"
 export CONTAINER_RUNTIME=${CONTAINER_RUNTIME:-podman}
 
 # When running as root, this may be empty or not, as a user, it MUST be set.
@@ -98,17 +102,9 @@ then
 else
     ROOTLESS_USER="${ROOTLESS_USER:-$USER}"
 fi
+# Type of filesystem used for cgroups
+CG_FS_TYPE="$(stat -f -c %T /sys/fs/cgroup)"
 
-# GCE image-name compatible string representation of distribution name
-OS_RELEASE_ID="$(source /etc/os-release; echo $ID)"
-# GCE image-name compatible string representation of distribution _major_ version
-OS_RELEASE_VER="$(source /etc/os-release; echo $VERSION_ID | cut -d '.' -f 1)"
-# Combined to ease soe usage
-OS_REL_VER="${OS_RELEASE_ID}-${OS_RELEASE_VER}"
-
-# Installed into cache-images, supports overrides
-# by user-data in case of breakage or for debugging.
-CUSTOM_CLOUD_CONFIG_DEFAULTS="$GOSRC/$PACKER_BASE/cloud-init/$OS_RELEASE_ID/cloud.cfg.d"
 # Pass in a list of one or more envariable names; exit non-zero with
 # helpful error message if any value is empty
 req_env_var() {
@@ -178,8 +174,7 @@ die() {
 }
 
 warn() {
-    echo ">>>>> ${2:-WARNING (but no message given!) in ${FUNCNAME[1]}()}" > /dev/stderr
-    echo ${1:-1} > /dev/stdout
+    echo ">>>>> ${1:-WARNING (but no message given!) in ${FUNCNAME[1]}()}" > /dev/stderr
 }
 
 bad_os_id_ver() {
@@ -220,75 +215,14 @@ timeout_attempt_delay_command() {
     fi
 }
 
-ircmsg() {
-    req_env_var CIRRUS_TASK_ID IRCID
-    [[ -n "$*" ]] || die 9 "ircmsg() invoked without message text argument"
-    # Sometimes setup_environment.sh didn't run
-    SCRIPT="$(dirname $0)/podbot.py"
-    NICK="podbot_$CIRRUS_TASK_ID"
-    NICK="${NICK:0:15}"  # Any longer will break things
-    set +e
-    $SCRIPT $NICK $@
-    echo "Ignoring exit($?)"
-    set -e
-}
-
-# This covers all possible human & CI workflow parallel & serial combinations
-# where at least one caller must definitively discover if within a commit range
-# there is at least one release tag not having any '-' characters (return 0)
-# or otherwise (return non-0).
-is_release() {
-    unset RELVER
-    local ret
-    req_env_var CIRRUS_CHANGE_IN_REPO
-    if [[ -n "$CIRRUS_TAG" ]]; then
-        RELVER="$CIRRUS_TAG"
-    elif [[ ! "$CIRRUS_BASE_SHA" =~ "unknown" ]]
-    then
-        # Normally not possible for this to be empty, except when unittesting.
-        req_env_var CIRRUS_BASE_SHA
-        local range="${CIRRUS_BASE_SHA}..${CIRRUS_CHANGE_IN_REPO}"
-        if echo "${range}$CIRRUS_TAG" | grep -iq 'unknown'; then
-            die 11 "is_release() unusable range ${range} or tag $CIRRUS_TAG"
-        fi
-
-        if type -P git &> /dev/null
-        then
-            git fetch --all --tags &> /dev/null|| \
-                die 12 "is_release() failed to fetch tags"
-            RELVER=$(git log --pretty='format:%d' $range | \
-                     grep '(tag:' | sed -r -e 's/\s+[(]tag:\s+(v[0-9].*)[)]/\1/' | \
-                     sort -uV | tail -1)
-            ret=$?
-        else
-            warn -1 "Git command not found while checking for release"
-            ret="-1"
-        fi
-        [[ "$ret" -eq "0" ]] || \
-            die 13 "is_release() failed to parse tags"
-    else  # Not testing a PR, but neither CIRRUS_BASE_SHA or CIRRUS_TAG are set
-        return 1
-    fi
-    if [[ -n "$RELVER" ]]; then
-        echo "Found \$RELVER $RELVER"
-        if echo "$RELVER" | grep -q '-'; then
-            return 2  # development tag
-        else
-            return 0
-        fi
-    else
-        return 1  # not a release
-    fi
-}
-
 setup_rootless() {
-    req_env_var ROOTLESS_USER GOSRC SECRET_ENV_RE ROOTLESS_ENV_RE
+    req_env_var ROOTLESS_USER GOPATH GOSRC SECRET_ENV_RE ROOTLESS_ENV_RE
 
     # Only do this once
     if passwd --status $ROOTLESS_USER
     then
         echo "Updating $ROOTLESS_USER user permissions on possibly changed libpod code"
-        chown -R $ROOTLESS_USER:$ROOTLESS_USER "$GOSRC"
+        chown -R $ROOTLESS_USER:$ROOTLESS_USER "$GOPATH" "$GOSRC"
         return 0
     fi
 
@@ -299,9 +233,9 @@ setup_rootless() {
     echo "creating $ROOTLESS_UID:$ROOTLESS_GID $ROOTLESS_USER user"
     groupadd -g $ROOTLESS_GID $ROOTLESS_USER
     useradd -g $ROOTLESS_GID -u $ROOTLESS_UID --no-user-group --create-home $ROOTLESS_USER
-    chown -R $ROOTLESS_USER:$ROOTLESS_USER "$GOSRC"
+    chown -R $ROOTLESS_USER:$ROOTLESS_USER "$GOPATH" "$GOSRC"
 
-    echo "creating ssh keypair for $USER"
+    echo "creating ssh key pair for $USER"
     [[ -r "$HOME/.ssh/id_rsa" ]] || \
         ssh-keygen -P "" -f "$HOME/.ssh/id_rsa"
 
@@ -352,27 +286,6 @@ setup_rootless() {
         die 11 "Timeout exceeded waiting for localhost ssh capability"
 }
 
-# Helper/wrapper script to only show stderr/stdout on non-zero exit
-install_ooe() {
-    req_env_var SCRIPT_BASE
-    echo "Installing script to mask stdout/stderr unless non-zero exit."
-    sudo install -D -m 755 "$GOSRC/$SCRIPT_BASE/ooe.sh" /usr/local/bin/ooe.sh
-}
-
-# Grab a newer version of git from software collections
-# https://www.softwarecollections.org/en/
-# and use it with a wrapper
-install_scl_git() {
-    echo "Installing SoftwareCollections updated 'git' version."
-    ooe.sh sudo yum -y install rh-git29
-    cat << "EOF" | sudo tee /usr/bin/git
-#!/bin/bash
-
-scl enable rh-git29 -- git $@
-EOF
-    sudo chmod 755 /usr/bin/git
-}
-
 install_test_configs() {
     echo "Installing cni config, policy and registry config"
     req_env_var GOSRC SCRIPT_BASE
@@ -382,12 +295,10 @@ install_test_configs() {
     # as the default).  This config prevents allocation of network address space used
     # by default in google cloud.  https://cloud.google.com/vpc/docs/vpc#ip-ranges
     install -v -D -m 644 $SCRIPT_BASE/99-do-not-use-google-subnets.conflist /etc/cni/net.d/
-    install -v -D -m 644 ./test/policy.json /etc/containers/
     install -v -D -m 644 ./test/registries.conf /etc/containers/
 }
 
-# Remove all files (except conmon, for now) provided by the distro version of podman.
-# Except conmon, for now as it's expected to eventually be  packaged separately.
+# Remove all files provided by the distro version of podman.
 # All VM cache-images used for testing include the distro podman because (1) it's
 # required for podman-in-podman testing and (2) it somewhat simplifies the task
 # of pulling in necessary prerequisites packages as the set can change over time.
@@ -413,9 +324,9 @@ remove_packaged_podman_files() {
 
     if [[ "$OS_RELEASE_ID" =~ "ubuntu" ]]
     then
-        LISTING_CMD="sudo -E dpkg-query -L podman"
+        LISTING_CMD="$SUDO dpkg-query -L podman"
     else
-        LISTING_CMD='sudo rpm -ql podman'
+        LISTING_CMD="$SUDO rpm -ql podman"
     fi
 
     # yum/dnf/dpkg may list system directories, only remove files
@@ -423,55 +334,29 @@ remove_packaged_podman_files() {
     do
         # Sub-directories may contain unrelated/valuable stuff
         if [[ -d "$fullpath" ]]; then continue; fi
-        ooe.sh sudo rm -vf "$fullpath"
+        ooe.sh $SUDO rm -vf "$fullpath"
     done
 
     # Be super extra sure and careful vs performant and completely safe
     sync && echo 3 > /proc/sys/vm/drop_caches
 }
 
-systemd_banish() {
-    $GOSRC/$PACKER_BASE/systemd_banish.sh
+# The version of CRI-O and Kubernetes must always match
+get_kubernetes_version(){
+    # TODO: Look up the kube RPM/DEB version installed, or in $PACKAGE_DOWNLOAD_DIR
+    #       and retrieve the major-minor version directly.
+    local KUBERNETES_VERSION="1.15"
+    echo "$KUBERNETES_VERSION"
 }
 
-_finalize() {
-    set +e  # Don't fail at the very end
-    if [[ -d "$CUSTOM_CLOUD_CONFIG_DEFAULTS" ]]
-    then
-        echo "Installing custom cloud-init defaults"
-        sudo cp -v "$CUSTOM_CLOUD_CONFIG_DEFAULTS"/* /etc/cloud/cloud.cfg.d/
-    else
-        echo "Could not find any files in $CUSTOM_CLOUD_CONFIG_DEFAULTS"
-    fi
-    echo "Re-initializing so next boot does 'first-boot' setup again."
-    sudo history -c
-    cd /
-    sudo rm -rf /var/lib/cloud/instanc*
-    sudo rm -rf /root/.ssh/*
-    sudo rm -rf /etc/ssh/*key*
-    sudo rm -rf /etc/ssh/moduli
-    sudo rm -rf /home/*
-    sudo rm -rf /tmp/*
-    sudo rm -rf /tmp/.??*
-    sudo sync
-    sudo fstrim -av
-}
-
-rh_finalize() {
-    set +e  # Don't fail at the very end
-    echo "Resetting to fresh-state for usage as cloud-image."
-    PKG=$(type -P dnf || type -P yum || echo "")
-    sudo $PKG clean all
-    sudo rm -rf /var/cache/{yum,dnf}
-    sudo rm -f /etc/udev/rules.d/*-persistent-*.rules
-    sudo touch /.unconfigured  # force firstboot to run
-    _finalize
-}
-
-ubuntu_finalize() {
-    set +e  # Don't fail at the very end
-    echo "Resetting to fresh-state for usage as cloud-image."
-    $LILTO $SUDOAPTGET autoremove
-    sudo rm -rf /var/cache/apt
-    _finalize
+canonicalize_image_names() {
+    req_env_var IMGNAMES
+    echo "Adding all current base images to \$IMGNAMES for timestamp update"
+    export IMGNAMES="\
+$IMGNAMES
+$UBUNTU_BASE_IMAGE
+$PRIOR_UBUNTU_BASE_IMAGE
+$FEDORA_BASE_IMAGE
+$PRIOR_FEDORA_BASE_IMAGE
+"
 }

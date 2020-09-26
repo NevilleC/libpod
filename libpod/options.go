@@ -4,27 +4,30 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"regexp"
+	"strings"
 	"syscall"
 
+	"github.com/containers/common/pkg/config"
 	"github.com/containers/image/v5/manifest"
-	"github.com/containers/libpod/libpod/define"
-	"github.com/containers/libpod/libpod/events"
-	"github.com/containers/libpod/pkg/namespaces"
-	"github.com/containers/libpod/pkg/rootless"
-	"github.com/containers/libpod/pkg/util"
+	"github.com/containers/image/v5/types"
+	"github.com/containers/podman/v2/libpod/define"
+	"github.com/containers/podman/v2/libpod/events"
+	"github.com/containers/podman/v2/pkg/namespaces"
+	"github.com/containers/podman/v2/pkg/rootless"
+	"github.com/containers/podman/v2/pkg/util"
 	"github.com/containers/storage"
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/cri-o/ocicni/pkg/ocicni"
+	"github.com/opencontainers/runtime-tools/generate"
 	"github.com/pkg/errors"
-)
-
-var (
-	NameRegex  = regexp.MustCompile("^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
-	RegexError = errors.Wrapf(define.ErrInvalidArg, "names must match [a-zA-Z0-9][a-zA-Z0-9_.-]*")
+	"github.com/sirupsen/logrus"
 )
 
 // Runtime Creation Options
+var (
+	// SdNotifyModeValues describes the only values that SdNotifyMode can be
+	SdNotifyModeValues = []string{define.SdNotifyModeContainer, define.SdNotifyModeConmon, define.SdNotifyModeIgnore}
+)
 
 // WithStorageConfig uses the given configuration to set up container storage.
 // If this is not specified, the system default configuration will be used
@@ -38,48 +41,48 @@ func WithStorageConfig(config storage.StoreOptions) RuntimeOption {
 		setField := false
 
 		if config.RunRoot != "" {
-			rt.config.StorageConfig.RunRoot = config.RunRoot
-			rt.config.StorageConfigRunRootSet = true
+			rt.storageConfig.RunRoot = config.RunRoot
+			rt.storageSet.RunRootSet = true
 			setField = true
 		}
 
 		if config.GraphRoot != "" {
-			rt.config.StorageConfig.GraphRoot = config.GraphRoot
-			rt.config.StorageConfigGraphRootSet = true
+			rt.storageConfig.GraphRoot = config.GraphRoot
+			rt.storageSet.GraphRootSet = true
 
 			// Also set libpod static dir, so we are a subdirectory
 			// of the c/storage store by default
-			rt.config.StaticDir = filepath.Join(config.GraphRoot, "libpod")
-			rt.config.StaticDirSet = true
+			rt.config.Engine.StaticDir = filepath.Join(config.GraphRoot, "libpod")
+			rt.storageSet.StaticDirSet = true
 
 			// Also set libpod volume path, so we are a subdirectory
 			// of the c/storage store by default
-			rt.config.VolumePath = filepath.Join(config.GraphRoot, "volumes")
-			rt.config.VolumePathSet = true
+			rt.config.Engine.VolumePath = filepath.Join(config.GraphRoot, "volumes")
+			rt.storageSet.VolumePathSet = true
 
 			setField = true
 		}
 
 		if config.GraphDriverName != "" {
-			rt.config.StorageConfig.GraphDriverName = config.GraphDriverName
-			rt.config.StorageConfigGraphDriverNameSet = true
+			rt.storageConfig.GraphDriverName = config.GraphDriverName
+			rt.storageSet.GraphDriverNameSet = true
 			setField = true
 		}
 
 		if config.GraphDriverOptions != nil {
-			rt.config.StorageConfig.GraphDriverOptions = make([]string, len(config.GraphDriverOptions))
-			copy(rt.config.StorageConfig.GraphDriverOptions, config.GraphDriverOptions)
+			rt.storageConfig.GraphDriverOptions = make([]string, len(config.GraphDriverOptions))
+			copy(rt.storageConfig.GraphDriverOptions, config.GraphDriverOptions)
 			setField = true
 		}
 
 		if config.UIDMap != nil {
-			rt.config.StorageConfig.UIDMap = make([]idtools.IDMap, len(config.UIDMap))
-			copy(rt.config.StorageConfig.UIDMap, config.UIDMap)
+			rt.storageConfig.UIDMap = make([]idtools.IDMap, len(config.UIDMap))
+			copy(rt.storageConfig.UIDMap, config.UIDMap)
 		}
 
 		if config.GIDMap != nil {
-			rt.config.StorageConfig.GIDMap = make([]idtools.IDMap, len(config.GIDMap))
-			copy(rt.config.StorageConfig.GIDMap, config.GIDMap)
+			rt.storageConfig.GIDMap = make([]idtools.IDMap, len(config.GIDMap))
+			copy(rt.storageConfig.GIDMap, config.GIDMap)
 		}
 
 		// If any one of runroot, graphroot, graphdrivername,
@@ -90,11 +93,11 @@ func WithStorageConfig(config storage.StoreOptions) RuntimeOption {
 			if err != nil {
 				return err
 			}
-			if rt.config.StorageConfig.GraphRoot == "" {
-				rt.config.StorageConfig.GraphRoot = storeOpts.GraphRoot
+			if rt.storageConfig.GraphRoot == "" {
+				rt.storageConfig.GraphRoot = storeOpts.GraphRoot
 			}
-			if rt.config.StorageConfig.RunRoot == "" {
-				rt.config.StorageConfig.RunRoot = storeOpts.RunRoot
+			if rt.storageConfig.RunRoot == "" {
+				rt.storageConfig.RunRoot = storeOpts.RunRoot
 			}
 		}
 
@@ -109,7 +112,7 @@ func WithDefaultTransport(defaultTransport string) RuntimeOption {
 			return define.ErrRuntimeFinalized
 		}
 
-		rt.config.ImageDefaultTransport = defaultTransport
+		rt.config.Engine.ImageDefaultTransport = defaultTransport
 
 		return nil
 	}
@@ -125,7 +128,7 @@ func WithSignaturePolicy(path string) RuntimeOption {
 			return define.ErrRuntimeFinalized
 		}
 
-		rt.config.SignaturePolicyPath = path
+		rt.config.Engine.SignaturePolicyPath = path
 
 		return nil
 	}
@@ -135,17 +138,17 @@ func WithSignaturePolicy(path string) RuntimeOption {
 // Please note that information is not portable between backing states.
 // As such, if this differs between two libpods running on the same system,
 // they will not share containers, and unspecified behavior may occur.
-func WithStateType(storeType define.RuntimeStateStore) RuntimeOption {
+func WithStateType(storeType config.RuntimeStateStore) RuntimeOption {
 	return func(rt *Runtime) error {
 		if rt.valid {
 			return define.ErrRuntimeFinalized
 		}
 
-		if storeType == define.InvalidStateStore {
+		if storeType == config.InvalidStateStore {
 			return errors.Wrapf(define.ErrInvalidArg, "must provide a valid state store type")
 		}
 
-		rt.config.StateType = storeType
+		rt.config.Engine.StateType = storeType
 
 		return nil
 	}
@@ -162,8 +165,7 @@ func WithOCIRuntime(runtime string) RuntimeOption {
 			return errors.Wrapf(define.ErrInvalidArg, "must provide a valid path")
 		}
 
-		rt.config.OCIRuntime = runtime
-		rt.config.RuntimePath = nil
+		rt.config.Engine.OCIRuntime = runtime
 
 		return nil
 	}
@@ -181,7 +183,7 @@ func WithConmonPath(path string) RuntimeOption {
 			return errors.Wrapf(define.ErrInvalidArg, "must provide a valid path")
 		}
 
-		rt.config.ConmonPath = []string{path}
+		rt.config.Engine.ConmonPath = []string{path}
 
 		return nil
 	}
@@ -194,8 +196,8 @@ func WithConmonEnv(environment []string) RuntimeOption {
 			return define.ErrRuntimeFinalized
 		}
 
-		rt.config.ConmonEnvVars = make([]string, len(environment))
-		copy(rt.config.ConmonEnvVars, environment)
+		rt.config.Engine.ConmonEnvVars = make([]string, len(environment))
+		copy(rt.config.Engine.ConmonEnvVars, environment)
 
 		return nil
 	}
@@ -209,7 +211,7 @@ func WithNetworkCmdPath(path string) RuntimeOption {
 			return define.ErrRuntimeFinalized
 		}
 
-		rt.config.NetworkCmdPath = path
+		rt.config.Engine.NetworkCmdPath = path
 
 		return nil
 	}
@@ -224,12 +226,12 @@ func WithCgroupManager(manager string) RuntimeOption {
 			return define.ErrRuntimeFinalized
 		}
 
-		if manager != define.CgroupfsCgroupsManager && manager != define.SystemdCgroupsManager {
+		if manager != config.CgroupfsCgroupsManager && manager != config.SystemdCgroupsManager {
 			return errors.Wrapf(define.ErrInvalidArg, "CGroup manager must be one of %s and %s",
-				define.CgroupfsCgroupsManager, define.SystemdCgroupsManager)
+				config.CgroupfsCgroupsManager, config.SystemdCgroupsManager)
 		}
 
-		rt.config.CgroupManager = manager
+		rt.config.Engine.CgroupManager = manager
 
 		return nil
 	}
@@ -243,9 +245,25 @@ func WithStaticDir(dir string) RuntimeOption {
 			return define.ErrRuntimeFinalized
 		}
 
-		rt.config.StaticDir = dir
-		rt.config.StaticDirSet = true
+		rt.config.Engine.StaticDir = dir
+		rt.config.Engine.StaticDirSet = true
 
+		return nil
+	}
+}
+
+// WithRegistriesConf configures the runtime to always use specified
+// registries.conf for image processing.
+func WithRegistriesConf(path string) RuntimeOption {
+	logrus.Debugf("Setting custom registries.conf: %q", path)
+	return func(rt *Runtime) error {
+		if _, err := os.Stat(path); err != nil {
+			return errors.Wrap(err, "error locating specified registries.conf")
+		}
+		if rt.imageContext == nil {
+			rt.imageContext = &types.SystemContext{}
+		}
+		rt.imageContext.SystemRegistriesConfPath = path
 		return nil
 	}
 }
@@ -263,7 +281,7 @@ func WithHooksDir(hooksDirs ...string) RuntimeOption {
 			}
 		}
 
-		rt.config.HooksDir = hooksDirs
+		rt.config.Engine.HooksDir = hooksDirs
 		return nil
 	}
 }
@@ -281,7 +299,7 @@ func WithDefaultMountsFile(mountsFile string) RuntimeOption {
 		if mountsFile == "" {
 			return define.ErrInvalidArg
 		}
-		rt.config.DefaultMountsFile = mountsFile
+		rt.config.Containers.DefaultMountsFile = mountsFile
 		return nil
 	}
 }
@@ -294,8 +312,8 @@ func WithTmpDir(dir string) RuntimeOption {
 		if rt.valid {
 			return define.ErrRuntimeFinalized
 		}
-		rt.config.TmpDir = dir
-		rt.config.TmpDirSet = true
+		rt.config.Engine.TmpDir = dir
+		rt.config.Engine.TmpDirSet = true
 
 		return nil
 	}
@@ -318,7 +336,7 @@ func WithMaxLogSize(limit int64) RuntimeOption {
 			return define.ErrRuntimeFinalized
 		}
 
-		rt.config.MaxLogSize = limit
+		rt.config.Containers.LogSizeMax = limit
 
 		return nil
 	}
@@ -332,7 +350,7 @@ func WithNoPivotRoot() RuntimeOption {
 			return define.ErrRuntimeFinalized
 		}
 
-		rt.config.NoPivotRoot = true
+		rt.config.Engine.NoPivotRoot = true
 
 		return nil
 	}
@@ -345,7 +363,7 @@ func WithCNIConfigDir(dir string) RuntimeOption {
 			return define.ErrRuntimeFinalized
 		}
 
-		rt.config.CNIConfigDir = dir
+		rt.config.Network.NetworkConfigDir = dir
 
 		return nil
 	}
@@ -358,7 +376,7 @@ func WithCNIPluginDir(dir string) RuntimeOption {
 			return define.ErrRuntimeFinalized
 		}
 
-		rt.config.CNIPluginDir = []string{dir}
+		rt.config.Network.CNIPluginDirs = []string{dir}
 
 		return nil
 	}
@@ -378,7 +396,7 @@ func WithNamespace(ns string) RuntimeOption {
 			return define.ErrRuntimeFinalized
 		}
 
-		rt.config.Namespace = ns
+		rt.config.Engine.Namespace = ns
 
 		return nil
 	}
@@ -393,8 +411,8 @@ func WithVolumePath(volPath string) RuntimeOption {
 			return define.ErrRuntimeFinalized
 		}
 
-		rt.config.VolumePath = volPath
-		rt.config.VolumePathSet = true
+		rt.config.Engine.VolumePath = volPath
+		rt.config.Engine.VolumePathSet = true
 
 		return nil
 	}
@@ -411,7 +429,7 @@ func WithDefaultInfraImage(img string) RuntimeOption {
 			return define.ErrRuntimeFinalized
 		}
 
-		rt.config.InfraImage = img
+		rt.config.Engine.InfraImage = img
 
 		return nil
 	}
@@ -425,7 +443,7 @@ func WithDefaultInfraCommand(cmd string) RuntimeOption {
 			return define.ErrRuntimeFinalized
 		}
 
-		rt.config.InfraCommand = cmd
+		rt.config.Engine.InfraCommand = cmd
 
 		return nil
 	}
@@ -448,7 +466,7 @@ func WithRenumber() RuntimeOption {
 }
 
 // WithMigrate instructs libpod to migrate container configurations to account
-// for changes between Libpod versions. All running containers will be stopped
+// for changes between Engine versions. All running containers will be stopped
 // during a migration, then restarted after the migration is complete.
 func WithMigrate() RuntimeOption {
 	return func(rt *Runtime) error {
@@ -462,10 +480,10 @@ func WithMigrate() RuntimeOption {
 	}
 }
 
-// WithMigrateRuntime instructs Libpod to change the default OCI runtime on all
+// WithMigrateRuntime instructs Engine to change the default OCI runtime on all
 // containers during a migration. This is not used if `MigrateRuntime()` is not
 // also passed.
-// Libpod makes no promises that your containers continue to work with the new
+// Engine makes no promises that your containers continue to work with the new
 // runtime - migrations between dissimilar runtimes may well break things.
 // Use with caution.
 func WithMigrateRuntime(requestedRuntime string) RuntimeOption {
@@ -497,7 +515,7 @@ func WithEventsLogger(logger string) RuntimeOption {
 			return errors.Wrapf(define.ErrInvalidArg, "%q is not a valid events backend", logger)
 		}
 
-		rt.config.EventsLogger = logger
+		rt.config.Engine.EventsLogger = logger
 
 		return nil
 	}
@@ -507,7 +525,18 @@ func WithEventsLogger(logger string) RuntimeOption {
 // listening
 func WithEnableSDNotify() RuntimeOption {
 	return func(rt *Runtime) error {
-		rt.config.SDNotify = true
+		rt.config.Engine.SDNotify = true
+		return nil
+	}
+}
+
+// WithRuntimeFlags adds the global runtime flags to the container config
+func WithRuntimeFlags(runtimeFlags []string) RuntimeOption {
+	return func(rt *Runtime) error {
+		if rt.valid {
+			return define.ErrRuntimeFinalized
+		}
+		rt.runtimeFlags = runtimeFlags
 		return nil
 	}
 }
@@ -534,6 +563,23 @@ func WithSystemd() CtrCreateOption {
 		}
 
 		ctr.config.Systemd = true
+		return nil
+	}
+}
+
+// WithSdNotifyMode sets the sd-notify method
+func WithSdNotifyMode(mode string) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+
+		// verify values
+		if len(mode) > 0 && !util.StringInSlice(strings.ToLower(mode), SdNotifyModeValues) {
+			return errors.Wrapf(define.ErrInvalidArg, "--sdnotify values must be one of %q", strings.Join(SdNotifyModeValues, ", "))
+		}
+
+		ctr.config.SdNotifyMode = mode
 		return nil
 	}
 }
@@ -573,7 +619,7 @@ func WithSecLabels(labelOpts []string) CtrCreateOption {
 	}
 }
 
-// WithUser sets the user identity field in configutation.
+// WithUser sets the user identity field in configuration.
 // Valid uses [user | user:group | uid | uid:gid | user:gid | uid:group ].
 func WithUser(user string) CtrCreateOption {
 	return func(ctr *Container) error {
@@ -591,23 +637,15 @@ func WithUser(user string) CtrCreateOption {
 // other configuration from the image will be added to the config.
 // TODO: Replace image name and ID with a libpod.Image struct when that is
 // finished.
-func WithRootFSFromImage(imageID string, imageName string, useImageVolumes bool) CtrCreateOption {
+func WithRootFSFromImage(imageID, imageName, rawImageName string) CtrCreateOption {
 	return func(ctr *Container) error {
 		if ctr.valid {
 			return define.ErrCtrFinalized
 		}
 
-		if ctr.config.RootfsImageID != "" || ctr.config.RootfsImageName != "" {
-			return errors.Wrapf(define.ErrInvalidArg, "container already configured with root filesystem")
-		}
-		if ctr.config.Rootfs != "" {
-			return errors.Wrapf(define.ErrInvalidArg, "cannot set both an image ID and a rootfs for a container")
-		}
-
 		ctr.config.RootfsImageID = imageID
 		ctr.config.RootfsImageName = imageName
-		ctr.config.ImageVolumes = useImageVolumes
-
+		ctr.config.RawImageName = rawImageName
 		return nil
 	}
 }
@@ -669,8 +707,8 @@ func WithName(name string) CtrCreateOption {
 		}
 
 		// Check the name against a regex
-		if !NameRegex.MatchString(name) {
-			return RegexError
+		if !define.NameRegex.MatchString(name) {
+			return define.RegexError
 		}
 
 		ctr.config.Name = name
@@ -731,7 +769,9 @@ func WithExitCommand(exitCommand []string) CtrCreateOption {
 			return define.ErrCtrFinalized
 		}
 
-		ctr.config.ExitCommand = append(exitCommand, ctr.ID())
+		ctr.config.ExitCommand = exitCommand
+		ctr.config.ExitCommand = append(ctr.config.ExitCommand, ctr.ID())
+
 		return nil
 	}
 }
@@ -812,10 +852,6 @@ func WithNetNSFrom(nsCtr *Container) CtrCreateOption {
 			return err
 		}
 
-		if ctr.config.CreateNetNS {
-			return errors.Wrapf(define.ErrInvalidArg, "cannot join another container's net ns as we are making a new net ns")
-		}
-
 		ctr.config.NetNsCtr = nsCtr.ID()
 
 		return nil
@@ -836,12 +872,22 @@ func WithPIDNSFrom(nsCtr *Container) CtrCreateOption {
 			return err
 		}
 
-		if ctr.config.NoCgroups {
-			return errors.Wrapf(define.ErrInvalidArg, "container has disabled creation of CGroups, which is incompatible with sharing a PID namespace")
-		}
-
 		ctr.config.PIDNsCtr = nsCtr.ID()
 
+		return nil
+	}
+}
+
+// WithAddCurrentUserPasswdEntry indicates that container should add current
+// user entry to /etc/passwd, since the UID will be mapped into the container,
+// via user namespace
+func WithAddCurrentUserPasswdEntry() CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+
+		ctr.config.AddCurrentUserPasswdEntry = true
 		return nil
 	}
 }
@@ -863,6 +909,17 @@ func WithUserNSFrom(nsCtr *Container) CtrCreateOption {
 		ctr.config.UserNsCtr = nsCtr.ID()
 		ctr.config.IDMappings = nsCtr.config.IDMappings
 
+		g := generate.NewFromSpec(ctr.config.Spec)
+
+		g.ClearLinuxUIDMappings()
+		for _, uidmap := range nsCtr.config.IDMappings.UIDMap {
+			g.AddLinuxUIDMapping(uint32(uidmap.HostID), uint32(uidmap.ContainerID), uint32(uidmap.Size))
+		}
+		g.ClearLinuxGIDMappings()
+		for _, gidmap := range nsCtr.config.IDMappings.GIDMap {
+			g.AddLinuxGIDMapping(uint32(gidmap.HostID), uint32(gidmap.ContainerID), uint32(gidmap.Size))
+		}
+		ctr.config.IDMappings = nsCtr.config.IDMappings
 		return nil
 	}
 }
@@ -918,16 +975,8 @@ func WithDependencyCtrs(ctrs []*Container) CtrCreateOption {
 		deps := make([]string, 0, len(ctrs))
 
 		for _, dep := range ctrs {
-			if !dep.valid {
-				return errors.Wrapf(define.ErrCtrRemoved, "container %s is not valid", dep.ID())
-			}
-
-			if dep.ID() == ctr.ID() {
-				return errors.Wrapf(define.ErrInvalidArg, "must specify another container")
-			}
-
-			if ctr.config.Pod != "" && dep.config.Pod != ctr.config.Pod {
-				return errors.Wrapf(define.ErrInvalidArg, "container has joined pod %s and dependency container %s is not a member of the pod", ctr.config.Pod, dep.ID())
+			if err := checkDependencyContainer(dep, ctr); err != nil {
+				return err
 			}
 
 			deps = append(deps, dep.ID())
@@ -949,20 +998,10 @@ func WithNetNS(portMappings []ocicni.PortMapping, postConfigureNetNS bool, netmo
 			return define.ErrCtrFinalized
 		}
 
-		if ctr.config.NetNsCtr != "" {
-			return errors.Wrapf(define.ErrInvalidArg, "container is already set to join another container's net ns, cannot create a new net ns")
-		}
-
 		ctr.config.PostConfigureNetNS = postConfigureNetNS
 		ctr.config.NetMode = namespaces.NetworkMode(netmode)
 		ctr.config.CreateNetNS = true
 		ctr.config.PortMappings = portMappings
-
-		if rootless.IsRootless() {
-			if len(networks) > 0 {
-				return errors.New("cannot use CNI networks with rootless containers")
-			}
-		}
 
 		ctr.config.Networks = networks
 
@@ -981,15 +1020,20 @@ func WithStaticIP(ip net.IP) CtrCreateOption {
 			return define.ErrCtrFinalized
 		}
 
-		if !ctr.config.CreateNetNS {
-			return errors.Wrapf(define.ErrInvalidArg, "cannot set a static IP if the container is not creating a network namespace")
-		}
-
-		if len(ctr.config.Networks) > 1 {
-			return errors.Wrapf(define.ErrInvalidArg, "cannot set a static IP if joining more than 1 CNI network")
-		}
-
 		ctr.config.StaticIP = ip
+
+		return nil
+	}
+}
+
+// WithNetworkOptions sets additional options for the networks.
+func WithNetworkOptions(options map[string][]string) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+
+		ctr.config.NetworkOptions = options
 
 		return nil
 	}
@@ -1004,14 +1048,6 @@ func WithStaticMAC(mac net.HardwareAddr) CtrCreateOption {
 	return func(ctr *Container) error {
 		if ctr.valid {
 			return define.ErrCtrFinalized
-		}
-
-		if !ctr.config.CreateNetNS {
-			return errors.Wrapf(define.ErrInvalidArg, "cannot set a static MAC if the container is not creating a network namespace")
-		}
-
-		if len(ctr.config.Networks) > 1 {
-			return errors.Wrapf(define.ErrInvalidArg, "cannot set a static MAC if joining more than 1 CNI network")
 		}
 
 		ctr.config.StaticMAC = mac
@@ -1029,7 +1065,7 @@ func WithLogDriver(driver string) CtrCreateOption {
 		switch driver {
 		case "":
 			return errors.Wrapf(define.ErrInvalidArg, "log driver must be set")
-		case JournaldLogging, KubernetesLogging, JSONLogging:
+		case define.JournaldLogging, define.KubernetesLogging, define.JSONLogging, define.NoLogging:
 			break
 		default:
 			return errors.Wrapf(define.ErrInvalidArg, "invalid log driver")
@@ -1057,25 +1093,43 @@ func WithLogPath(path string) CtrCreateOption {
 	}
 }
 
-// WithNoCgroups disables the creation of CGroups for the new container.
-func WithNoCgroups() CtrCreateOption {
+// WithLogTag sets the tag to the log file.
+func WithLogTag(tag string) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+		if tag == "" {
+			return errors.Wrapf(define.ErrInvalidArg, "log tag must be set")
+		}
+
+		ctr.config.LogTag = tag
+
+		return nil
+	}
+
+}
+
+// WithCgroupsMode disables the creation of CGroups for the conmon process.
+func WithCgroupsMode(mode string) CtrCreateOption {
 	return func(ctr *Container) error {
 		if ctr.valid {
 			return define.ErrCtrFinalized
 		}
 
-		if ctr.config.CgroupParent != "" {
-			return errors.Wrapf(define.ErrInvalidArg, "NoCgroups conflicts with CgroupParent")
+		switch mode {
+		case "disabled":
+			ctr.config.NoCgroups = true
+			ctr.config.CgroupsMode = mode
+		case "enabled", "no-conmon", cgroupSplit:
+			ctr.config.CgroupsMode = mode
+		default:
+			return errors.Wrapf(define.ErrInvalidArg, "Invalid cgroup mode %q", mode)
 		}
-
-		if ctr.config.PIDNsCtr != "" {
-			return errors.Wrapf(define.ErrInvalidArg, "NoCgroups requires a private PID namespace and cannot be used when PID namespace is shared with another container")
-		}
-
-		ctr.config.NoCgroups = true
 
 		return nil
 	}
+
 }
 
 // WithCgroupParent sets the Cgroup Parent of the new container.
@@ -1087,10 +1141,6 @@ func WithCgroupParent(parent string) CtrCreateOption {
 
 		if parent == "" {
 			return errors.Wrapf(define.ErrInvalidArg, "cgroup parent cannot be empty")
-		}
-
-		if ctr.config.NoCgroups {
-			return errors.Wrapf(define.ErrInvalidArg, "CgroupParent conflicts with NoCgroups")
 		}
 
 		ctr.config.CgroupParent = parent
@@ -1105,9 +1155,6 @@ func WithDNSSearch(searchDomains []string) CtrCreateOption {
 		if ctr.valid {
 			return define.ErrCtrFinalized
 		}
-		if ctr.config.UseImageResolvConf {
-			return errors.Wrapf(define.ErrInvalidArg, "cannot add DNS search domains if container will not create /etc/resolv.conf")
-		}
 		ctr.config.DNSSearch = searchDomains
 		return nil
 	}
@@ -1119,9 +1166,6 @@ func WithDNS(dnsServers []string) CtrCreateOption {
 		if ctr.valid {
 			return define.ErrCtrFinalized
 		}
-		if ctr.config.UseImageResolvConf {
-			return errors.Wrapf(define.ErrInvalidArg, "cannot add DNS servers if container will not create /etc/resolv.conf")
-		}
 		var dns []net.IP
 		for _, i := range dnsServers {
 			result := net.ParseIP(i)
@@ -1130,7 +1174,8 @@ func WithDNS(dnsServers []string) CtrCreateOption {
 			}
 			dns = append(dns, result)
 		}
-		ctr.config.DNSServer = dns
+		ctr.config.DNSServer = append(ctr.config.DNSServer, dns...)
+
 		return nil
 	}
 }
@@ -1144,7 +1189,7 @@ func WithDNSOption(dnsOptions []string) CtrCreateOption {
 		if ctr.config.UseImageResolvConf {
 			return errors.Wrapf(define.ErrInvalidArg, "cannot add DNS options if container will not create /etc/resolv.conf")
 		}
-		ctr.config.DNSOption = dnsOptions
+		ctr.config.DNSOption = append(ctr.config.DNSOption, dnsOptions...)
 		return nil
 	}
 }
@@ -1154,10 +1199,6 @@ func WithHosts(hosts []string) CtrCreateOption {
 	return func(ctr *Container) error {
 		if ctr.valid {
 			return define.ErrCtrFinalized
-		}
-
-		if ctr.config.UseImageHosts {
-			return errors.Wrapf(define.ErrInvalidArg, "cannot add hosts if container will not create /etc/hosts")
 		}
 
 		ctr.config.HostAdd = hosts
@@ -1257,9 +1298,6 @@ func WithRootFS(rootfs string) CtrCreateOption {
 		if _, err := os.Stat(rootfs); err != nil {
 			return errors.Wrapf(err, "error checking path %q", rootfs)
 		}
-		if ctr.config.RootfsImageID != "" {
-			return errors.Wrapf(define.ErrInvalidArg, "cannot set both an image ID and a rootfs for a container")
-		}
 		ctr.config.Rootfs = rootfs
 		return nil
 	}
@@ -1289,12 +1327,6 @@ func WithUseImageResolvConf() CtrCreateOption {
 			return define.ErrCtrFinalized
 		}
 
-		if len(ctr.config.DNSServer) != 0 ||
-			len(ctr.config.DNSSearch) != 0 ||
-			len(ctr.config.DNSOption) != 0 {
-			return errors.Wrapf(define.ErrInvalidArg, "not creating resolv.conf conflicts with DNS options")
-		}
-
 		ctr.config.UseImageResolvConf = true
 
 		return nil
@@ -1307,10 +1339,6 @@ func WithUseImageHosts() CtrCreateOption {
 	return func(ctr *Container) error {
 		if ctr.valid {
 			return define.ErrCtrFinalized
-		}
-
-		if len(ctr.config.HostAdd) != 0 {
-			return errors.Wrapf(define.ErrInvalidArg, "not creating /etc/hosts conflicts with adding to the hosts file")
 		}
 
 		ctr.config.UseImageHosts = true
@@ -1329,7 +1357,7 @@ func WithRestartPolicy(policy string) CtrCreateOption {
 		}
 
 		switch policy {
-		case RestartPolicyNone, RestartPolicyNo, RestartPolicyOnFailure, RestartPolicyAlways:
+		case RestartPolicyNone, RestartPolicyNo, RestartPolicyOnFailure, RestartPolicyAlways, RestartPolicyUnlessStopped:
 			ctr.config.RestartPolicy = policy
 		default:
 			return errors.Wrapf(define.ErrInvalidArg, "%q is not a valid restart policy", policy)
@@ -1375,18 +1403,8 @@ func WithNamedVolumes(volumes []*ContainerNamedVolume) CtrCreateOption {
 			return define.ErrCtrFinalized
 		}
 
-		destinations := make(map[string]bool)
-
 		for _, vol := range volumes {
-			// Don't check if they already exist.
-			// If they don't we will automatically create them.
-
-			if _, ok := destinations[vol.Dest]; ok {
-				return errors.Wrapf(define.ErrInvalidArg, "two volumes found with destination %s", vol.Dest)
-			}
-			destinations[vol.Dest] = true
-
-			mountOpts, err := util.ProcessOptions(vol.Options, false, nil)
+			mountOpts, err := util.ProcessOptions(vol.Options, false, "")
 			if err != nil {
 				return errors.Wrapf(err, "error processing options for named volume %q mounted at %q", vol.Name, vol.Dest)
 			}
@@ -1395,6 +1413,25 @@ func WithNamedVolumes(volumes []*ContainerNamedVolume) CtrCreateOption {
 				Name:    vol.Name,
 				Dest:    vol.Dest,
 				Options: mountOpts,
+			})
+		}
+
+		return nil
+	}
+}
+
+// WithOverlayVolumes adds the given overlay volumes to the container.
+func WithOverlayVolumes(volumes []*ContainerOverlayVolume) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+
+		for _, vol := range volumes {
+
+			ctr.config.OverlayVolumes = append(ctr.config.OverlayVolumes, &ContainerOverlayVolume{
+				Dest:   vol.Dest,
+				Source: vol.Source,
 			})
 		}
 
@@ -1413,14 +1450,39 @@ func WithHealthCheck(healthCheck *manifest.Schema2HealthConfig) CtrCreateOption 
 	}
 }
 
-// WithCreateCommand adds the full command plus arguments of the current
-// process to the container config.
-func WithCreateCommand() CtrCreateOption {
+// WithPreserveFDs forwards from the process running Libpod into the container
+// the given number of extra FDs (starting after the standard streams) to the created container
+func WithPreserveFDs(fd uint) CtrCreateOption {
 	return func(ctr *Container) error {
 		if ctr.valid {
 			return define.ErrCtrFinalized
 		}
-		ctr.config.CreateCommand = os.Args
+		ctr.config.PreserveFDs = fd
+		return nil
+	}
+}
+
+// WithCreateCommand adds the full command plus arguments of the current
+// process to the container config.
+func WithCreateCommand(cmd []string) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+		ctr.config.CreateCommand = cmd
+		return nil
+	}
+}
+
+// WithCreateWorkingDir tells Podman to create the container's working directory
+// if it does not exist.
+func WithCreateWorkingDir() CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+
+		ctr.config.CreateWorkingDir = true
 		return nil
 	}
 }
@@ -1435,8 +1497,8 @@ func WithVolumeName(name string) VolumeCreateOption {
 		}
 
 		// Check the name against a regex
-		if !NameRegex.MatchString(name) {
-			return RegexError
+		if !define.NameRegex.MatchString(name) {
+			return define.RegexError
 		}
 		volume.config.Name = name
 
@@ -1452,8 +1514,13 @@ func WithVolumeDriver(driver string) VolumeCreateOption {
 		if volume.valid {
 			return define.ErrVolumeFinalized
 		}
+		// only local driver is possible rn
+		if driver != define.VolumeDriverLocal {
+			return define.ErrNotImplemented
 
-		return define.ErrNotImplemented
+		}
+		volume.config.Driver = define.VolumeDriverLocal
+		return nil
 	}
 }
 
@@ -1524,23 +1591,103 @@ func WithVolumeGID(gid int) VolumeCreateOption {
 	}
 }
 
-// withSetCtrSpecific sets a bool notifying libpod that a volume was created
-// specifically for a container.
-// These volumes will be removed when the container is removed and volumes are
-// also specified for removal.
-func withSetCtrSpecific() VolumeCreateOption {
+// WithVolumeNeedsChown sets the NeedsChown flag for the volume.
+func WithVolumeNeedsChown() VolumeCreateOption {
 	return func(volume *Volume) error {
 		if volume.valid {
 			return define.ErrVolumeFinalized
 		}
 
-		volume.config.IsCtrSpecific = true
+		volume.state.NeedsChown = true
 
 		return nil
 	}
 }
 
+// withSetAnon sets a bool notifying libpod that this volume is anonymous and
+// should be removed when containers using it are removed and volumes are
+// specified for removal.
+func withSetAnon() VolumeCreateOption {
+	return func(volume *Volume) error {
+		if volume.valid {
+			return define.ErrVolumeFinalized
+		}
+
+		volume.config.IsAnon = true
+
+		return nil
+	}
+}
+
+// WithTimezone sets the timezone in the container
+func WithTimezone(path string) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+		if path != "local" {
+			zone := filepath.Join("/usr/share/zoneinfo", path)
+
+			file, err := os.Stat(zone)
+			if err != nil {
+				return err
+			}
+			//We don't want to mount a timezone directory
+			if file.IsDir() {
+				return errors.New("Invalid timezone: is a directory")
+			}
+		}
+
+		ctr.config.Timezone = path
+		return nil
+	}
+}
+
+// WithUmask sets the umask in the container
+func WithUmask(umask string) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+		if !define.UmaskRegex.MatchString(umask) {
+			return errors.Wrapf(define.ErrInvalidArg, "Invalid umask string %s", umask)
+		}
+		ctr.config.Umask = umask
+		return nil
+	}
+}
+
 // Pod Creation Options
+
+// WithInfraImage sets the infra image for libpod.
+// An infra image is used for inter-container kernel
+// namespace sharing within a pod. Typically, an infra
+// container is lightweight and is there to reap
+// zombie processes within its pid namespace.
+func WithInfraImage(img string) PodCreateOption {
+	return func(pod *Pod) error {
+		if pod.valid {
+			return define.ErrPodFinalized
+		}
+
+		pod.config.InfraContainer.InfraImage = img
+
+		return nil
+	}
+}
+
+// WithInfraCommand sets the command to
+// run on pause container start up.
+func WithInfraCommand(cmd []string) PodCreateOption {
+	return func(pod *Pod) error {
+		if pod.valid {
+			return define.ErrPodFinalized
+		}
+
+		pod.config.InfraContainer.InfraCommand = cmd
+		return nil
+	}
+}
 
 // WithPodName sets the name of the pod.
 func WithPodName(name string) PodCreateOption {
@@ -1550,8 +1697,8 @@ func WithPodName(name string) PodCreateOption {
 		}
 
 		// Check the name against a regex
-		if !NameRegex.MatchString(name) {
-			return RegexError
+		if !define.NameRegex.MatchString(name) {
+			return define.RegexError
 		}
 
 		pod.config.Name = name
@@ -1568,12 +1715,36 @@ func WithPodHostname(hostname string) PodCreateOption {
 		}
 
 		// Check the hostname against a regex
-		if !NameRegex.MatchString(hostname) {
-			return RegexError
+		if !define.NameRegex.MatchString(hostname) {
+			return define.RegexError
 		}
 
 		pod.config.Hostname = hostname
 
+		return nil
+	}
+}
+
+// WithPodCreateCommand adds the full command plus arguments of the current
+// process to the pod config.
+func WithPodCreateCommand(createCmd []string) PodCreateOption {
+	return func(pod *Pod) error {
+		if pod.valid {
+			return define.ErrPodFinalized
+		}
+		pod.config.CreateCommand = createCmd
+		return nil
+	}
+}
+
+// WithInfraConmonPidFile sets the path to a custom conmon PID file for the
+// infra container.
+func WithInfraConmonPidFile(path string) PodCreateOption {
+	return func(pod *Pod) error {
+		if pod.valid {
+			return define.ErrPodFinalized
+		}
+		pod.config.InfraContainer.ConmonPidFile = path
 		return nil
 	}
 }
@@ -1740,6 +1911,22 @@ func WithPodUTS() PodCreateOption {
 	}
 }
 
+// WithPodCgroup tells containers in this pod to use the cgroup namespace
+// created for this pod.
+// Containers in a pod will inherit the kernel namespaces from the first
+// container added.
+func WithPodCgroup() PodCreateOption {
+	return func(pod *Pod) error {
+		if pod.valid {
+			return define.ErrPodFinalized
+		}
+
+		pod.config.UsePodCgroupNS = true
+
+		return nil
+	}
+}
+
 // WithInfraContainer tells the pod to create a pause container
 func WithInfraContainer() PodCreateOption {
 	return func(pod *Pod) error {
@@ -1759,7 +1946,260 @@ func WithInfraContainerPorts(bindings []ocicni.PortMapping) PodCreateOption {
 		if pod.valid {
 			return define.ErrPodFinalized
 		}
+		if !pod.config.InfraContainer.HasInfraContainer {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot set pod ports as no infra container is being created")
+		}
 		pod.config.InfraContainer.PortBindings = bindings
+		return nil
+	}
+}
+
+// WithPodStaticIP sets a static IP for the pod.
+func WithPodStaticIP(ip net.IP) PodCreateOption {
+	return func(pod *Pod) error {
+		if pod.valid {
+			return define.ErrPodFinalized
+		}
+
+		if !pod.config.InfraContainer.HasInfraContainer {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot set pod static IP as no infra container is being created")
+		}
+
+		if pod.config.InfraContainer.HostNetwork {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot set static IP if host network is specified")
+		}
+
+		if len(pod.config.InfraContainer.Networks) > 1 {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot set a static IP if joining more than 1 CNI network")
+		}
+
+		pod.config.InfraContainer.StaticIP = ip
+
+		return nil
+	}
+}
+
+// WithPodStaticMAC sets a static MAC address for the pod.
+func WithPodStaticMAC(mac net.HardwareAddr) PodCreateOption {
+	return func(pod *Pod) error {
+		if pod.valid {
+			return define.ErrPodFinalized
+		}
+
+		if !pod.config.InfraContainer.HasInfraContainer {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot set pod static MAC as no infra container is being created")
+		}
+
+		if pod.config.InfraContainer.HostNetwork {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot set static MAC if host network is specified")
+		}
+
+		if len(pod.config.InfraContainer.Networks) > 1 {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot set a static MAC if joining more than 1 CNI network")
+		}
+
+		pod.config.InfraContainer.StaticMAC = mac
+
+		return nil
+	}
+}
+
+// WithPodUseImageResolvConf sets a pod to use an image's resolv.conf and not
+// create its own.
+func WithPodUseImageResolvConf() PodCreateOption {
+	return func(pod *Pod) error {
+		if pod.valid {
+			return define.ErrPodFinalized
+		}
+
+		if !pod.config.InfraContainer.HasInfraContainer {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot configure pod DNS as no infra container is being created")
+		}
+
+		if len(pod.config.InfraContainer.DNSServer) != 0 ||
+			len(pod.config.InfraContainer.DNSSearch) != 0 ||
+			len(pod.config.InfraContainer.DNSOption) != 0 {
+			return errors.Wrapf(define.ErrInvalidArg, "requested use of image resolv.conf conflicts with already-configured DNS settings")
+		}
+
+		pod.config.InfraContainer.UseImageResolvConf = true
+
+		return nil
+	}
+}
+
+// WithPodDNS sets the DNS Servers for a pod.
+func WithPodDNS(dnsServer []string) PodCreateOption {
+	return func(pod *Pod) error {
+		if pod.valid {
+			return define.ErrPodFinalized
+		}
+
+		if !pod.config.InfraContainer.HasInfraContainer {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot configure pod DNS as no infra container is being created")
+		}
+
+		if pod.config.InfraContainer.UseImageResolvConf {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot add DNS servers if pod will not create /etc/resolv.conf")
+		}
+
+		pod.config.InfraContainer.DNSServer = dnsServer
+
+		return nil
+	}
+}
+
+// WithPodDNSSearch sets the DNS Search domains for a pod.
+func WithPodDNSSearch(dnsSearch []string) PodCreateOption {
+	return func(pod *Pod) error {
+		if pod.valid {
+			return define.ErrPodFinalized
+		}
+
+		if !pod.config.InfraContainer.HasInfraContainer {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot configure pod DNS as no infra container is being created")
+		}
+
+		if pod.config.InfraContainer.UseImageResolvConf {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot add DNS search domains if pod will not create /etc/resolv.conf")
+		}
+
+		pod.config.InfraContainer.DNSSearch = dnsSearch
+
+		return nil
+	}
+}
+
+// WithPodDNSOption sets DNS Options for a pod.
+func WithPodDNSOption(dnsOption []string) PodCreateOption {
+	return func(pod *Pod) error {
+		if pod.valid {
+			return define.ErrPodFinalized
+		}
+
+		if !pod.config.InfraContainer.HasInfraContainer {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot configure pod DNS as no infra container is being created")
+		}
+
+		if pod.config.InfraContainer.UseImageResolvConf {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot add DNS options if pod will not create /etc/resolv.conf")
+		}
+
+		pod.config.InfraContainer.DNSOption = dnsOption
+
+		return nil
+	}
+}
+
+// WithPodUseImageHosts tells the pod not to create /etc/hosts and instead to
+// use the one provided by the image.
+func WithPodUseImageHosts() PodCreateOption {
+	return func(pod *Pod) error {
+		if pod.valid {
+			return define.ErrPodFinalized
+		}
+
+		if !pod.config.InfraContainer.HasInfraContainer {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot configure pod hosts as no infra container is being created")
+		}
+
+		if len(pod.config.InfraContainer.HostAdd) != 0 {
+			return errors.Wrapf(define.ErrInvalidArg, "not creating /etc/hosts conflicts with adding to the hosts file")
+		}
+
+		pod.config.InfraContainer.UseImageHosts = true
+
+		return nil
+	}
+}
+
+// WithPodHosts adds additional entries to the pod's /etc/hosts
+func WithPodHosts(hosts []string) PodCreateOption {
+	return func(pod *Pod) error {
+		if pod.valid {
+			return define.ErrPodFinalized
+		}
+
+		if !pod.config.InfraContainer.HasInfraContainer {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot configure pod hosts as no infra container is being created")
+		}
+
+		if pod.config.InfraContainer.UseImageHosts {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot add to /etc/hosts if container is using image hosts")
+		}
+
+		pod.config.InfraContainer.HostAdd = hosts
+
+		return nil
+	}
+}
+
+// WithPodNetworks sets additional CNI networks for the pod to join.
+func WithPodNetworks(networks []string) PodCreateOption {
+	return func(pod *Pod) error {
+		if pod.valid {
+			return define.ErrPodFinalized
+		}
+
+		if !pod.config.InfraContainer.HasInfraContainer {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot configure pod CNI networks as no infra container is being created")
+		}
+
+		if (pod.config.InfraContainer.StaticIP != nil || pod.config.InfraContainer.StaticMAC != nil) &&
+			len(networks) > 1 {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot join more than one CNI network if setting a static IP or MAC address")
+		}
+
+		if pod.config.InfraContainer.HostNetwork {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot join pod to CNI networks if host network is specified")
+		}
+
+		pod.config.InfraContainer.Networks = networks
+
+		return nil
+	}
+}
+
+// WithPodHostNetwork tells the pod to use the host's network namespace.
+func WithPodHostNetwork() PodCreateOption {
+	return func(pod *Pod) error {
+		if pod.valid {
+			return define.ErrPodFinalized
+		}
+
+		if !pod.config.InfraContainer.HasInfraContainer {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot configure pod host networking as no infra container is being created")
+		}
+
+		if len(pod.config.InfraContainer.PortBindings) > 0 ||
+			pod.config.InfraContainer.StaticIP != nil ||
+			pod.config.InfraContainer.StaticMAC != nil ||
+			len(pod.config.InfraContainer.Networks) > 0 {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot set host network if network-related configuration is specified")
+		}
+
+		pod.config.InfraContainer.HostNetwork = true
+
+		return nil
+	}
+}
+
+// WithPodInfraExitCommand sets an exit command for the pod's infra container.
+// Semantics are identical to WithExitCommand() above - the ID of the container
+// will be appended to the end of the provided command (note that this will
+// specifically be the ID of the infra container *and not the pod's id*.
+func WithPodInfraExitCommand(exitCmd []string) PodCreateOption {
+	return func(pod *Pod) error {
+		if pod.valid {
+			return define.ErrPodFinalized
+		}
+
+		if !pod.config.InfraContainer.HasInfraContainer {
+			return errors.Wrapf(define.ErrInvalidArg, "cannot configure pod infra container exit command as no infra container is being created")
+		}
+
+		pod.config.InfraContainer.ExitCommand = exitCmd
+
 		return nil
 	}
 }

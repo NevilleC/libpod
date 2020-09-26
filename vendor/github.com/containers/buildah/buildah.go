@@ -8,11 +8,12 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/containers/buildah/docker"
-	"github.com/containers/buildah/util"
 	"github.com/containers/image/v5/types"
+	encconfig "github.com/containers/ocicrypt/config"
 	"github.com/containers/storage"
 	"github.com/containers/storage/pkg/ioutils"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
@@ -27,7 +28,7 @@ const (
 	Package = "buildah"
 	// Version for the Package.  Bump version in contrib/rpm/buildah.spec
 	// too.
-	Version = "1.12.0"
+	Version = "1.16.2"
 	// The value we use to identify what type of information, currently a
 	// serialized Builder structure, we are using as per-container state.
 	// This should only be changed when we make incompatible changes to
@@ -180,13 +181,8 @@ type Builder struct {
 	CNIConfigDir string
 	// ID mapping options to use when running processes in the container with non-host user namespaces.
 	IDMappingOptions IDMappingOptions
-	// AddCapabilities is a list of capabilities to add to the default set when running
-	// commands in the container.
-	AddCapabilities []string
-	// DropCapabilities is a list of capabilities to remove from the default set,
-	// after processing the AddCapabilities set, when running commands in the container.
-	// If a capability appears in both lists, it will be dropped.
-	DropCapabilities []string
+	// Capabilities is a list of capabilities to use when running commands in the container.
+	Capabilities []string
 	// PrependedEmptyLayers are history entries that we'll add to a
 	// committed image, after any history items that we inherit from a base
 	// image, but before the history item for the layer that we're
@@ -229,13 +225,11 @@ type BuilderInfo struct {
 	DefaultMountsFilePath string
 	Isolation             string
 	NamespaceOptions      NamespaceOptions
+	Capabilities          []string
 	ConfigureNetwork      string
 	CNIPluginPath         string
 	CNIConfigDir          string
 	IDMappingOptions      IDMappingOptions
-	DefaultCapabilities   []string
-	AddCapabilities       []string
-	DropCapabilities      []string
 	History               []v1.History
 	Devices               []configs.Device
 }
@@ -255,6 +249,7 @@ func GetBuildInfo(b *Builder) BuilderInfo {
 		EmptyLayer: false,
 	})
 	history = append(history, copyHistory(b.AppendedEmptyLayers)...)
+	sort.Strings(b.Capabilities)
 	return BuilderInfo{
 		Type:                  b.Type,
 		FromImage:             b.FromImage,
@@ -278,9 +273,7 @@ func GetBuildInfo(b *Builder) BuilderInfo {
 		CNIPluginPath:         b.CNIPluginPath,
 		CNIConfigDir:          b.CNIConfigDir,
 		IDMappingOptions:      b.IDMappingOptions,
-		DefaultCapabilities:   append([]string{}, util.DefaultCapabilities...),
-		AddCapabilities:       append([]string{}, b.AddCapabilities...),
-		DropCapabilities:      append([]string{}, b.DropCapabilities...),
+		Capabilities:          b.Capabilities,
 		History:               history,
 		Devices:               b.Devices,
 	}
@@ -317,6 +310,9 @@ type CommonBuildOptions struct {
 	// LabelOpts is the a slice of fields of an SELinux context, given in "field:pair" format, or "disable".
 	// Recognized field names are "role", "type", and "level".
 	LabelOpts []string
+	// OmitTimestamp forces epoch 0 as created timestamp to allow for
+	// deterministic, content-addressable builds.
+	OmitTimestamp bool
 	// SeccompProfilePath is the pathname of a seccomp profile.
 	SeccompProfilePath string
 	// ApparmorProfile is the name of an apparmor profile.
@@ -406,19 +402,24 @@ type BuilderOptions struct {
 	CNIConfigDir string
 	// ID mapping options to use if we're setting up our own user namespace.
 	IDMappingOptions *IDMappingOptions
-	// AddCapabilities is a list of capabilities to add to the default set when
+	// Capabilities is a list of capabilities to use when
 	// running commands in the container.
-	AddCapabilities []string
-	// DropCapabilities is a list of capabilities to remove from the default set,
-	// after processing the AddCapabilities set, when running commands in the
-	// container.  If a capability appears in both lists, it will be dropped.
-	DropCapabilities []string
-
+	Capabilities    []string
 	CommonBuildOpts *CommonBuildOptions
 	// Format for the container image
 	Format string
 	// Devices are the additional devices to add to the containers
 	Devices []configs.Device
+	//DefaultEnv for containers
+	DefaultEnv []string
+	// MaxPullRetries is the maximum number of attempts we'll make to pull
+	// any one image from the external registry if the first attempt fails.
+	MaxPullRetries int
+	// PullRetryDelay is how long to wait before retrying a pull attempt.
+	PullRetryDelay time.Duration
+	// OciDecryptConfig contains the config that can be used to decrypt an image if it is
+	// encrypted if non-nil. If nil, it does not attempt to decrypt an image.
+	OciDecryptConfig *encconfig.DecryptConfig
 }
 
 // ImportOptions are used to initialize a Builder from an existing container

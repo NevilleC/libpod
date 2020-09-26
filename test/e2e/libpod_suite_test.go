@@ -1,4 +1,4 @@
-// +build !remoteclient
+// +build !remote
 
 package integration
 
@@ -9,21 +9,37 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo"
 )
 
-func SkipIfRemote() {
+func IsRemote() bool {
+	return false
+}
+
+func SkipIfRemote(string) {
+}
+
+func SkipIfRootlessCgroupsV1() {
+	if os.Geteuid() != 0 && !CGROUPSV2 {
+		Skip("Rooless requires cgroupsV2 to set limits")
+	}
 }
 
 func SkipIfRootless() {
 	if os.Geteuid() != 0 {
-		ginkgo.Skip("This function is not enabled for rootless podman")
+		Skip("This function is not enabled for rootless podman")
 	}
 }
 
 // Podman is the exec call to podman on the filesystem
 func (p *PodmanTestIntegration) Podman(args []string) *PodmanSessionIntegration {
 	podmanSession := p.PodmanBase(args, false, false)
+	return &PodmanSessionIntegration{podmanSession}
+}
+
+// PodmanExtraFiles is the exec call to podman on the filesystem and passes down extra files
+func (p *PodmanTestIntegration) PodmanExtraFiles(args []string, extraFiles []*os.File) *PodmanSessionIntegration {
+	podmanSession := p.PodmanAsUserBase(args, 0, 0, "", nil, false, false, extraFiles)
 	return &PodmanSessionIntegration{podmanSession}
 }
 
@@ -37,12 +53,6 @@ func (p *PodmanTestIntegration) PodmanNoCache(args []string) *PodmanSessionInteg
 // events backend. It is used mostly for caching and uncaching images.
 func (p *PodmanTestIntegration) PodmanNoEvents(args []string) *PodmanSessionIntegration {
 	podmanSession := p.PodmanBase(args, true, true)
-	return &PodmanSessionIntegration{podmanSession}
-}
-
-// PodmanAsUser is the exec call to podman on the filesystem with the specified uid/gid and environment
-func (p *PodmanTestIntegration) PodmanAsUser(args []string, uid, gid uint32, cwd string, env []string) *PodmanSessionIntegration {
-	podmanSession := p.PodmanAsUserBase(args, uid, gid, cwd, env, false, false)
 	return &PodmanSessionIntegration{podmanSession}
 }
 
@@ -115,13 +125,15 @@ func (p *PodmanTestIntegration) RestoreArtifactToCache(image string) error {
 	return nil
 }
 
-func (p *PodmanTestIntegration) StopVarlink()     {}
-func (p *PodmanTestIntegration) DelayForVarlink() {}
+func (p *PodmanTestIntegration) StopRemoteService() {}
+func (p *PodmanTestIntegration) DelayForVarlink()   {}
 
 func populateCache(podman *PodmanTestIntegration) {
 	for _, image := range CACHE_IMAGES {
 		podman.RestoreArtifactToCache(image)
 	}
+	// logformatter uses this to recognize the first test
+	fmt.Printf("-----------------------------\n")
 }
 
 func removeCache() {
@@ -137,5 +149,5 @@ func (p *PodmanTestIntegration) SeedImages() error {
 }
 
 // We don't support running Varlink when local
-func (p *PodmanTestIntegration) StartVarlink() {
+func (p *PodmanTestIntegration) StartRemoteService() {
 }

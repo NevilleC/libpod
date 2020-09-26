@@ -1,7 +1,6 @@
 package integration
 
 import (
-	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"math/rand"
@@ -14,16 +13,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/containers/libpod/libpod"
-	"github.com/containers/libpod/pkg/inspect"
-	"github.com/containers/libpod/pkg/rootless"
-	. "github.com/containers/libpod/test/utils"
+	"github.com/containers/podman/v2/libpod/define"
+	"github.com/containers/podman/v2/pkg/cgroups"
+	"github.com/containers/podman/v2/pkg/inspect"
+	"github.com/containers/podman/v2/pkg/rootless"
+	. "github.com/containers/podman/v2/test/utils"
 	"github.com/containers/storage"
 	"github.com/containers/storage/pkg/reexec"
 	"github.com/containers/storage/pkg/stringid"
+	jsoniter "github.com/json-iterator/go"
+	"github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-	"github.com/onsi/gomega/gexec"
+	. "github.com/onsi/gomega/gexec"
 	"github.com/pkg/errors"
 )
 
@@ -35,8 +37,9 @@ var (
 	INTEGRATION_ROOT   string
 	CGROUP_MANAGER     = "systemd"
 	ARTIFACT_DIR       = "/tmp/.artifacts"
-	RESTORE_IMAGES     = []string{ALPINE, BB}
+	RESTORE_IMAGES     = []string{ALPINE, BB, nginx}
 	defaultWaitTimeout = 90
+	CGROUPSV2, _       = cgroups.IsCgroup2UnifiedMode()
 )
 
 // PodmanTestIntegration struct for command line options
@@ -53,6 +56,7 @@ type PodmanTestIntegration struct {
 	Host                HostOS
 	Timings             []string
 	TmpDir              string
+	RemoteStartErr      error
 }
 
 var LockTmpDir string
@@ -141,8 +145,16 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 		fmt.Println(err)
 		os.Exit(1)
 	}
+
+	// If running remote, we need to stop the associated podman system service
+	if podman.RemoteTest {
+		podman.StopRemoteService()
+	}
+
 	return []byte(path)
 }, func(data []byte) {
+	cwd, _ := os.Getwd()
+	INTEGRATION_ROOT = filepath.Join(cwd, "../../")
 	LockTmpDir = string(data)
 })
 
@@ -171,6 +183,10 @@ var _ = SynchronizedAfterSuite(func() {},
 			fmt.Printf("%q\n", err)
 		}
 
+		// If running remote, we need to stop the associated podman system service
+		if podmanTest.RemoteTest {
+			podmanTest.StopRemoteService()
+		}
 		// for localized tests, this removes the image cache dir and for remote tests
 		// this is a no-op
 		removeCache()
@@ -220,8 +236,8 @@ func PodmanTestCreateUtil(tempDir string, remote bool) *PodmanTestIntegration {
 	ociRuntime := os.Getenv("OCI_RUNTIME")
 	if ociRuntime == "" {
 		var err error
-		ociRuntime, err = exec.LookPath("runc")
-		// If we cannot find the runc binary, setting to something static as we have no way
+		ociRuntime, err = exec.LookPath("crun")
+		// If we cannot find the crun binary, setting to something static as we have no way
 		// to return an error.  The tests will fail and point out that the runc binary could
 		// not be found nicely.
 		if err != nil {
@@ -230,6 +246,12 @@ func PodmanTestCreateUtil(tempDir string, remote bool) *PodmanTestIntegration {
 	}
 	os.Setenv("DISABLE_HC_SYSTEMD", "true")
 	CNIConfigDir := "/etc/cni/net.d"
+	if rootless.IsRootless() {
+		CNIConfigDir = filepath.Join(os.Getenv("HOME"), ".config/cni/net.d")
+	}
+	if err := os.MkdirAll(CNIConfigDir, 0755); err != nil {
+		panic(err)
+	}
 
 	storageFs := STORAGE_FS
 	if rootless.IsRootless() {
@@ -259,12 +281,12 @@ func PodmanTestCreateUtil(tempDir string, remote bool) *PodmanTestIntegration {
 		p.PodmanTest.RemotePodmanBinary = podmanRemoteBinary
 		uuid := stringid.GenerateNonCryptoID()
 		if !rootless.IsRootless() {
-			p.VarlinkEndpoint = fmt.Sprintf("unix:/run/podman/io.podman-%s", uuid)
+			p.RemoteSocket = fmt.Sprintf("unix:/run/podman/podman-%s.sock", uuid)
 		} else {
 			runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
-			socket := fmt.Sprintf("io.podman-%s", uuid)
+			socket := fmt.Sprintf("podman-%s.sock", uuid)
 			fqpath := filepath.Join(runtimeDir, socket)
-			p.VarlinkEndpoint = fmt.Sprintf("unix:%s", fqpath)
+			p.RemoteSocket = fmt.Sprintf("unix:%s", fqpath)
 		}
 	}
 
@@ -314,17 +336,17 @@ func (p *PodmanTestIntegration) createArtifact(image string) {
 // image and returns json
 func (s *PodmanSessionIntegration) InspectImageJSON() []inspect.ImageData {
 	var i []inspect.ImageData
-	err := json.Unmarshal(s.Out.Contents(), &i)
+	err := jsoniter.Unmarshal(s.Out.Contents(), &i)
 	Expect(err).To(BeNil())
 	return i
 }
 
 // InspectContainer returns a container's inspect data in JSON format
-func (p *PodmanTestIntegration) InspectContainer(name string) []libpod.InspectContainerData {
+func (p *PodmanTestIntegration) InspectContainer(name string) []define.InspectContainerData {
 	cmd := []string{"inspect", name}
 	session := p.Podman(cmd)
 	session.WaitWithDefaultTimeout()
-	Expect(session.ExitCode()).To(Equal(0))
+	Expect(session).Should(Exit(0))
 	return session.InspectContainerToJSON()
 }
 
@@ -411,7 +433,7 @@ func (p *PodmanTestIntegration) BuildImage(dockerfile, imageName string, layers 
 	Expect(err).To(BeNil())
 	session := p.PodmanNoCache([]string{"build", "--layers=" + layers, "-t", imageName, "--file", dockerfilePath, p.TempDir})
 	session.Wait(120)
-	Expect(session.ExitCode()).To(Equal(0))
+	Expect(session).Should(Exit(0), fmt.Sprintf("BuildImage session output: %q", session.OutputToString()))
 }
 
 // PodmanPID execs podman and returns its PID
@@ -419,7 +441,7 @@ func (p *PodmanTestIntegration) PodmanPID(args []string) (*PodmanSessionIntegrat
 	podmanOptions := p.MakeOptions(args, false, false)
 	fmt.Printf("Running: %s %s\n", p.PodmanBinary, strings.Join(podmanOptions, " "))
 	command := exec.Command(p.PodmanBinary, podmanOptions...)
-	session, err := gexec.Start(command, GinkgoWriter, GinkgoWriter)
+	session, err := Start(command, GinkgoWriter, GinkgoWriter)
 	if err != nil {
 		Fail(fmt.Sprintf("unable to run podman command: %s", strings.Join(podmanOptions, " ")))
 	}
@@ -430,7 +452,7 @@ func (p *PodmanTestIntegration) PodmanPID(args []string) (*PodmanSessionIntegrat
 // Cleanup cleans up the temporary store
 func (p *PodmanTestIntegration) Cleanup() {
 	// Remove all containers
-	stopall := p.Podman([]string{"stop", "-a", "--timeout", "0"})
+	stopall := p.Podman([]string{"stop", "-a", "--time", "0"})
 	stopall.Wait(90)
 
 	podstop := p.Podman([]string{"pod", "stop", "-a", "-t", "0"})
@@ -441,7 +463,7 @@ func (p *PodmanTestIntegration) Cleanup() {
 	session := p.Podman([]string{"rm", "-fa"})
 	session.Wait(90)
 
-	p.StopVarlink()
+	p.StopRemoteService()
 	// Nuke tempdir
 	if err := os.RemoveAll(p.TempDir); err != nil {
 		fmt.Printf("%q\n", err)
@@ -451,22 +473,15 @@ func (p *PodmanTestIntegration) Cleanup() {
 	resetRegistriesConfigEnv()
 }
 
-// CleanupPod cleans up the temporary store
-func (p *PodmanTestIntegration) CleanupPod() {
-	// Remove all containers
-	session := p.Podman([]string{"pod", "rm", "-fa"})
-	session.Wait(90)
-	// Nuke tempdir
-	if err := os.RemoveAll(p.TempDir); err != nil {
-		fmt.Printf("%q\n", err)
-	}
-}
-
 // CleanupVolume cleans up the temporary store
 func (p *PodmanTestIntegration) CleanupVolume() {
 	// Remove all containers
 	session := p.Podman([]string{"volume", "rm", "-fa"})
 	session.Wait(90)
+
+	// Stop remove service on volume cleanup
+	p.StopRemoteService()
+
 	// Nuke tempdir
 	if err := os.RemoveAll(p.TempDir); err != nil {
 		fmt.Printf("%q\n", err)
@@ -492,17 +507,17 @@ func (p *PodmanTestIntegration) PullImage(image string) error {
 
 // InspectContainerToJSON takes the session output of an inspect
 // container and returns json
-func (s *PodmanSessionIntegration) InspectContainerToJSON() []libpod.InspectContainerData {
-	var i []libpod.InspectContainerData
-	err := json.Unmarshal(s.Out.Contents(), &i)
+func (s *PodmanSessionIntegration) InspectContainerToJSON() []define.InspectContainerData {
+	var i []define.InspectContainerData
+	err := jsoniter.Unmarshal(s.Out.Contents(), &i)
 	Expect(err).To(BeNil())
 	return i
 }
 
 // InspectPodToJSON takes the sessions output from a pod inspect and returns json
-func (s *PodmanSessionIntegration) InspectPodToJSON() libpod.PodInspect {
-	var i libpod.PodInspect
-	err := json.Unmarshal(s.Out.Contents(), &i)
+func (s *PodmanSessionIntegration) InspectPodToJSON() define.InspectPodData {
+	var i define.InspectPodData
+	err := jsoniter.Unmarshal(s.Out.Contents(), &i)
 	Expect(err).To(BeNil())
 	return i
 }
@@ -513,6 +528,21 @@ func (p *PodmanTestIntegration) CreatePod(name string) (*PodmanSessionIntegratio
 	var podmanArgs = []string{"pod", "create", "--infra=false", "--share", ""}
 	if name != "" {
 		podmanArgs = append(podmanArgs, "--name", name)
+	}
+	session := p.Podman(podmanArgs)
+	session.WaitWithDefaultTimeout()
+	return session, session.ExitCode(), session.OutputToString()
+}
+
+// CreatePod creates a pod with no infra container and some labels.
+// it optionally takes a pod name
+func (p *PodmanTestIntegration) CreatePodWithLabels(name string, labels map[string]string) (*PodmanSessionIntegration, int, string) {
+	var podmanArgs = []string{"pod", "create", "--infra=false", "--share", ""}
+	if name != "" {
+		podmanArgs = append(podmanArgs, "--name", name)
+	}
+	for labelKey, labelValue := range labels {
+		podmanArgs = append(podmanArgs, "--label", fmt.Sprintf("%s=%s", labelKey, labelValue))
 	}
 	session := p.Podman(podmanArgs)
 	session.WaitWithDefaultTimeout()
@@ -567,4 +597,39 @@ func (p *PodmanTestIntegration) CreateSeccompJson(in []byte) (string, error) {
 		return "", err
 	}
 	return jsonFile, nil
+}
+
+func SkipIfNotFedora() {
+	info := GetHostDistributionInfo()
+	if info.Distribution != "fedora" {
+		ginkgo.Skip("Test can only run on Fedora")
+	}
+}
+
+func isRootless() bool {
+	return os.Geteuid() != 0
+}
+
+func SkipIfCgroupV1() {
+	cgroupsv2, err := cgroups.IsCgroup2UnifiedMode()
+	Expect(err).To(BeNil())
+
+	if !cgroupsv2 {
+		Skip("Skip on systems with cgroup V1 systems")
+	}
+}
+
+func SkipIfCgroupV2() {
+	cgroupsv2, err := cgroups.IsCgroup2UnifiedMode()
+	Expect(err).To(BeNil())
+
+	if cgroupsv2 {
+		Skip("Skip on systems with cgroup V2 systems")
+	}
+}
+
+// PodmanAsUser is the exec call to podman on the filesystem with the specified uid/gid and environment
+func (p *PodmanTestIntegration) PodmanAsUser(args []string, uid, gid uint32, cwd string, env []string) *PodmanSessionIntegration {
+	podmanSession := p.PodmanAsUserBase(args, uid, gid, cwd, env, false, false, nil)
+	return &PodmanSessionIntegration{podmanSession}
 }

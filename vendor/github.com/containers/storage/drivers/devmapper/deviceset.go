@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/containers/storage/drivers"
+	graphdriver "github.com/containers/storage/drivers"
 	"github.com/containers/storage/pkg/devicemapper"
 	"github.com/containers/storage/pkg/dmesg"
 	"github.com/containers/storage/pkg/idtools"
@@ -49,8 +49,13 @@ var (
 	lvmSetupConfigForce          bool
 )
 
-const deviceSetMetaFile string = "deviceset-metadata"
-const transactionMetaFile string = "transaction-metadata"
+const (
+	deviceSetMetaFile   = "deviceset-metadata"
+	transactionMetaFile = "transaction-metadata"
+	xfs                 = "xfs"
+	ext4                = "ext4"
+	base                = "base"
+)
 
 type transaction struct {
 	OpenTransactionID uint64 `json:"open_transaction_id"`
@@ -96,6 +101,7 @@ type DeviceSet struct {
 
 	// Options
 	dataLoopbackSize      int64
+	metaDataSize          string
 	metaDataLoopbackSize  int64
 	baseFsSize            uint64
 	filesystem            string
@@ -199,7 +205,7 @@ func getDevName(name string) string {
 func (info *devInfo) Name() string {
 	hash := info.Hash
 	if hash == "" {
-		hash = "base"
+		hash = base
 	}
 	return fmt.Sprintf("%s-%s", info.devices.devicePrefix, hash)
 }
@@ -219,7 +225,7 @@ func (devices *DeviceSet) metadataDir() string {
 func (devices *DeviceSet) metadataFile(info *devInfo) string {
 	file := info.Hash
 	if file == "" {
-		file = "base"
+		file = base
 	}
 	return path.Join(devices.metadataDir(), file)
 }
@@ -267,7 +273,7 @@ func (devices *DeviceSet) ensureImage(name string, size int64) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := idtools.MkdirAllAs(dirname, 0700, uid, gid); err != nil && !os.IsExist(err) {
+	if err := idtools.MkdirAllAs(dirname, 0700, uid, gid); err != nil {
 		return "", err
 	}
 
@@ -440,7 +446,7 @@ func (devices *DeviceSet) deviceFileWalkFunction(path string, finfo os.FileInfo)
 	logrus.Debugf("devmapper: Loading data for file %s", path)
 
 	hash := finfo.Name()
-	if hash == "base" {
+	if hash == base {
 		hash = ""
 	}
 
@@ -542,7 +548,7 @@ func xfsSupported() error {
 	}
 
 	// Check if kernel supports xfs filesystem or not.
-	exec.Command("modprobe", "xfs").Run()
+	exec.Command("modprobe", xfs).Run()
 
 	f, err := os.Open("/proc/filesystems")
 	if err != nil {
@@ -567,16 +573,16 @@ func xfsSupported() error {
 func determineDefaultFS() string {
 	err := xfsSupported()
 	if err == nil {
-		return "xfs"
+		return xfs
 	}
 
-	logrus.Warnf("devmapper: XFS is not supported in your system (%v). Defaulting to ext4 filesystem", err)
-	return "ext4"
+	logrus.Warnf("devmapper: XFS is not supported in your system (%v). Defaulting to %s filesystem", ext4, err)
+	return ext4
 }
 
 // mkfsOptions tries to figure out whether some additional mkfs options are required
 func mkfsOptions(fs string) []string {
-	if fs == "xfs" && !kernel.CheckKernelVersion(3, 16, 0) {
+	if fs == xfs && !kernel.CheckKernelVersion(3, 16, 0) {
 		// For kernels earlier than 3.16 (and newer xfsutils),
 		// some xfs features need to be explicitly disabled.
 		return []string{"-m", "crc=0,finobt=0"}
@@ -609,9 +615,9 @@ func (devices *DeviceSet) createFilesystem(info *devInfo) (err error) {
 	}()
 
 	switch devices.filesystem {
-	case "xfs":
+	case xfs:
 		err = exec.Command("mkfs.xfs", args...).Run()
-	case "ext4":
+	case ext4:
 		err = exec.Command("mkfs.ext4", append([]string{"-E", "nodiscard,lazy_itable_init=0,lazy_journal_init=0"}, args...)...).Run()
 		if err != nil {
 			err = exec.Command("mkfs.ext4", append([]string{"-E", "nodiscard,lazy_itable_init=0"}, args...)...).Run()
@@ -1197,24 +1203,24 @@ func (devices *DeviceSet) growFS(info *devInfo) error {
 	}
 
 	options := ""
-	if devices.BaseDeviceFilesystem == "xfs" {
+	if devices.BaseDeviceFilesystem == xfs {
 		// XFS needs nouuid or it can't mount filesystems with the same fs
 		options = joinMountOptions(options, "nouuid")
 	}
 	options = joinMountOptions(options, devices.mountOptions)
 
 	if err := mount.Mount(info.DevName(), fsMountPoint, devices.BaseDeviceFilesystem, options); err != nil {
-		return fmt.Errorf("Error mounting '%s' on '%s': %s\n%v", info.DevName(), fsMountPoint, err, string(dmesg.Dmesg(256)))
+		return errors.Wrapf(err, "Failed to mount; dmesg: %s", string(dmesg.Dmesg(256)))
 	}
 
 	defer unix.Unmount(fsMountPoint, unix.MNT_DETACH)
 
 	switch devices.BaseDeviceFilesystem {
-	case "ext4":
+	case ext4:
 		if out, err := exec.Command("resize2fs", info.DevName()).CombinedOutput(); err != nil {
 			return fmt.Errorf("Failed to grow rootfs:%v:%s", err, string(out))
 		}
-	case "xfs":
+	case xfs:
 		if out, err := exec.Command("xfs_growfs", info.DevName()).CombinedOutput(); err != nil {
 			return fmt.Errorf("Failed to grow rootfs:%v:%s", err, string(out))
 		}
@@ -1539,8 +1545,8 @@ func getDeviceMajorMinor(file *os.File) (uint64, uint64, error) {
 	}
 
 	dev := stat.Rdev
-	majorNum := major(dev)
-	minorNum := minor(dev)
+	majorNum := major(uint64(dev))
+	minorNum := minor(uint64(dev))
 
 	logrus.Debugf("devmapper: Major:Minor for device: %s is:%v:%v", file.Name(), majorNum, minorNum)
 	return majorNum, minorNum, nil
@@ -1696,10 +1702,10 @@ func (devices *DeviceSet) initDevmapper(doInit bool) (retErr error) {
 	if err != nil {
 		return err
 	}
-	if err := idtools.MkdirAs(devices.root, 0700, uid, gid); err != nil && !os.IsExist(err) {
+	if err := idtools.MkdirAs(devices.root, 0700, uid, gid); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(devices.metadataDir(), 0700); err != nil && !os.IsExist(err) {
+	if err := os.MkdirAll(devices.metadataDir(), 0700); err != nil {
 		return err
 	}
 
@@ -1743,7 +1749,7 @@ func (devices *DeviceSet) initDevmapper(doInit bool) (retErr error) {
 	//	- Managed by container storage
 	//	- The target of this device is at major <maj> and minor <min>
 	//	- If <inode> is defined, use that file inside the device as a loopback image. Otherwise use the device itself.
-	devices.devicePrefix = fmt.Sprintf("container-%d:%d-%d", major(st.Dev), minor(st.Dev), st.Ino)
+	devices.devicePrefix = fmt.Sprintf("container-%d:%d-%d", major(uint64(st.Dev)), minor(uint64(st.Dev)), st.Ino)
 	logrus.Debugf("devmapper: Generated prefix: %s", devices.devicePrefix)
 
 	// Check for the existence of the thin-pool device
@@ -2391,7 +2397,7 @@ func (devices *DeviceSet) MountDevice(hash, path string, moptions graphdriver.Mo
 
 	options := ""
 
-	if fstype == "xfs" {
+	if fstype == xfs {
 		// XFS needs nouuid or it can't mount filesystems with the same fs
 		options = joinMountOptions(options, "nouuid")
 	}
@@ -2409,10 +2415,10 @@ func (devices *DeviceSet) MountDevice(hash, path string, moptions graphdriver.Mo
 	options = joinMountOptions(options, label.FormatMountLabel("", moptions.MountLabel))
 
 	if err := mount.Mount(info.DevName(), path, fstype, options); err != nil {
-		return fmt.Errorf("devmapper: Error mounting '%s' on '%s': %s\n%v", info.DevName(), path, err, string(dmesg.Dmesg(256)))
+		return errors.Wrapf(err, "Failed to mount; dmesg: %s", string(dmesg.Dmesg(256)))
 	}
 
-	if fstype == "xfs" && devices.xfsNospaceRetries != "" {
+	if fstype == xfs && devices.xfsNospaceRetries != "" {
 		if err := devices.xfsSetNospaceRetries(info); err != nil {
 			unix.Unmount(path, unix.MNT_DETACH)
 			devices.deactivateDevice(info)
@@ -2693,7 +2699,7 @@ func NewDeviceSet(root string, doInit bool, options []string, uidMaps, gidMaps [
 			}
 			devices.metaDataLoopbackSize = size
 		case "dm.fs":
-			if val != "ext4" && val != "xfs" {
+			if val != ext4 && val != xfs {
 				return nil, fmt.Errorf("devmapper: Unsupported filesystem %s", val)
 			}
 			devices.filesystem = val
@@ -2703,6 +2709,8 @@ func NewDeviceSet(root string, doInit bool, options []string, uidMaps, gidMaps [
 			devices.mountOptions = joinMountOptions(devices.mountOptions, val)
 		case "dm.metadatadev":
 			devices.metadataDevice = val
+		case "dm.metadata_size":
+			devices.metaDataSize = val
 		case "dm.datadev":
 			devices.dataDevice = val
 		case "dm.thinpooldev":
@@ -2738,6 +2746,8 @@ func NewDeviceSet(root string, doInit bool, options []string, uidMaps, gidMaps [
 				return nil, err
 			}
 
+		case "dm.metaDataSize":
+			lvmSetupConfig.MetaDataSize = val
 		case "dm.min_free_space":
 			if !strings.HasSuffix(val, "%") {
 				return nil, fmt.Errorf("devmapper: Option dm.min_free_space requires %% suffix")

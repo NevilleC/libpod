@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Compare commands listed by 'podman help' against those in 'man podman'.
 # Recurse into subcommands as well.
@@ -38,6 +38,9 @@ function podman_man() {
 
         # Special case: there is no podman-help man page, nor need for such.
         echo "help"
+        # Auto-update differs from other commands as it's a single command, not
+        # a main and sub-command split by a dash.
+        echo "auto-update"
     elif [ "$@" = "podman-image-trust" ]; then
         # Special case: set and show aren't actually in a table in the man page
         echo set

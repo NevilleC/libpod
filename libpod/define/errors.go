@@ -2,23 +2,30 @@ package define
 
 import (
 	"errors"
-
-	"github.com/containers/libpod/libpod/image"
-	"github.com/containers/libpod/utils"
 )
 
 var (
 	// ErrNoSuchCtr indicates the requested container does not exist
-	ErrNoSuchCtr = image.ErrNoSuchCtr
+	ErrNoSuchCtr = errors.New("no such container")
 
 	// ErrNoSuchPod indicates the requested pod does not exist
-	ErrNoSuchPod = image.ErrNoSuchPod
+	ErrNoSuchPod = errors.New("no such pod")
 
 	// ErrNoSuchImage indicates the requested image does not exist
-	ErrNoSuchImage = image.ErrNoSuchImage
+	ErrNoSuchImage = errors.New("no such image")
+
+	// ErrNoSuchTag indicates the requested image tag does not exist
+	ErrNoSuchTag = errors.New("no such tag")
 
 	// ErrNoSuchVolume indicates the requested volume does not exist
 	ErrNoSuchVolume = errors.New("no such volume")
+
+	// ErrNoSuchNetwork indicates the requested network does not exist
+	ErrNoSuchNetwork = errors.New("network not found")
+
+	// ErrNoSuchExecSession indicates that the requested exec session does
+	// not exist.
+	ErrNoSuchExecSession = errors.New("no such exec session")
 
 	// ErrCtrExists indicates a container with the same name or ID already
 	// exists
@@ -29,10 +36,16 @@ var (
 	ErrImageExists = errors.New("image already exists")
 	// ErrVolumeExists indicates a volume with the same name already exists
 	ErrVolumeExists = errors.New("volume already exists")
+	// ErrExecSessionExists indicates an exec session with the same ID
+	// already exists.
+	ErrExecSessionExists = errors.New("exec session already exists")
 
 	// ErrCtrStateInvalid indicates a container is in an improper state for
 	// the requested operation
 	ErrCtrStateInvalid = errors.New("container state improper")
+	// ErrExecSessionStateInvalid indicates that an exec session is in an
+	// improper state for the requested operation
+	ErrExecSessionStateInvalid = errors.New("exec session state improper")
 	// ErrVolumeBeingUsed indicates that a volume is being used by at least one container
 	ErrVolumeBeingUsed = errors.New("volume is being used")
 
@@ -57,13 +70,25 @@ var (
 	// ErrInternal indicates an internal library error
 	ErrInternal = errors.New("internal libpod error")
 
+	// ErrPodPartialFail indicates that a pod operation was only partially
+	// successful, and some containers within the pod failed.
+	ErrPodPartialFail = errors.New("some containers failed")
+
 	// ErrDetach indicates that an attach session was manually detached by
 	// the user.
-	ErrDetach = utils.ErrDetach
+	ErrDetach = errors.New("detached from container")
+
+	// ErrWillDeadlock indicates that the requested operation will cause a
+	// deadlock. This is usually caused by upgrade issues, and is resolved
+	// by renumbering the locks.
+	ErrWillDeadlock = errors.New("deadlock due to lock mismatch")
 
 	// ErrNoCgroups indicates that the container does not have its own
 	// CGroup.
 	ErrNoCgroups = errors.New("this container does not have a cgroup")
+	// ErrNoLogs indicates that this container is not creating a log so log
+	// operations cannot be performed on it
+	ErrNoLogs = errors.New("this container is not logging output")
 
 	// ErrRootless indicates that the given command cannot but run without
 	// root.
@@ -85,6 +110,9 @@ var (
 	// ErrVolumeRemoved indicates that the volume has already been removed and
 	// no further operations can be performed on it
 	ErrVolumeRemoved = errors.New("volume has already been removed")
+	// ErrExecSessionRemoved indicates that the exec session has already
+	// been removed and no further operations can be performed on it.
+	ErrExecSessionRemoved = errors.New("exec session has already been removed")
 
 	// ErrDBClosed indicates that the connection to the state database has
 	// already been closed
@@ -123,4 +151,18 @@ var (
 	// ErrConmonOutdated indicates the version of conmon found (whether via the configuration or $PATH)
 	// is out of date for the current podman version
 	ErrConmonOutdated = errors.New("outdated conmon version")
+	// ErrConmonDead indicates that the container's conmon process has been
+	// killed, preventing normal operation.
+	ErrConmonDead = errors.New("conmon process killed")
+
+	// ErrImageInUse indicates the requested operation failed because the image was in use
+	ErrImageInUse = errors.New("image is being used")
+
+	// ErrNetworkOnPodContainer indicates the user wishes to alter network attributes on a container
+	// in a pod.  This cannot be done as the infra container has all the network information
+	ErrNetworkOnPodContainer = errors.New("network cannot be configured when it is shared with a pod")
+
+	// ErrStoreNotInitialized indicates that the container storage was never
+	// initialized.
+	ErrStoreNotInitialized = errors.New("the container storage was never initialized")
 )

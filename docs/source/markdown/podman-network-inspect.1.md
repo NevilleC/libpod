@@ -4,10 +4,15 @@
 podman\-network\-inspect - Displays the raw CNI network configuration for one or more networks
 
 ## SYNOPSIS
-**podman network inspect**  [*network* ...]
+**podman network inspect** [*options*] [*network* ...]
 
 ## DESCRIPTION
 Display the raw (JSON format) network configuration. This command is not available for rootless users.
+
+## OPTIONS
+**--format**, **-f**
+
+Pretty-print networks to JSON or using a Go template.
 
 ## EXAMPLE
 
@@ -41,6 +46,11 @@ Inspect the default podman network
     ]
 }
 ]
+```
+
+```
+# podman network inspect podman --format '{{(index  .plugins  0).ipam.ranges}}'
+[[map[gateway:10.88.0.1 subnet:10.88.0.0/16]]]
 ```
 
 ## SEE ALSO

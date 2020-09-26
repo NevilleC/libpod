@@ -14,8 +14,8 @@ Push is mainly used to push images to registries, however **podman push**
 can be used to save images to tarballs and directories using the following
 transports: **dir:**, **docker-archive:**, **docker-daemon:** and **oci-archive:**.
 
-## imageID
-Image stored in local container/storage
+## Image storage
+Images are pushed from those stored in local image storage.
 
 ## DESTINATION
 
@@ -70,6 +70,12 @@ Note: This flag can only be set when using the **dir** transport
 **--digestfile** *Digestfile*
 
 After copying the image, write the digest of the resulting image to the file.  (Not available for remote commands)
+
+**--disable-content-trust**
+
+This is a Docker specific option to disable image verification to a Docker
+registry and is not supported by Podman.  This flag is a NOOP and provided
+solely for scripting compatibility.
 
 **--format**, **-f**=*format*
 

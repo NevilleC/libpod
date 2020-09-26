@@ -1,11 +1,9 @@
-// +build !remoteclient
-
 package integration
 
 import (
 	"os"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -35,6 +33,7 @@ var _ = Describe("Podman namespaces", func() {
 	})
 
 	It("podman namespace test", func() {
+		SkipIfRemote("FIXME This should work on Remote")
 		podman1 := podmanTest.Podman([]string{"--namespace", "test1", "run", "-d", ALPINE, "echo", "hello"})
 		podman1.WaitWithDefaultTimeout()
 		Expect(podman1.ExitCode()).To(Equal(0))

@@ -4,19 +4,20 @@ package varlinkapi
 
 import (
 	"bufio"
+	"context"
 	"io"
 
-	"github.com/containers/libpod/cmd/podman/varlink"
-	"github.com/containers/libpod/libpod"
-	"github.com/containers/libpod/libpod/define"
-	"github.com/containers/libpod/libpod/events"
-	"github.com/containers/libpod/pkg/varlinkapi/virtwriter"
+	"github.com/containers/podman/v2/libpod"
+	"github.com/containers/podman/v2/libpod/define"
+	"github.com/containers/podman/v2/libpod/events"
+	iopodman "github.com/containers/podman/v2/pkg/varlink"
+	"github.com/containers/podman/v2/pkg/varlinkapi/virtwriter"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"k8s.io/client-go/tools/remotecommand"
 )
 
-func setupStreams(call iopodman.VarlinkCall) (*bufio.Reader, *bufio.Writer, *io.PipeReader, *io.PipeWriter, *libpod.AttachStreams) {
+func setupStreams(call iopodman.VarlinkCall) (*bufio.Reader, *bufio.Writer, *io.PipeReader, *io.PipeWriter, *define.AttachStreams) {
 
 	// These are the varlink sockets
 	reader := call.Call.Reader
@@ -28,9 +29,9 @@ func setupStreams(call iopodman.VarlinkCall) (*bufio.Reader, *bufio.Writer, *io.
 
 	stdoutWriter := virtwriter.NewVirtWriteCloser(writer, virtwriter.ToStdout)
 	// TODO if runc ever starts passing stderr, we can too
-	//stderrWriter := NewVirtWriteCloser(writer, ToStderr)
+	// stderrWriter := NewVirtWriteCloser(writer, ToStderr)
 
-	streams := libpod.AttachStreams{
+	streams := define.AttachStreams{
 		OutputStream: stdoutWriter,
 		InputStream:  bufio.NewReader(pr),
 		// Runc eats the error stream
@@ -44,7 +45,7 @@ func setupStreams(call iopodman.VarlinkCall) (*bufio.Reader, *bufio.Writer, *io.
 }
 
 // Attach connects to a containers console
-func (i *LibpodAPI) Attach(call iopodman.VarlinkCall, name string, detachKeys string, start bool) error {
+func (i *VarlinkAPI) Attach(call iopodman.VarlinkCall, name string, detachKeys string, start bool) error {
 	var finalErr error
 	resize := make(chan remotecommand.TerminalSize)
 	errChan := make(chan error)
@@ -89,7 +90,7 @@ func (i *LibpodAPI) Attach(call iopodman.VarlinkCall, name string, detachKeys st
 		if ecode, err := ctr.Wait(); err != nil {
 			if errors.Cause(err) == define.ErrNoSuchCtr {
 				// Check events
-				event, err := i.Runtime.GetLastContainerEvent(ctr.ID(), events.Exited)
+				event, err := i.Runtime.GetLastContainerEvent(context.Background(), ctr.ID(), events.Exited)
 				if err != nil {
 					logrus.Errorf("Cannot get exit code: %v", err)
 					exitCode = define.ExecErrorCodeNotFound
@@ -117,7 +118,7 @@ func (i *LibpodAPI) Attach(call iopodman.VarlinkCall, name string, detachKeys st
 	return call.Writer.Flush()
 }
 
-func attach(ctr *libpod.Container, streams *libpod.AttachStreams, detachKeys string, resize chan remotecommand.TerminalSize, errChan chan error) error {
+func attach(ctr *libpod.Container, streams *define.AttachStreams, detachKeys string, resize chan remotecommand.TerminalSize, errChan chan error) error {
 	go func() {
 		if err := ctr.Attach(streams, detachKeys, resize); err != nil {
 			errChan <- err
@@ -127,7 +128,7 @@ func attach(ctr *libpod.Container, streams *libpod.AttachStreams, detachKeys str
 	return attachError
 }
 
-func startAndAttach(ctr *libpod.Container, streams *libpod.AttachStreams, detachKeys string, resize chan remotecommand.TerminalSize, errChan chan error) error {
+func startAndAttach(ctr *libpod.Container, streams *define.AttachStreams, detachKeys string, resize chan remotecommand.TerminalSize, errChan chan error) error {
 	var finalErr error
 	attachChan, err := ctr.StartAndAttach(getContext(), streams, detachKeys, resize, false)
 	if err != nil {

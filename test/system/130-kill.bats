@@ -6,10 +6,29 @@
 load helpers
 
 @test "podman kill - test signal handling in containers" {
+    # podman-remote and crun interact poorly in f31: crun seems to gobble up
+    # some signals.
+    # Workaround: run 'env --default-signal sh' instead of just 'sh' in
+    # the container. Since env on our regular alpine image doesn't support
+    # that flag, we need to pull fedora-minimal. See:
+    #    https://github.com/containers/podman/issues/5004
+    # FIXME: remove this kludge once we get rid of podman-remote
+    local _image=$IMAGE
+    local _sh_cmd="sh"
+    if is_remote; then
+        _image=quay.io/libpod/fedora-minimal:latest
+        _sh_cmd="env --default-signal sh"
+    fi
+
     # Start a container that will handle all signals by emitting 'got: N'
     local -a signals=(1 2 3 4 5 6 8 10 12 13 14 15 16 20 21 22 23 24 25 26 64)
-    run_podman run -d $IMAGE sh -c "for i in ${signals[*]}; do trap \"echo got: \$i\" \$i; done; echo READY; while ! test -e /stop; do sleep 0.05; done;echo DONE"
-    cid="$output"
+    run_podman run -d $_image $_sh_cmd -c \
+        "for i in ${signals[*]}; do trap \"echo got: \$i\" \$i; done;
+        echo READY;
+        while ! test -e /stop; do sleep 0.05; done;
+        echo DONE"
+    # Ignore output regarding pulling/processing container images
+    cid=$(echo "$output" | tail -1)
 
     # Run 'logs -f' on that container, but run it in the background with
     # redirection to a named pipe from which we (foreground job) read
@@ -62,6 +81,10 @@ load helpers
     run_podman wait $cid
     run_podman rm $cid
     wait $podman_log_pid
+
+    if [[ $_image != $IMAGE ]]; then
+        run_podman rmi $_image
+    fi
 }
 
 @test "podman kill - rejects invalid args" {
@@ -70,10 +93,10 @@ load helpers
     for s in ${bad_signal_names[@]}; do
         # 'nosuchcontainer' is fine: podman should bail before it gets there
         run_podman 125 kill -s $s nosuchcontainer
-        is "$output" "Error: Invalid signal: $s" "Error from kill -s $s"
+        is "$output" "Error: invalid signal: $s" "Error from kill -s $s"
 
         run_podman 125 pod kill -s $s nosuchpod
-        is "$output" "Error: Invalid signal: $s" "Error from pod kill -s $s"
+        is "$output" "Error: invalid signal: $s" "Error from pod kill -s $s"
     done
 
     # Special case: these too are thrown by docker/signal.ParseSignal(),
@@ -82,7 +105,7 @@ load helpers
     local -a bad_dash_signals=(-0 -SIGBADSIG -SIG -BADSIG -)
     for s in ${bad_dash_signals[@]}; do
         run_podman 125 kill -s $s nosuchcontainer
-        is "$output" "Error: Invalid signal: ${s##-}" "Error from kill -s $s"
+        is "$output" "Error: invalid signal: ${s##-}" "Error from kill -s $s"
     done
 
     # This error (signal out of range) is thrown by our wrapper

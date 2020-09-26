@@ -1,12 +1,16 @@
 package version
 
+import (
+	"github.com/blang/semver"
+)
+
 // Version is the version of the build.
 // NOTE: remember to bump the version at the top
 // of the top-level README.md file when this is
 // bumped.
-const Version = "1.7.1-dev"
+var Version = semver.MustParse("2.2.0-dev")
 
-// RemoteAPIVersion is the version for the remote
+// APIVersion is the version for the remote
 // client API.  It is used to determine compatibility
 // between a remote podman client and its backend
-const RemoteAPIVersion = 1
+var APIVersion = semver.MustParse("2.0.0")

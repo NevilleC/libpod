@@ -10,9 +10,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/containers/libpod/pkg/rootless"
-	systemdDbus "github.com/coreos/go-systemd/dbus"
-	"github.com/godbus/dbus"
+	"github.com/containers/podman/v2/pkg/rootless"
+	systemdDbus "github.com/coreos/go-systemd/v22/dbus"
+	"github.com/godbus/dbus/v5"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -97,8 +97,7 @@ type controllerHandler interface {
 }
 
 const (
-	cgroupRoot         = "/sys/fs/cgroup"
-	_cgroup2SuperMagic = 0x63677270
+	cgroupRoot = "/sys/fs/cgroup"
 	// CPU is the cpu controller
 	CPU = "cpu"
 	// CPUAcct is the cpuacct controller
@@ -134,7 +133,7 @@ func getAvailableControllers(exclude map[string]controllerHandler, cgroup2 bool)
 	if err != nil {
 		return nil, errors.Wrapf(err, "read directory %s", cgroupRoot)
 	}
-	var controllers []controller
+	controllers := []controller{}
 	for _, i := range infos {
 		name := i.Name()
 		if _, found := exclude[name]; found {
@@ -155,7 +154,7 @@ func (c *CgroupControl) getCgroupv1Path(name string) string {
 }
 
 // createCgroupv2Path creates the cgroupv2 path and enables all the available controllers
-func createCgroupv2Path(path string) (Err error) {
+func createCgroupv2Path(path string) (deferredError error) {
 	content, err := ioutil.ReadFile("/sys/fs/cgroup/cgroup.controllers")
 	if err != nil {
 		return errors.Wrapf(err, "read /sys/fs/cgroup/cgroup.controllers")
@@ -169,7 +168,7 @@ func createCgroupv2Path(path string) (Err error) {
 		if i == 0 {
 			res = fmt.Sprintf("+%s", c)
 		} else {
-			res = res + fmt.Sprintf(" +%s", c)
+			res += fmt.Sprintf(" +%s", c)
 		}
 	}
 	resByte := []byte(res)
@@ -186,7 +185,7 @@ func createCgroupv2Path(path string) (Err error) {
 			} else {
 				// If the directory was created, be sure it is not left around on errors.
 				defer func() {
-					if Err != nil {
+					if deferredError != nil {
 						os.Remove(current)
 					}
 				}()
@@ -506,7 +505,7 @@ func (c *CgroupControl) AddPid(pid int) error {
 		return nil
 	}
 
-	var names []string
+	names := make([]string, 0, len(handlers))
 	for n := range handlers {
 		names = append(names, n)
 	}
@@ -518,6 +517,10 @@ func (c *CgroupControl) AddPid(pid int) error {
 	}
 
 	for _, n := range names {
+		// If we aren't using cgroup2, we won't write correctly to unified hierarchy
+		if !c.cgroup2 && n == "unified" {
+			continue
+		}
 		p := filepath.Join(c.getCgroupv1Path(n), "tasks")
 		if err := ioutil.WriteFile(p, pidString, 0644); err != nil {
 			return errors.Wrapf(err, "write %s", p)
@@ -537,15 +540,14 @@ func (c *CgroupControl) Stat() (*Metrics, error) {
 	return &m, nil
 }
 
-func readCgroup2MapFile(ctr *CgroupControl, name string) (map[string][]string, error) {
+func readCgroup2MapPath(path string) (map[string][]string, error) {
 	ret := map[string][]string{}
-	p := filepath.Join(cgroupRoot, ctr.path, name)
-	f, err := os.Open(p)
+	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return ret, nil
 		}
-		return nil, errors.Wrapf(err, "open file %s", p)
+		return nil, errors.Wrapf(err, "open file %s", path)
 	}
 	defer f.Close()
 	scanner := bufio.NewScanner(f)
@@ -558,7 +560,13 @@ func readCgroup2MapFile(ctr *CgroupControl, name string) (map[string][]string, e
 		ret[parts[0]] = parts[1:]
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, errors.Wrapf(err, "parsing file %s", p)
+		return nil, errors.Wrapf(err, "parsing file %s", path)
 	}
 	return ret, nil
+}
+
+func readCgroup2MapFile(ctr *CgroupControl, name string) (map[string][]string, error) {
+	p := filepath.Join(cgroupRoot, ctr.path, name)
+
+	return readCgroup2MapPath(p)
 }

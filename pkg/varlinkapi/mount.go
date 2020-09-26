@@ -2,12 +2,10 @@
 
 package varlinkapi
 
-import (
-	"github.com/containers/libpod/cmd/podman/varlink"
-)
+import iopodman "github.com/containers/podman/v2/pkg/varlink"
 
 // ListContainerMounts ...
-func (i *LibpodAPI) ListContainerMounts(call iopodman.VarlinkCall) error {
+func (i *VarlinkAPI) ListContainerMounts(call iopodman.VarlinkCall) error {
 	mounts := make(map[string]string)
 	allContainers, err := i.Runtime.GetAllContainers()
 	if err != nil {
@@ -26,7 +24,7 @@ func (i *LibpodAPI) ListContainerMounts(call iopodman.VarlinkCall) error {
 }
 
 // MountContainer ...
-func (i *LibpodAPI) MountContainer(call iopodman.VarlinkCall, name string) error {
+func (i *VarlinkAPI) MountContainer(call iopodman.VarlinkCall, name string) error {
 	container, err := i.Runtime.LookupContainer(name)
 	if err != nil {
 		return call.ReplyErrorOccurred(err.Error())
@@ -39,7 +37,7 @@ func (i *LibpodAPI) MountContainer(call iopodman.VarlinkCall, name string) error
 }
 
 // UnmountContainer ...
-func (i *LibpodAPI) UnmountContainer(call iopodman.VarlinkCall, name string, force bool) error {
+func (i *VarlinkAPI) UnmountContainer(call iopodman.VarlinkCall, name string, force bool) error {
 	container, err := i.Runtime.LookupContainer(name)
 	if err != nil {
 		return call.ReplyErrorOccurred(err.Error())

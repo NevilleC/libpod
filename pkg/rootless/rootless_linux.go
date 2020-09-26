@@ -16,7 +16,7 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/containers/libpod/pkg/errorhandling"
+	"github.com/containers/podman/v2/pkg/errorhandling"
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -31,7 +31,8 @@ extern uid_t rootless_uid();
 extern uid_t rootless_gid();
 extern int reexec_in_user_namespace(int ready, char *pause_pid_file_path, char *file_to_read, int fd);
 extern int reexec_in_user_namespace_wait(int pid, int options);
-extern int reexec_userns_join(int userns, int mountns, char *pause_pid_file_path);
+extern int reexec_userns_join(int pid, char *pause_pid_file_path);
+extern int is_fd_inherited(int fd);
 */
 import "C"
 
@@ -97,7 +98,11 @@ func GetRootlessGID() int {
 	return os.Getegid()
 }
 
-func tryMappingTool(tool string, pid int, hostID int, mappings []idtools.IDMap) error {
+func tryMappingTool(uid bool, pid int, hostID int, mappings []idtools.IDMap) error {
+	var tool = "newuidmap"
+	if !uid {
+		tool = "newgidmap"
+	}
 	path, err := exec.LookPath(tool)
 	if err != nil {
 		return errors.Wrapf(err, "cannot find %s", tool)
@@ -110,6 +115,15 @@ func tryMappingTool(tool string, pid int, hostID int, mappings []idtools.IDMap) 
 	args := []string{path, fmt.Sprintf("%d", pid)}
 	args = appendTriplet(args, 0, hostID, 1)
 	for _, i := range mappings {
+		if hostID >= i.HostID && hostID < i.HostID+i.Size {
+			what := "UID"
+			where := "/etc/subuid"
+			if !uid {
+				what = "GID"
+				where = "/etc/subgid"
+			}
+			return errors.Errorf("invalid configuration: the specified mapping %d:%d in %q includes the user %s", i.HostID, i.Size, where, what)
+		}
 		args = appendTriplet(args, i.ContainerID+1, i.HostID, i.Size)
 	}
 	cmd := exec.Cmd{
@@ -124,91 +138,6 @@ func tryMappingTool(tool string, pid int, hostID int, mappings []idtools.IDMap) 
 	return nil
 }
 
-func readUserNs(path string) (string, error) {
-	b := make([]byte, 256)
-	_, err := unix.Readlink(path, b)
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
-}
-
-func readUserNsFd(fd uintptr) (string, error) {
-	return readUserNs(fmt.Sprintf("/proc/self/fd/%d", fd))
-}
-
-func getParentUserNs(fd uintptr) (uintptr, error) {
-	const nsGetParent = 0xb702
-	ret, _, errno := unix.Syscall(unix.SYS_IOCTL, fd, uintptr(nsGetParent), 0)
-	if errno != 0 {
-		return 0, errno
-	}
-	return (uintptr)(unsafe.Pointer(ret)), nil
-}
-
-// getUserNSFirstChild returns an open FD for the first direct child user namespace that created the process
-// Each container creates a new user namespace where the runtime runs.  The current process in the container
-// might have created new user namespaces that are child of the initial namespace we created.
-// This function finds the initial namespace created for the container that is a child of the current namespace.
-//
-//                                     current ns
-//                                       /     \
-//                           TARGET ->  a   [other containers]
-//                                     /
-//                                    b
-//                                   /
-//        NS READ USING THE PID ->  c
-func getUserNSFirstChild(fd uintptr) (*os.File, error) {
-	currentNS, err := readUserNs("/proc/self/ns/user")
-	if err != nil {
-		return nil, err
-	}
-
-	ns, err := readUserNsFd(fd)
-	if err != nil {
-		return nil, errors.Wrapf(err, "cannot read user namespace")
-	}
-	if ns == currentNS {
-		return nil, errors.New("process running in the same user namespace")
-	}
-
-	for {
-		nextFd, err := getParentUserNs(fd)
-		if err != nil {
-			if err == unix.ENOTTY {
-				return os.NewFile(fd, "userns child"), nil
-			}
-			return nil, errors.Wrapf(err, "cannot get parent user namespace")
-		}
-
-		ns, err = readUserNsFd(nextFd)
-		if err != nil {
-			return nil, errors.Wrapf(err, "cannot read user namespace")
-		}
-
-		if ns == currentNS {
-			if err := unix.Close(int(nextFd)); err != nil {
-				return nil, err
-			}
-
-			// Drop O_CLOEXEC for the fd.
-			_, _, errno := unix.Syscall(unix.SYS_FCNTL, fd, unix.F_SETFD, 0)
-			if errno != 0 {
-				if err := unix.Close(int(fd)); err != nil {
-					logrus.Errorf("failed to close file descriptor %d", fd)
-				}
-				return nil, errno
-			}
-
-			return os.NewFile(fd, "userns child"), nil
-		}
-		if err := unix.Close(int(fd)); err != nil {
-			return nil, err
-		}
-		fd = nextFd
-	}
-}
-
 // joinUserAndMountNS re-exec podman in a new userNS and join the user and mount
 // namespace of the specified PID without looking up its parent.  Useful to join directly
 // the conmon process.
@@ -220,31 +149,7 @@ func joinUserAndMountNS(pid uint, pausePid string) (bool, int, error) {
 	cPausePid := C.CString(pausePid)
 	defer C.free(unsafe.Pointer(cPausePid))
 
-	userNS, err := os.Open(fmt.Sprintf("/proc/%d/ns/user", pid))
-	if err != nil {
-		return false, -1, err
-	}
-	defer func() {
-		if err := userNS.Close(); err != nil {
-			logrus.Errorf("unable to close namespace: %q", err)
-		}
-	}()
-
-	mountNS, err := os.Open(fmt.Sprintf("/proc/%d/ns/mnt", pid))
-	if err != nil {
-		return false, -1, err
-	}
-	defer func() {
-		if err := mountNS.Close(); err != nil {
-			logrus.Errorf("unable to close namespace: %q", err)
-		}
-	}()
-
-	fd, err := getUserNSFirstChild(userNS.Fd())
-	if err != nil {
-		return false, -1, err
-	}
-	pidC := C.reexec_userns_join(C.int(fd.Fd()), C.int(mountNS.Fd()), cPausePid)
+	pidC := C.reexec_userns_join(C.int(pid), cPausePid)
 	if int(pidC) < 0 {
 		return false, -1, errors.Errorf("cannot re-exec process")
 	}
@@ -275,7 +180,8 @@ func GetConfiguredMappings() ([]idtools.IDMap, []idtools.IDMap, error) {
 	}
 	mappings, err := idtools.NewIDMappings(username, username)
 	if err != nil {
-		logrus.Errorf("cannot find mappings for user %s: %v", username, err)
+		logrus.Errorf(
+			"cannot find UID/GID for user %s: %v - check rootless mode in man pages.", username, err)
 	} else {
 		uids = mappings.UIDs()
 		gids = mappings.GIDs()
@@ -283,7 +189,7 @@ func GetConfiguredMappings() ([]idtools.IDMap, []idtools.IDMap, error) {
 	return uids, gids, nil
 }
 
-func becomeRootInUserNS(pausePid, fileToRead string, fileOutput *os.File) (bool, int, error) {
+func becomeRootInUserNS(pausePid, fileToRead string, fileOutput *os.File) (_ bool, _ int, retErr error) {
 	if os.Geteuid() == 0 || os.Getenv("_CONTAINERS_USERNS_CONFIGURED") != "" {
 		if os.Getenv("_CONTAINERS_USERNS_CONFIGURED") == "init" {
 			return false, 0, runInUser()
@@ -310,16 +216,28 @@ func becomeRootInUserNS(pausePid, fileToRead string, fileOutput *os.File) (bool,
 	}
 	r, w := os.NewFile(uintptr(fds[0]), "sync host"), os.NewFile(uintptr(fds[1]), "sync child")
 
+	var pid int
+
 	defer errorhandling.CloseQuiet(r)
 	defer errorhandling.CloseQuiet(w)
 	defer func() {
-		if _, err := w.Write([]byte("0")); err != nil {
+		toWrite := []byte("0")
+		if retErr != nil {
+			toWrite = []byte("1")
+		}
+		if _, err := w.Write(toWrite); err != nil {
 			logrus.Errorf("failed to write byte 0: %q", err)
+		}
+		if retErr != nil && pid > 0 {
+			if err := unix.Kill(pid, unix.SIGKILL); err != nil {
+				logrus.Errorf("failed to kill %d", pid)
+			}
+			C.reexec_in_user_namespace_wait(C.int(pid), 0)
 		}
 	}()
 
 	pidC := C.reexec_in_user_namespace(C.int(r.Fd()), cPausePid, cFileToRead, fileOutputFD)
-	pid := int(pidC)
+	pid = int(pidC)
 	if pid < 0 {
 		return false, -1, errors.Errorf("cannot re-exec process")
 	}
@@ -331,7 +249,11 @@ func becomeRootInUserNS(pausePid, fileToRead string, fileOutput *os.File) (bool,
 
 	uidsMapped := false
 	if uids != nil {
-		err := tryMappingTool("newuidmap", pid, os.Geteuid(), uids)
+		err := tryMappingTool(true, pid, os.Geteuid(), uids)
+		// If some mappings were specified, do not ignore the error
+		if err != nil && len(uids) > 0 {
+			return false, -1, err
+		}
 		uidsMapped = err == nil
 	}
 	if !uidsMapped {
@@ -353,7 +275,11 @@ func becomeRootInUserNS(pausePid, fileToRead string, fileOutput *os.File) (bool,
 
 	gidsMapped := false
 	if gids != nil {
-		err := tryMappingTool("newgidmap", pid, os.Getegid(), gids)
+		err := tryMappingTool(false, pid, os.Getegid(), gids)
+		// If some mappings were specified, do not ignore the error
+		if err != nil && len(gids) > 0 {
+			return false, -1, err
+		}
 		gidsMapped = err == nil
 	}
 	if !gidsMapped {
@@ -376,6 +302,11 @@ func becomeRootInUserNS(pausePid, fileToRead string, fileOutput *os.File) (bool,
 	}
 
 	if fileOutput != nil {
+		ret := C.reexec_in_user_namespace_wait(pidC, 0)
+		if ret < 0 {
+			return false, -1, errors.New("error waiting for the re-exec process")
+		}
+
 		return true, 0, nil
 	}
 
@@ -452,6 +383,7 @@ func TryJoinFromFilePaths(pausePidPath string, needNewNamespace bool, paths []st
 
 	var lastErr error
 	var pausePid int
+	foundProcess := false
 
 	for _, path := range paths {
 		if !needNewNamespace {
@@ -470,13 +402,11 @@ func TryJoinFromFilePaths(pausePidPath string, needNewNamespace bool, paths []st
 			lastErr = nil
 			break
 		} else {
-			fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
+			r, w, err := os.Pipe()
 			if err != nil {
 				lastErr = err
 				continue
 			}
-
-			r, w := os.NewFile(uintptr(fds[0]), "read file"), os.NewFile(uintptr(fds[1]), "write file")
 
 			defer errorhandling.CloseQuiet(r)
 
@@ -502,11 +432,15 @@ func TryJoinFromFilePaths(pausePidPath string, needNewNamespace bool, paths []st
 			}
 
 			pausePid, err = strconv.Atoi(string(b[:n]))
-			if err == nil {
+			if err == nil && unix.Kill(pausePid, 0) == nil {
+				foundProcess = true
 				lastErr = nil
 				break
 			}
 		}
+	}
+	if !foundProcess && pausePidPath != "" {
+		return BecomeRootInUserNS(pausePidPath)
 	}
 	if lastErr != nil {
 		return false, 0, lastErr
@@ -514,6 +448,8 @@ func TryJoinFromFilePaths(pausePidPath string, needNewNamespace bool, paths []st
 
 	return joinUserAndMountNS(uint(pausePid), pausePidPath)
 }
+
+// ReadMappingsProc parses and returns the ID mappings at the specified path.
 func ReadMappingsProc(path string) ([]idtools.IDMap, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -595,4 +531,9 @@ func ConfigurationMatches() (bool, error) {
 	}
 
 	return matches(GetRootlessGID(), gids, currentGIDs), nil
+}
+
+// IsFdInherited checks whether the fd is opened and valid to use
+func IsFdInherited(fd int) bool {
+	return int(C.is_fd_inherited(C.int(fd))) > 0
 }

@@ -1,15 +1,17 @@
 package createconfig
 
 import (
+	"context"
 	"os"
 	"strconv"
 	"strings"
 	"syscall"
 
 	"github.com/containers/image/v5/manifest"
-	"github.com/containers/libpod/libpod"
-	"github.com/containers/libpod/libpod/define"
-	"github.com/containers/libpod/pkg/namespaces"
+	"github.com/containers/podman/v2/libpod"
+	"github.com/containers/podman/v2/libpod/define"
+	"github.com/containers/podman/v2/pkg/namespaces"
+	"github.com/containers/podman/v2/pkg/seccomp"
 	"github.com/containers/storage"
 	"github.com/docker/go-connections/nat"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
@@ -29,14 +31,16 @@ const (
 type CreateResourceConfig struct {
 	BlkioWeight       uint16   // blkio-weight
 	BlkioWeightDevice []string // blkio-weight-device
-	CPUPeriod         uint64   // cpu-period
-	CPUQuota          int64    // cpu-quota
-	CPURtPeriod       uint64   // cpu-rt-period
-	CPURtRuntime      int64    // cpu-rt-runtime
-	CPUShares         uint64   // cpu-shares
-	CPUs              float64  // cpus
+	CgroupConf        map[string]string
+	CPUPeriod         uint64  // cpu-period
+	CPUQuota          int64   // cpu-quota
+	CPURtPeriod       uint64  // cpu-rt-period
+	CPURtRuntime      int64   // cpu-rt-runtime
+	CPUShares         uint64  // cpu-shares
+	CPUs              float64 // cpus
 	CPUsetCPUs        string
 	CPUsetMems        string   // cpuset-mems
+	DeviceCgroupRules []string //device-cgroup-rule
 	DeviceReadBps     []string // device-read-bps
 	DeviceReadIOps    []string // device-read-iops
 	DeviceWriteBps    []string // device-write-bps
@@ -108,20 +112,25 @@ type NetworkConfig struct {
 
 // SecurityConfig configures the security features for the container
 type SecurityConfig struct {
-	CapAdd             []string // cap-add
-	CapDrop            []string // cap-drop
-	LabelOpts          []string //SecurityOpts
-	NoNewPrivs         bool     //SecurityOpts
-	ApparmorProfile    string   //SecurityOpts
-	SeccompProfilePath string   //SecurityOpts
-	SecurityOpts       []string
-	Privileged         bool              //privileged
-	ReadOnlyRootfs     bool              //read-only
-	ReadOnlyTmpfs      bool              //read-only-tmpfs
-	Sysctl             map[string]string //sysctl
+	CapAdd                  []string // cap-add
+	CapDrop                 []string // cap-drop
+	CapRequired             []string // cap-required
+	LabelOpts               []string //SecurityOpts
+	NoNewPrivs              bool     //SecurityOpts
+	ApparmorProfile         string   //SecurityOpts
+	SeccompProfilePath      string   //SecurityOpts
+	SeccompProfileFromImage string   // seccomp profile from the container image
+	SeccompPolicy           seccomp.Policy
+	SecurityOpts            []string
+	Privileged              bool              //privileged
+	ReadOnlyRootfs          bool              //read-only
+	ReadOnlyTmpfs           bool              //read-only-tmpfs
+	Sysctl                  map[string]string //sysctl
+	ProcOpts                []string
 }
 
 // CreateConfig is a pre OCI spec structure.  It represents user input from varlink or the CLI
+// swagger:model CreateConfig
 type CreateConfig struct {
 	Annotations       map[string]string
 	Args              []string
@@ -138,6 +147,7 @@ type CreateConfig struct {
 	InitPath          string //init-path
 	Image             string
 	ImageID           string
+	RawImageName      string
 	BuiltinImgVolumes map[string]struct{} // volumes defined in the image config
 	ImageVolumeType   string              // how to handle the image volume, either bind, tmpfs, or ignore
 	Interactive       bool                //interactive
@@ -151,6 +161,7 @@ type CreateConfig struct {
 	Resources         CreateResourceConfig
 	RestartPolicy     string
 	Rm                bool           //rm
+	Rmi               bool           //rmi
 	StopSignal        syscall.Signal // stop-signal
 	StopTimeout       uint           // stop-timeout
 	Systemd           bool
@@ -188,6 +199,7 @@ func (c *CreateConfig) createExitCommand(runtime *libpod.Runtime) ([]string, err
 	if err != nil {
 		return nil, err
 	}
+	storageConfig := runtime.StorageConfig()
 
 	// We need a cleanup process for containers in the current model.
 	// But we can't assume that the caller is Podman - it could be another
@@ -200,23 +212,23 @@ func (c *CreateConfig) createExitCommand(runtime *libpod.Runtime) ([]string, err
 	}
 
 	command := []string{cmd,
-		"--root", config.StorageConfig.GraphRoot,
-		"--runroot", config.StorageConfig.RunRoot,
+		"--root", storageConfig.GraphRoot,
+		"--runroot", storageConfig.RunRoot,
 		"--log-level", logrus.GetLevel().String(),
-		"--cgroup-manager", config.CgroupManager,
-		"--tmpdir", config.TmpDir,
+		"--cgroup-manager", config.Engine.CgroupManager,
+		"--tmpdir", config.Engine.TmpDir,
 	}
-	if config.OCIRuntime != "" {
-		command = append(command, []string{"--runtime", config.OCIRuntime}...)
+	if config.Engine.OCIRuntime != "" {
+		command = append(command, []string{"--runtime", config.Engine.OCIRuntime}...)
 	}
-	if config.StorageConfig.GraphDriverName != "" {
-		command = append(command, []string{"--storage-driver", config.StorageConfig.GraphDriverName}...)
+	if storageConfig.GraphDriverName != "" {
+		command = append(command, []string{"--storage-driver", storageConfig.GraphDriverName}...)
 	}
-	for _, opt := range config.StorageConfig.GraphDriverOptions {
+	for _, opt := range storageConfig.GraphDriverOptions {
 		command = append(command, []string{"--storage-opt", opt}...)
 	}
-	if config.EventsLogger != "" {
-		command = append(command, []string{"--events-backend", config.EventsLogger}...)
+	if config.Engine.EventsLogger != "" {
+		command = append(command, []string{"--events-backend", config.Engine.EventsLogger}...)
 	}
 
 	if c.Syslog {
@@ -226,6 +238,10 @@ func (c *CreateConfig) createExitCommand(runtime *libpod.Runtime) ([]string, err
 
 	if c.Rm {
 		command = append(command, "--rm")
+	}
+
+	if c.Rmi {
+		command = append(command, "--rmi")
 	}
 
 	return command, nil
@@ -251,6 +267,16 @@ func (c *CreateConfig) getContainerCreateOptions(runtime *libpod.Runtime, pod *l
 		options = append(options, runtime.WithPod(pod))
 	}
 
+	// handle some spec from the InfraContainer when it's a pod
+	if pod != nil && pod.HasInfraContainer() {
+		InfraCtr, err := pod.InfraContainer()
+		if err != nil {
+			return nil, err
+		}
+		// handle the pod.spec.hostAliases
+		options = append(options, libpod.WithHosts(InfraCtr.HostsAdd()))
+	}
+
 	if len(mounts) != 0 || len(namedVolumes) != 0 {
 		destinations := []string{}
 
@@ -273,18 +299,22 @@ func (c *CreateConfig) getContainerCreateOptions(runtime *libpod.Runtime, pod *l
 		options = append(options, libpod.WithCommand(c.UserCommand))
 	}
 
-	// Add entrypoint unconditionally
-	// If it's empty it's because it was explicitly set to "" or the image
-	// does not have one
-	options = append(options, libpod.WithEntrypoint(c.Entrypoint))
+	// Add entrypoint if it was set
+	// If it's empty it's because it was explicitly set to ""
+	if c.Entrypoint != nil {
+		options = append(options, libpod.WithEntrypoint(c.Entrypoint))
+	}
 
 	// TODO: MNT, USER, CGROUP
 	options = append(options, libpod.WithStopSignal(c.StopSignal))
 	options = append(options, libpod.WithStopTimeout(c.StopTimeout))
 
-	logPath := getLoggingPath(c.LogDriverOpt)
+	logPath, logTag := getLoggingOpts(c.LogDriverOpt)
 	if logPath != "" {
 		options = append(options, libpod.WithLogPath(logPath))
+	}
+	if logTag != "" {
+		options = append(options, libpod.WithLogTag(logTag))
 	}
 
 	if c.LogDriver != "" {
@@ -333,9 +363,8 @@ func (c *CreateConfig) getContainerCreateOptions(runtime *libpod.Runtime, pod *l
 	}
 	options = append(options, nsOpts...)
 
-	useImageVolumes := c.ImageVolumeType == TypeBind
 	// Gather up the options for NewContainer which consist of With... funcs
-	options = append(options, libpod.WithRootFSFromImage(c.ImageID, c.Image, useImageVolumes))
+	options = append(options, libpod.WithRootFSFromImage(c.ImageID, c.Image, c.RawImageName))
 	options = append(options, libpod.WithConmonPidFile(c.ConmonPidFile))
 	options = append(options, libpod.WithLabels(c.Labels))
 	options = append(options, libpod.WithShmSize(c.Resources.ShmSize))
@@ -379,6 +408,19 @@ func (c *CreateConfig) getContainerCreateOptions(runtime *libpod.Runtime, pod *l
 
 // AddPrivilegedDevices iterates through host devices and adds all
 // host devices to the spec
-func (c *CreateConfig) AddPrivilegedDevices(g *generate.Generator) error {
-	return c.addPrivilegedDevices(g)
+func AddPrivilegedDevices(g *generate.Generator) error {
+	return addPrivilegedDevices(g)
+}
+
+func CreateContainerFromCreateConfig(ctx context.Context, r *libpod.Runtime, createConfig *CreateConfig, pod *libpod.Pod) (*libpod.Container, error) {
+	runtimeSpec, options, err := createConfig.MakeContainerConfig(r, pod)
+	if err != nil {
+		return nil, err
+	}
+
+	ctr, err := r.NewContainer(ctx, runtimeSpec, options...)
+	if err != nil {
+		return nil, err
+	}
+	return ctr, nil
 }

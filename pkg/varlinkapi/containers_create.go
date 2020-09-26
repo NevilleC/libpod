@@ -3,14 +3,13 @@
 package varlinkapi
 
 import (
-	"github.com/containers/libpod/cmd/podman/shared"
-	"github.com/containers/libpod/cmd/podman/varlink"
+	iopodman "github.com/containers/podman/v2/pkg/varlink"
 )
 
 // CreateContainer ...
-func (i *LibpodAPI) CreateContainer(call iopodman.VarlinkCall, config iopodman.Create) error {
-	generic := shared.VarlinkCreateToGeneric(config)
-	ctr, _, err := shared.CreateContainer(getContext(), &generic, i.Runtime)
+func (i *VarlinkAPI) CreateContainer(call iopodman.VarlinkCall, config iopodman.Create) error {
+	generic := VarlinkCreateToGeneric(config)
+	ctr, _, err := CreateContainer(getContext(), &generic, i.Runtime)
 	if err != nil {
 		return call.ReplyErrorOccurred(err.Error())
 	}

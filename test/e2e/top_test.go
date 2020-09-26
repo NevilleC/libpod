@@ -1,11 +1,9 @@
-// +build !remoteclient
-
 package integration
 
 import (
 	"os"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -55,22 +53,22 @@ var _ = Describe("Podman top", func() {
 	})
 
 	It("podman top on container", func() {
-		session := podmanTest.Podman([]string{"run", "-d", ALPINE, "top", "-d", "2"})
+		session := podmanTest.Podman([]string{"run", "--name", "test", "-d", ALPINE, "top", "-d", "2"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 
-		result := podmanTest.Podman([]string{"top", "-l"})
+		result := podmanTest.Podman([]string{"top", "test"})
 		result.WaitWithDefaultTimeout()
 		Expect(result.ExitCode()).To(Equal(0))
 		Expect(len(result.OutputToStringArray())).To(BeNumerically(">", 1))
 	})
 
 	It("podman container top on container", func() {
-		session := podmanTest.Podman([]string{"container", "run", "-d", ALPINE, "top", "-d", "2"})
+		session := podmanTest.Podman([]string{"container", "run", "--name", "test", "-d", ALPINE, "top", "-d", "2"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 
-		result := podmanTest.Podman([]string{"container", "top", "-l"})
+		result := podmanTest.Podman([]string{"container", "top", "test"})
 		result.WaitWithDefaultTimeout()
 		Expect(result.ExitCode()).To(Equal(0))
 		Expect(len(result.OutputToStringArray())).To(BeNumerically(">", 1))

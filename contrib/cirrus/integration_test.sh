@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -e
 
@@ -6,19 +6,24 @@ source $(dirname $0)/lib.sh
 
 req_env_var GOSRC SCRIPT_BASE OS_RELEASE_ID OS_RELEASE_VER CONTAINER_RUNTIME VARLINK_LOG
 
+LOCAL_OR_REMOTE=local
+if [[ "$RCLI" = "true" ]]; then
+    LOCAL_OR_REMOTE=remote
+fi
+
 # Our name must be of the form xxxx_test or xxxx_test.sh, where xxxx is
 # the test suite to run; currently (2019-05) the only option is 'integration'
 # but pr2947 intends to add 'system'.
 TESTSUITE=$(expr $(basename $0) : '\(.*\)_test')
 if [[ -z $TESTSUITE ]]; then
-    die 1 "Script name is not of the form xxxx_test.sh"
+    die 1 "Script name ($basename $0) is not of the form xxxx_test.sh"
 fi
 
 cd "$GOSRC"
 
 case "$SPECIALMODE" in
     in_podman)
-        ${CONTAINER_RUNTIME} run --rm --privileged --net=host \
+        ${CONTAINER_RUNTIME} run --rm --privileged --net=host --cgroupns=host \
             -v $GOSRC:$GOSRC:Z \
             --workdir $GOSRC \
             -e "CGROUP_MANAGER=cgroupfs" \
@@ -34,17 +39,7 @@ case "$SPECIALMODE" in
         req_env_var ROOTLESS_USER
         ssh $ROOTLESS_USER@localhost \
                 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
-                -o CheckHostIP=no $GOSRC/$SCRIPT_BASE/rootless_test.sh ${TESTSUITE}
-        ;;
-    cgroupv2)
-        setenforce 0
-        dnf install -y crun
-        export OCI_RUNTIME=/usr/bin/crun
-        make
-        make install PREFIX=/usr ETCDIR=/etc
-        make install.config PREFIX=/usr
-        make test-binaries
-        make local${TESTSUITE}
+                -o CheckHostIP=no $GOSRC/$SCRIPT_BASE/rootless_test.sh ${TESTSUITE} ${LOCAL_OR_REMOTE}
         ;;
     endpoint)
         make
@@ -52,17 +47,18 @@ case "$SPECIALMODE" in
         make test-binaries
         make endpoint
         ;;
+    bindings)
+	    make
+        make install PREFIX=/usr ETCDIR=/etc
+	    export PATH=$PATH:`pwd`/hack
+	    cd pkg/bindings/test && ginkgo -trace -noColor -debug  -r
+	;;
     none)
         make
         make install PREFIX=/usr ETCDIR=/etc
-        make install.config PREFIX=/usr
         make test-binaries
-        if [[ "$TEST_REMOTE_CLIENT" == "true" ]]
-        then
-            make remote${TESTSUITE} VARLINK_LOG=$VARLINK_LOG
-        else
-            make local${TESTSUITE}
-        fi
+        make .install.bats
+        make ${LOCAL_OR_REMOTE}${TESTSUITE} PODMAN_SERVER_LOG=$PODMAN_SERVER_LOG
         ;;
     *)
         die 110 "Unsupported \$SPECIALMODE: $SPECIALMODE"

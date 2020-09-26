@@ -12,7 +12,6 @@ import (
 
 	"github.com/containers/buildah/pkg/blobcache"
 	"github.com/containers/buildah/util"
-	cp "github.com/containers/image/v5/copy"
 	"github.com/containers/image/v5/docker"
 	"github.com/containers/image/v5/docker/reference"
 	"github.com/containers/image/v5/manifest"
@@ -20,11 +19,11 @@ import (
 	is "github.com/containers/image/v5/storage"
 	"github.com/containers/image/v5/transports"
 	"github.com/containers/image/v5/types"
+	encconfig "github.com/containers/ocicrypt/config"
 	"github.com/containers/storage"
 	"github.com/containers/storage/pkg/archive"
 	"github.com/containers/storage/pkg/stringid"
 	digest "github.com/opencontainers/go-digest"
-	configv1 "github.com/openshift/api/config/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -80,7 +79,25 @@ type CommitOptions struct {
 	EmptyLayer bool
 	// OmitTimestamp forces epoch 0 as created timestamp to allow for
 	// deterministic, content-addressable builds.
+	// Deprecated use HistoryTimestamp instead.
 	OmitTimestamp bool
+	// SignBy is the fingerprint of a GPG key to use for signing the image.
+	SignBy string
+	// MaxRetries is the maximum number of attempts we'll make to commit
+	// the image to an external registry if the first attempt fails.
+	MaxRetries int
+	// RetryDelay is how long to wait before retrying a commit attempt to a
+	// registry.
+	RetryDelay time.Duration
+	// OciEncryptConfig when non-nil indicates that an image should be encrypted.
+	// The encryption options is derived from the construction of EncryptConfig object.
+	OciEncryptConfig *encconfig.EncryptConfig
+	// OciEncryptLayers represents the list of layers to encrypt.
+	// If nil, don't encrypt any layers.
+	// If non-nil and len==0, denotes encrypt all layers.
+	// integers in the slice represent 0-indexed layer indices, with support for negative
+	// indexing. i.e. 0 is the first layer, -1 is the last (top-most) layer.
+	OciEncryptLayers *[]int
 }
 
 // PushOptions can be used to alter how an image is copied somewhere.
@@ -115,6 +132,25 @@ type PushOptions struct {
 	// the user will be displayed, this is best used for logging.
 	// The default is false.
 	Quiet bool
+	// SignBy is the fingerprint of a GPG key to use for signing the image.
+	SignBy string
+	// RemoveSignatures causes any existing signatures for the image to be
+	// discarded for the pushed copy.
+	RemoveSignatures bool
+	// MaxRetries is the maximum number of attempts we'll make to push any
+	// one image to the external registry if the first attempt fails.
+	MaxRetries int
+	// RetryDelay is how long to wait before retrying a push attempt.
+	RetryDelay time.Duration
+	// OciEncryptConfig when non-nil indicates that an image should be encrypted.
+	// The encryption options is derived from the construction of EncryptConfig object.
+	OciEncryptConfig *encconfig.EncryptConfig
+	// OciEncryptLayers represents the list of layers to encrypt.
+	// If nil, don't encrypt any layers.
+	// If non-nil and len==0, denotes encrypt all layers.
+	// integers in the slice represent 0-indexed layer indices, with support for negative
+	// indexing. i.e. 0 is the first layer, -1 is the last (top-most) layer.
+	OciEncryptLayers *[]int
 }
 
 var (
@@ -145,7 +181,12 @@ func checkRegistrySourcesAllows(forWhat string, dest types.ImageReference) error
 	}
 
 	if registrySources, ok := os.LookupEnv("BUILD_REGISTRY_SOURCES"); ok && len(registrySources) > 0 {
-		var sources configv1.RegistrySources
+		// Use local struct instead of github.com/openshift/api/config/v1 RegistrySources
+		var sources struct {
+			InsecureRegistries []string `json:"insecureRegistries,omitempty"`
+			BlockedRegistries  []string `json:"blockedRegistries,omitempty"`
+			AllowedRegistries  []string `json:"allowedRegistries,omitempty"`
+		}
 		if err := json.Unmarshal([]byte(registrySources), &sources); err != nil {
 			return errors.Wrapf(err, "error parsing $BUILD_REGISTRY_SOURCES (%q) as JSON", registrySources)
 		}
@@ -191,6 +232,13 @@ func (b *Builder) Commit(ctx context.Context, dest types.ImageReference, options
 	// want to compute here because we'll have to do it again when
 	// cp.Image() instantiates a source image, and we don't want to do the
 	// work twice.
+	if options.OmitTimestamp {
+		if options.HistoryTimestamp != nil {
+			return imgID, nil, "", errors.Errorf("OmitTimestamp ahd HistoryTimestamp can not be used together")
+		}
+		timestamp := time.Unix(0, 0).UTC()
+		options.HistoryTimestamp = &timestamp
+	}
 	nameToRemove := ""
 	if dest == nil {
 		nameToRemove = stringid.GenerateRandomID() + "-tmp"
@@ -253,7 +301,9 @@ func (b *Builder) Commit(ctx context.Context, dest types.ImageReference, options
 	// Check if the base image is already in the destination and it's some kind of local
 	// storage.  If so, we can skip recompressing any layers that come from the base image.
 	exportBaseLayers := true
-	if transport, destIsStorage := dest.Transport().(is.StoreTransport); destIsStorage && b.FromImageID != "" {
+	if transport, destIsStorage := dest.Transport().(is.StoreTransport); destIsStorage && options.OciEncryptConfig != nil {
+		return imgID, nil, "", errors.New("unable to use local storage with image encryption")
+	} else if destIsStorage && b.FromImageID != "" {
 		if baseref, err := transport.ParseReference(b.FromImageID); baseref != nil && err == nil {
 			if img, err := transport.GetImage(baseref); img != nil && err == nil {
 				logrus.Debugf("base image %q is already present in local storage, no need to copy its layers", b.FromImageID)
@@ -293,8 +343,16 @@ func (b *Builder) Commit(ctx context.Context, dest types.ImageReference, options
 	case archive.Gzip:
 		systemContext.DirForceCompress = true
 	}
+
+	if systemContext.ArchitectureChoice != b.Architecture() {
+		systemContext.ArchitectureChoice = b.Architecture()
+	}
+	if systemContext.OSChoice != b.OS() {
+		systemContext.OSChoice = b.OS()
+	}
+
 	var manifestBytes []byte
-	if manifestBytes, err = cp.Image(ctx, policyContext, maybeCachedDest, maybeCachedSrc, getCopyOptions(b.store, options.ReportWriter, nil, systemContext, "")); err != nil {
+	if manifestBytes, err = retryCopyImage(ctx, policyContext, maybeCachedDest, maybeCachedSrc, dest, getCopyOptions(b.store, options.ReportWriter, nil, systemContext, "", false, options.SignBy, options.OciEncryptLayers, options.OciEncryptConfig, nil), options.MaxRetries, options.RetryDelay); err != nil {
 		return imgID, nil, "", errors.Wrapf(err, "error copying layers and metadata for container %q", b.ContainerID)
 	}
 	// If we've got more names to attach, and we know how to do that for
@@ -426,7 +484,7 @@ func Push(ctx context.Context, image string, dest types.ImageReference, options 
 		systemContext.DirForceCompress = true
 	}
 	var manifestBytes []byte
-	if manifestBytes, err = cp.Image(ctx, policyContext, dest, maybeCachedSrc, getCopyOptions(options.Store, options.ReportWriter, nil, systemContext, options.ManifestType)); err != nil {
+	if manifestBytes, err = retryCopyImage(ctx, policyContext, dest, maybeCachedSrc, dest, getCopyOptions(options.Store, options.ReportWriter, nil, systemContext, options.ManifestType, options.RemoveSignatures, options.SignBy, options.OciEncryptLayers, options.OciEncryptConfig, nil), options.MaxRetries, options.RetryDelay); err != nil {
 		return nil, "", errors.Wrapf(err, "error copying layers and metadata from %q to %q", transports.ImageName(maybeCachedSrc), transports.ImageName(dest))
 	}
 	if options.ReportWriter != nil {

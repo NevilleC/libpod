@@ -1,4 +1,4 @@
-// +build !remoteclient
+// +build !remote
 
 package integration
 
@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -95,7 +95,7 @@ var _ = Describe("Podman cp", func() {
 	})
 
 	It("podman cp dir to dir", func() {
-		testDirPath := filepath.Join(podmanTest.RunRoot, "TestDir")
+		testDirPath := filepath.Join(podmanTest.RunRoot, "TestDir1")
 
 		session := podmanTest.Podman([]string{"create", ALPINE, "ls", "/foodir"})
 		session.WaitWithDefaultTimeout()
@@ -104,6 +104,7 @@ var _ = Describe("Podman cp", func() {
 
 		err := os.Mkdir(testDirPath, 0755)
 		Expect(err).To(BeNil())
+		defer os.RemoveAll(testDirPath)
 
 		session = podmanTest.Podman([]string{"cp", testDirPath, name + ":/foodir"})
 		session.WaitWithDefaultTimeout()
@@ -112,17 +113,44 @@ var _ = Describe("Podman cp", func() {
 		session = podmanTest.Podman([]string{"cp", testDirPath, name + ":/foodir"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
+
+		testctr := "testctr"
+		setup := podmanTest.RunTopContainer(testctr)
+		setup.WaitWithDefaultTimeout()
+		Expect(setup.ExitCode()).To(Equal(0))
+
+		session = podmanTest.Podman([]string{"exec", testctr, "mkdir", "foo"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+
+		session = podmanTest.Podman([]string{"cp", testDirPath + "/.", testctr + ":/foo"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		session = podmanTest.Podman([]string{"exec", testctr, "ls", "foo"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		Expect(len(session.OutputToString())).To(Equal(0))
+
+		session = podmanTest.Podman([]string{"cp", testctr + ":/foo/.", testDirPath})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		cmd := exec.Command("ls", testDirPath)
+		res, err := cmd.Output()
+		Expect(err).To(BeNil())
+		Expect(len(res)).To(Equal(0))
 	})
 
 	It("podman cp stdin/stdout", func() {
+		SkipIfRemote("FIXME: podman-remote cp not implemented yet")
 		session := podmanTest.Podman([]string{"create", ALPINE, "ls", "foo"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 		name := session.OutputToString()
 
-		testDirPath := filepath.Join(podmanTest.RunRoot, "TestDir")
+		testDirPath := filepath.Join(podmanTest.RunRoot, "TestDir2")
 		err := os.Mkdir(testDirPath, 0755)
 		Expect(err).To(BeNil())
+		defer os.RemoveAll(testDirPath)
 		cmd := exec.Command("tar", "-zcvf", "file.tar.gz", testDirPath)
 		_, err = cmd.Output()
 		Expect(err).To(BeNil())
@@ -141,7 +169,6 @@ var _ = Describe("Podman cp", func() {
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 
-		os.RemoveAll(testDirPath)
 		os.Remove("file.tar.gz")
 	})
 
@@ -157,9 +184,10 @@ var _ = Describe("Podman cp", func() {
 
 		path, err := os.Getwd()
 		Expect(err).To(BeNil())
-		testDirPath := filepath.Join(path, "TestDir")
+		testDirPath := filepath.Join(path, "TestDir3")
 		err = os.Mkdir(testDirPath, 0777)
 		Expect(err).To(BeNil())
+		defer os.RemoveAll(testDirPath)
 		cmd := exec.Command("tar", "-cvf", "file.tar", testDirPath)
 		_, err = cmd.Output()
 		Expect(err).To(BeNil())
@@ -174,7 +202,6 @@ var _ = Describe("Podman cp", func() {
 		Expect(session.OutputToString()).To(ContainSubstring("file.tar"))
 
 		os.Remove("file.tar")
-		os.RemoveAll(testDirPath)
 	})
 
 	It("podman cp symlink", func() {
@@ -267,5 +294,43 @@ var _ = Describe("Podman cp", func() {
 		Expect(session.OutputToString()).To(ContainSubstring("root"))
 
 		os.Remove("testfile1")
+	})
+	It("podman cp the root directory from the ctr to an existing directory on the host ", func() {
+		imgName := "test-cp-root-dir:latest"
+		DockerfileName := "Dockerfile.test-cp-root-dir"
+		ctrName := "test-container-cp-root"
+
+		session := podmanTest.PodmanNoCache([]string{"build", "-f", "build/" + DockerfileName, "-t", imgName, "build/"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+
+		testDirPath := filepath.Join(podmanTest.RunRoot, "TestDirForCp")
+
+		session = podmanTest.Podman([]string{"create", "--name", ctrName, imgName, "dummy"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+
+		err := os.Mkdir(testDirPath, 0755)
+		Expect(err).To(BeNil())
+		defer os.RemoveAll(testDirPath)
+
+		// Copy the root directory of the container to an existing directory
+		session = podmanTest.Podman([]string{"cp", ctrName + ":/", testDirPath})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+
+		// The file should be in the directory,
+		// not one layer too much of the directory called merged
+		checkFile := filepath.Join(testDirPath, DockerfileName)
+		_, err = os.Stat(checkFile)
+		Expect(err).To(BeNil())
+
+		session = podmanTest.Podman([]string{"container", "rm", ctrName})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+
+		session = podmanTest.PodmanNoCache([]string{"rmi", "-f", imgName})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
 	})
 })

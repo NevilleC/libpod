@@ -2,14 +2,14 @@ package storage
 
 import (
 	"fmt"
+	"io/ioutil"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
 
-	"github.com/BurntSushi/toml"
+	"github.com/containers/storage/pkg/homedir"
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/containers/storage/pkg/system"
 	"github.com/pkg/errors"
@@ -69,8 +69,8 @@ func ParseIDMapping(UIDMapSlice, GIDMapSlice []string, subUIDMap, subGIDMap stri
 }
 
 // GetRootlessRuntimeDir returns the runtime directory when running as non root
-func GetRootlessRuntimeDir(rootlessUid int) (string, error) {
-	path, err := getRootlessRuntimeDir(rootlessUid)
+func GetRootlessRuntimeDir(rootlessUID int) (string, error) {
+	path, err := getRootlessRuntimeDir(rootlessUID)
 	if err != nil {
 		return "", err
 	}
@@ -81,96 +81,150 @@ func GetRootlessRuntimeDir(rootlessUid int) (string, error) {
 	return path, nil
 }
 
-func getRootlessRuntimeDir(rootlessUid int) (string, error) {
-	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
+type rootlessRuntimeDirEnvironment interface {
+	getProcCommandFile() string
+	getRunUserDir() string
+	getTmpPerUserDir() string
 
-	if runtimeDir != "" {
+	homeDirGetRuntimeDir() (string, error)
+	systemLstat(string) (*system.StatT, error)
+	homedirGet() string
+}
+
+type rootlessRuntimeDirEnvironmentImplementation struct {
+	procCommandFile string
+	runUserDir      string
+	tmpPerUserDir   string
+}
+
+func (env rootlessRuntimeDirEnvironmentImplementation) getProcCommandFile() string {
+	return env.procCommandFile
+}
+func (env rootlessRuntimeDirEnvironmentImplementation) getRunUserDir() string {
+	return env.runUserDir
+}
+func (env rootlessRuntimeDirEnvironmentImplementation) getTmpPerUserDir() string {
+	return env.tmpPerUserDir
+}
+func (rootlessRuntimeDirEnvironmentImplementation) homeDirGetRuntimeDir() (string, error) {
+	return homedir.GetRuntimeDir()
+}
+func (rootlessRuntimeDirEnvironmentImplementation) systemLstat(path string) (*system.StatT, error) {
+	return system.Lstat(path)
+}
+func (rootlessRuntimeDirEnvironmentImplementation) homedirGet() string {
+	return homedir.Get()
+}
+
+func isRootlessRuntimeDirOwner(dir string, env rootlessRuntimeDirEnvironment) bool {
+	st, err := env.systemLstat(dir)
+	return err == nil && int(st.UID()) == os.Getuid() && st.Mode()&0700 == 0700 && st.Mode()&0066 == 0000
+}
+
+// getRootlessRuntimeDirIsolated is an internal implementation detail of getRootlessRuntimeDir to allow testing.
+// Everyone but the tests this is intended for should only call getRootlessRuntimeDir, never this function.
+func getRootlessRuntimeDirIsolated(env rootlessRuntimeDirEnvironment) (string, error) {
+	runtimeDir, err := env.homeDirGetRuntimeDir()
+	if err == nil {
 		return runtimeDir, nil
 	}
-	tmpDir := fmt.Sprintf("/run/user/%d", rootlessUid)
-	st, err := system.Stat(tmpDir)
-	if err == nil && int(st.UID()) == os.Getuid() && st.Mode()&0700 == 0700 && st.Mode()&0066 == 0000 {
-		return tmpDir, nil
+
+	initCommand, err := ioutil.ReadFile(env.getProcCommandFile())
+	if err != nil || string(initCommand) == "systemd" {
+		runUserDir := env.getRunUserDir()
+		if isRootlessRuntimeDirOwner(runUserDir, env) {
+			return runUserDir, nil
+		}
 	}
-	tmpDir = fmt.Sprintf("%s/%d", os.TempDir(), rootlessUid)
-	if err := os.MkdirAll(tmpDir, 0700); err != nil {
-		logrus.Errorf("failed to create %s: %v", tmpDir, err)
-	} else {
-		return tmpDir, nil
+
+	tmpPerUserDir := env.getTmpPerUserDir()
+	if _, err := env.systemLstat(tmpPerUserDir); os.IsNotExist(err) {
+		if err := os.Mkdir(tmpPerUserDir, 0700); err != nil {
+			logrus.Errorf("failed to create temp directory for user: %v", err)
+		} else {
+			return tmpPerUserDir, nil
+		}
+	} else if isRootlessRuntimeDirOwner(tmpPerUserDir, env) {
+		return tmpPerUserDir, nil
 	}
-	home, err := homeDir()
+
+	homeDir := env.homedirGet()
+	if homeDir == "" {
+		return "", errors.New("neither XDG_RUNTIME_DIR not temp dir nor HOME was set non-empty")
+	}
+	resolvedHomeDir, err := filepath.EvalSymlinks(homeDir)
 	if err != nil {
-		return "", errors.Wrapf(err, "neither XDG_RUNTIME_DIR nor HOME was set non-empty")
+		return "", errors.Wrapf(err, "cannot resolve %s", homeDir)
 	}
-	resolvedHome, err := filepath.EvalSymlinks(home)
-	if err != nil {
-		return "", errors.Wrapf(err, "cannot resolve %s", home)
-	}
-	return filepath.Join(resolvedHome, "rundir"), nil
+	return filepath.Join(resolvedHomeDir, "rundir"), nil
+}
+
+func getRootlessRuntimeDir(rootlessUID int) (string, error) {
+	return getRootlessRuntimeDirIsolated(
+		rootlessRuntimeDirEnvironmentImplementation{
+			"/proc/1/comm",
+			fmt.Sprintf("/run/user/%d", rootlessUID),
+			fmt.Sprintf("%s/containers-user-%d", os.TempDir(), rootlessUID),
+		},
+	)
 }
 
 // getRootlessDirInfo returns the parent path of where the storage for containers and
 // volumes will be in rootless mode
-func getRootlessDirInfo(rootlessUid int) (string, string, error) {
-	rootlessRuntime, err := GetRootlessRuntimeDir(rootlessUid)
+func getRootlessDirInfo(rootlessUID int) (string, string, error) {
+	rootlessRuntime, err := GetRootlessRuntimeDir(rootlessUID)
 	if err != nil {
 		return "", "", err
 	}
 
-	dataDir := os.Getenv("XDG_DATA_HOME")
-	if dataDir == "" {
-		home, err := homeDir()
-		if err != nil {
-			return "", "", errors.Wrapf(err, "neither XDG_DATA_HOME nor HOME was set non-empty")
-		}
-		// runc doesn't like symlinks in the rootfs path, and at least
-		// on CoreOS /home is a symlink to /var/home, so resolve any symlink.
-		resolvedHome, err := filepath.EvalSymlinks(home)
-		if err != nil {
-			return "", "", errors.Wrapf(err, "cannot resolve %s", home)
-		}
-		dataDir = filepath.Join(resolvedHome, ".local", "share")
+	dataDir, err := homedir.GetDataHome()
+	if err == nil {
+		return dataDir, rootlessRuntime, nil
 	}
+
+	home := homedir.Get()
+	if home == "" {
+		return "", "", errors.Wrapf(err, "neither XDG_DATA_HOME nor HOME was set non-empty")
+	}
+	// runc doesn't like symlinks in the rootfs path, and at least
+	// on CoreOS /home is a symlink to /var/home, so resolve any symlink.
+	resolvedHome, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		return "", "", errors.Wrapf(err, "cannot resolve %s", home)
+	}
+	dataDir = filepath.Join(resolvedHome, ".local", "share")
+
 	return dataDir, rootlessRuntime, nil
 }
 
 // getRootlessStorageOpts returns the storage opts for containers running as non root
-func getRootlessStorageOpts(rootlessUid int) (StoreOptions, error) {
+func getRootlessStorageOpts(rootlessUID int, systemOpts StoreOptions) (StoreOptions, error) {
 	var opts StoreOptions
 
-	dataDir, rootlessRuntime, err := getRootlessDirInfo(rootlessUid)
+	dataDir, rootlessRuntime, err := getRootlessDirInfo(rootlessUID)
 	if err != nil {
 		return opts, err
 	}
 	opts.RunRoot = rootlessRuntime
 	opts.GraphRoot = filepath.Join(dataDir, "containers", "storage")
+	if systemOpts.RootlessStoragePath != "" {
+		opts.RootlessStoragePath = systemOpts.RootlessStoragePath
+	} else {
+		opts.RootlessStoragePath = opts.GraphRoot
+	}
 	if path, err := exec.LookPath("fuse-overlayfs"); err == nil {
 		opts.GraphDriverName = "overlay"
 		opts.GraphDriverOptions = []string{fmt.Sprintf("overlay.mount_program=%s", path)}
+		for _, o := range systemOpts.GraphDriverOptions {
+			if strings.Contains(o, "ignore_chown_errors") {
+				opts.GraphDriverOptions = append(opts.GraphDriverOptions, o)
+				break
+			}
+		}
 	} else {
 		opts.GraphDriverName = "vfs"
 	}
 	return opts, nil
-}
-
-type tomlOptionsConfig struct {
-	MountProgram string `toml:"mount_program"`
-}
-
-func getTomlStorage(storeOptions *StoreOptions) *tomlConfig {
-	config := new(tomlConfig)
-
-	config.Storage.Driver = storeOptions.GraphDriverName
-	config.Storage.RunRoot = storeOptions.RunRoot
-	config.Storage.GraphRoot = storeOptions.GraphRoot
-	for _, i := range storeOptions.GraphDriverOptions {
-		s := strings.Split(i, "=")
-		if s[0] == "overlay.mount_program" {
-			config.Storage.Options.MountProgram = s[1]
-		}
-	}
-
-	return config
 }
 
 func getRootlessUID() int {
@@ -188,24 +242,20 @@ func DefaultStoreOptionsAutoDetectUID() (StoreOptions, error) {
 	return DefaultStoreOptions(uid != 0, uid)
 }
 
-// DefaultStoreOptions returns the default storage ops for containers
-func DefaultStoreOptions(rootless bool, rootlessUid int) (StoreOptions, error) {
+// defaultStoreOptionsIsolated is an internal implementation detail of DefaultStoreOptions to allow testing.
+// Everyone but the tests this is intended for should only call DefaultStoreOptions, never this function.
+func defaultStoreOptionsIsolated(rootless bool, rootlessUID int, storageConf string) (StoreOptions, error) {
 	var (
 		defaultRootlessRunRoot   string
 		defaultRootlessGraphRoot string
 		err                      error
 	)
 	storageOpts := defaultStoreOptions
-	if rootless && rootlessUid != 0 {
-		storageOpts, err = getRootlessStorageOpts(rootlessUid)
+	if rootless && rootlessUID != 0 {
+		storageOpts, err = getRootlessStorageOpts(rootlessUID, storageOpts)
 		if err != nil {
 			return storageOpts, err
 		}
-	}
-
-	storageConf, err := DefaultConfigFile(rootless && rootlessUid != 0)
-	if err != nil {
-		return storageOpts, err
 	}
 	_, err = os.Stat(storageConf)
 	if err != nil && !os.IsNotExist(err) {
@@ -215,10 +265,24 @@ func DefaultStoreOptions(rootless bool, rootlessUid int) (StoreOptions, error) {
 		defaultRootlessRunRoot = storageOpts.RunRoot
 		defaultRootlessGraphRoot = storageOpts.GraphRoot
 		storageOpts = StoreOptions{}
-		ReloadConfigurationFile(storageConf, &storageOpts)
+		reloadConfigurationFileIfNeeded(storageConf, &storageOpts)
+	}
+	if storageOpts.RunRoot != "" {
+		runRoot, err := expandEnvPath(storageOpts.RunRoot, rootlessUID)
+		if err != nil {
+			return storageOpts, err
+		}
+		storageOpts.RunRoot = runRoot
+	}
+	if storageOpts.GraphRoot != "" {
+		graphRoot, err := expandEnvPath(storageOpts.GraphRoot, rootlessUID)
+		if err != nil {
+			return storageOpts, err
+		}
+		storageOpts.GraphRoot = graphRoot
 	}
 
-	if rootless && rootlessUid != 0 {
+	if rootless && rootlessUID != 0 {
 		if err == nil {
 			// If the file did not specify a graphroot or runroot,
 			// set sane defaults so we don't try and use root-owned
@@ -229,36 +293,44 @@ func DefaultStoreOptions(rootless bool, rootlessUid int) (StoreOptions, error) {
 			if storageOpts.GraphRoot == "" {
 				storageOpts.GraphRoot = defaultRootlessGraphRoot
 			}
-		} else {
-			if err := os.MkdirAll(filepath.Dir(storageConf), 0755); err != nil {
-				return storageOpts, errors.Wrapf(err, "cannot make directory %s", filepath.Dir(storageConf))
-			}
-			file, err := os.OpenFile(storageConf, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0666)
-			if err != nil {
-				return storageOpts, errors.Wrapf(err, "cannot open %s", storageConf)
-			}
-
-			tomlConfiguration := getTomlStorage(&storageOpts)
-			defer file.Close()
-			enc := toml.NewEncoder(file)
-			if err := enc.Encode(tomlConfiguration); err != nil {
-				os.Remove(storageConf)
-
-				return storageOpts, errors.Wrapf(err, "failed to encode %s", storageConf)
+			if storageOpts.RootlessStoragePath != "" {
+				rootlessStoragePath, err := expandEnvPath(storageOpts.RootlessStoragePath, rootlessUID)
+				if err != nil {
+					return storageOpts, err
+				}
+				storageOpts.GraphRoot = rootlessStoragePath
 			}
 		}
 	}
 	return storageOpts, nil
 }
 
-func homeDir() (string, error) {
-	home := os.Getenv("HOME")
-	if home == "" {
-		usr, err := user.Current()
-		if err != nil {
-			return "", errors.Wrapf(err, "neither XDG_RUNTIME_DIR nor HOME was set non-empty")
-		}
-		home = usr.HomeDir
+// DefaultStoreOptions returns the default storage ops for containers
+func DefaultStoreOptions(rootless bool, rootlessUID int) (StoreOptions, error) {
+	storageConf, err := DefaultConfigFile(rootless && rootlessUID != 0)
+	if err != nil {
+		return defaultStoreOptions, err
 	}
-	return home, nil
+	return defaultStoreOptionsIsolated(rootless, rootlessUID, storageConf)
+}
+
+func expandEnvPath(path string, rootlessUID int) (string, error) {
+	path = strings.Replace(path, "$UID", strconv.Itoa(rootlessUID), -1)
+	path = os.ExpandEnv(path)
+	return path, nil
+}
+
+func validateMountOptions(mountOptions []string) error {
+	var Empty struct{}
+	// Add invalid options for ImageMount() here.
+	invalidOptions := map[string]struct{}{
+		"rw": Empty,
+	}
+
+	for _, opt := range mountOptions {
+		if _, ok := invalidOptions[opt]; ok {
+			return fmt.Errorf(" %q option not supported", opt)
+		}
+	}
+	return nil
 }

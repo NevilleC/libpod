@@ -23,6 +23,8 @@ When the URL is an Containerfile, the Containerfile is downloaded to a temporary
 
 When a Git repository is set as the URL, the repository is cloned locally and then set as the context.
 
+NOTE: `podman build` uses code sourced from the `buildah` project to build container images.  This `buildah` code creates `buildah` containers for the `RUN` options in container storage. In certain situations, when the `podman build` crashes or users kill the `podman build` process, these external containers can be left in container storage. Use the `podman ps --all --storage` command to see these contaienrs. External containers can be removed with the `podman rm --storage` command.
+
 ## OPTIONS
 
 **--add-host**=*host*
@@ -36,6 +38,10 @@ Add a line to /etc/hosts. The format is hostname:ip. The **--add-host** option c
 Add an image *annotation* (e.g. annotation=*value*) to the image metadata. Can be used multiple times.
 
 Note: this information is not present in Docker image formats, so it is discarded when writing images in Docker formats.
+
+**--arch**=*arch*
+
+Set the ARCH of the image to the provided value instead of the architecture of the host.
 
 **--authfile**=*path*
 
@@ -172,15 +178,22 @@ The [username[:password]] to use to authenticate with the registry if required.
 If one or both values are not supplied, a command line prompt will appear and the
 value can be entered.  The password is entered without echo.
 
-**--device**=*device*
+**--device**=_host-device_[**:**_container-device_][**:**_permissions_]
 
-Add a host device to the container. The format is `<device-on-host>[:<device-on-container>][:<permissions>]` (e.g. --device=/dev/sdc:/dev/xvdc:rwm)
+Add a host device to the container. Optional *permissions* parameter
+can be used to specify device permissions, it is combination of
+**r** for read, **w** for write, and **m** for **mknod**(2).
 
-Note: if the user only has access rights via a group then accessing the device
-from inside a rootless container will fail. The `crun` runtime offers a
-workaround for this by adding the option `--annotation io.crun.keep_original_groups=1`.
+Example: **--device=/dev/sdc:/dev/xvdc:rwm**.
 
-**--disable-compression, -D**
+Note: if _host_device_ is a symbolic link then it will be resolved first.
+The container will only store the major and minor numbers of the host device.
+
+Note: if the user only has access rights via a group, accessing the device
+from inside a rootless container will fail. The **crun**(1) runtime offers a
+workaround for this by adding the option **--annotation run.oci.keep_original_groups=1**.
+
+**--disable-compression**, **-D**
 
 Don't compress filesystem layers when building the image unless it is required
 by the location where the image is being written.  This is the default setting,
@@ -241,6 +254,10 @@ environment variable.  `export BUILDAH_FORMAT=docker`
 
 Print usage statement
 
+**--http-proxy**
+
+Pass through HTTP Proxy environment variables.
+
 **--iidfile**=*ImageIDfile*
 
 Write the image ID to the file.
@@ -268,9 +285,22 @@ chroot(1) than container technology).
 Note: You can also override the default isolation type by setting the
 BUILDAH\_ISOLATION environment variable.  `export BUILDAH_ISOLATION=oci`
 
+**--jobs**=*number*
+How many stages to run in parallel (default 1)
+
 **--label**=*label*
 
 Add an image *label* (e.g. label=*value*) to the image metadata. Can be used multiple times.
+
+Users can set a special LABEL **io.containers.capabilities=CAP1,CAP2,CAP3** in
+a Containerfile that specified the list of Linux capabilities required for the
+container to run properly. This label specified in a container image tells
+Podman to run the container with just these capabilities. Podman launches the
+container with just the specified capabilities, as long as this list of
+capabilities is a subset of the default list.
+
+If the specified capabilities are not in the default set, Podman will
+print an error message and will run the container with the default capabilities.
 
 **--layers**
 
@@ -284,7 +314,7 @@ environment variable. `export BUILDAH_LAYERS=true`
 Log output which would be sent to standard output and standard error to the
 specified file instead of to standard output and standard error.
 
-**--loglevel** *number*
+**--loglevel**=*number*
 
 Adjust the logging level up or down.  Valid option values range from -2 to 3,
 with 3 being roughly equivalent to using the global *--debug* option, and
@@ -322,6 +352,10 @@ another process.
 **--no-cache**
 
 Do not use existing cached images for the container build. Build from the start with a new set of cached layers.
+
+**--os**=*string*
+
+Set the OS to the provided value instead of the current operating system of the host.
 
 **--pid**=*pid*
 
@@ -379,16 +413,6 @@ commands specified by the **RUN** instruction.
 Note: You can also override the default runtime by setting the BUILDAH\_RUNTIME
 environment variable.  `export BUILDAH_RUNTIME=/usr/local/bin/runc`
 
-**--runtime-flag**=*flag*
-
-Adds global flags for the container runtime. To list the supported flags, please
-consult the manpages of the selected container runtime (`runc` is the default
-runtime, the manpage to consult is `runc(8)`.  When the machine is configured
-for cgroup V2, the default runtime is `crun`, the manpage to consult is `crun(8)`.).
-
-Note: Do not pass the leading `--` to the flag. To pass the runc flag `--log-format json`
-to podman build, the option given would be `--runtime-flag log-format=json`.
-
 **--security-opt**=*option*
 
 Security Options
@@ -412,6 +436,10 @@ Size of `/dev/shm`. The format is `<number><unit>`. `number` must be greater tha
 Unit is optional and can be `b` (bytes), `k` (kilobytes), `m`(megabytes), or `g` (gigabytes).
 If you omit the unit, the system uses bytes. If you omit the size entirely, the system uses `64m`.
 
+**--sign-by**=*fingerprint*
+
+Sign the image using a GPG key with the specified FINGERPRINT.
+
 **--squash**
 
 Squash all of the image's new layers into a single new layer; any preexisting layers
@@ -432,6 +460,13 @@ If _imageName_ does not include a registry name, the registry name *localhost* w
 Set the target build stage to build.  When building a Containerfile with multiple build stages, --target
 can be used to specify an intermediate build stage by name as the final stage for the resulting image.
 Commands after the target stage will be skipped.
+
+**--timestamp** *seconds*
+
+Set the create timestamp to seconds since epoch to allow for deterministic builds (defaults to current time).
+By default, the created timestamp is changed and written into the image manifest with every commit,
+causing the image's sha256 hash to be different even if the sources are exactly the same otherwise.
+When --timestamp is set, the created timestamp is always set to the time specified and therefore not changed, allowing the image's sha256 to remain the same. All files committed to the layers of the image will be created with the timestamp.
 
 **--tls-verify**=*true|false*
 
@@ -544,7 +579,7 @@ process.
 
    Create a bind mount. If you specify, ` -v /HOST-DIR:/CONTAINER-DIR`, Podman
    bind mounts `/HOST-DIR` in the host to `/CONTAINER-DIR` in the Podman
-   container. The `OPTIONS` are a comma delimited list and can be:
+   container. The `OPTIONS` are a comma delimited list and can be: <sup>[[1]](#Footnote1)</sup>
 
    * [rw|ro]
    * [z|Z|O]
@@ -607,7 +642,7 @@ be specified only for bind mounted volumes and not for internal volumes or
 named volumes. For mount propagation to work on the source mount point (mount point
 where source dir is mounted on) has to have the right propagation properties. For
 shared volumes, the source mount point has to be shared. And for slave volumes,
-the source mount has to be either shared or slave.
+the source mount has to be either shared or slave. <sup>[[1]](#Footnote1)</sup>
 
 Use `df <source-dir>` to determine the source mount and then use
 `findmnt -o TARGET,PROPAGATION <source-mount-dir>` to determine propagation
@@ -615,7 +650,7 @@ properties of source mount, if `findmnt` utility is not available, the source mo
 can be determined by looking at the mount entry in `/proc/self/mountinfo`. Look
 at `optional fields` and see if any propagation properties are specified.
 `shared:X` means the mount is `shared`, `master:X` means the mount is `slave` and if
-nothing is there that means the mount is `private`.
+nothing is there that means the mount is `private`. <sup>[[1]](#Footnote1)</sup>
 
 To change propagation properties of a mount point use the `mount` command. For
 example, to bind mount the source directory `/foo` do
@@ -633,11 +668,11 @@ $ podman build .
 
 $ podman build -f Containerfile.simple .
 
-$ cat ~/Dockerfile | podman build -f - .
+$ cat $HOME/Dockerfile | podman build -f - .
 
 $ podman build -f Dockerfile.simple -f Containerfile.notsosimple .
 
-$ podman build -f Dockerfile.in ~
+$ podman build -f Dockerfile.in $HOME
 
 $ podman build -t imageName .
 
@@ -649,7 +684,7 @@ $ podman build --runtime-flag log-format=json .
 
 $ podman build --runtime-flag debug .
 
-$ podman build --authfile /tmp/auths/myauths.json --cert-dir ~/auth --tls-verify=true --creds=username:password -t imageName -f Dockerfile.simple .
+$ podman build --authfile /tmp/auths/myauths.json --cert-dir $HOME/auth --tls-verify=true --creds=username:password -t imageName -f Dockerfile.simple .
 
 $ podman build --memory 40m --cpu-period 10000 --cpu-quota 50000 --ulimit nofile=1024:1028 -t imageName .
 
@@ -700,6 +735,52 @@ $ podman build -f dev/Containerfile https://10.10.10.1/podman/context.tar.gz
 
 ## Files
 
+### `.dockerignore`
+
+If the file .dockerignore exists in the context directory, `podman build` reads
+its contents. Podman uses the content to exclude files and directories from
+the context directory, when executing COPY and ADD directives in the
+Containerfile/Dockerfile
+
+Users can specify a series of Unix shell globals in a .dockerignore file to
+identify files/directories to exclude.
+
+Podman supports a special wildcard string `**` which matches any number of
+directories (including zero). For example, **/*.go will exclude all files that
+end with .go that are found in all directories.
+
+Example .dockerignore file:
+
+```
+# exclude this content for image
+*/*.c
+**/output*
+src
+```
+
+`*/*.c`
+Excludes files and directories whose names ends with .c in any top level subdirectory. For example, the source file include/rootless.c.
+
+`**/output*`
+Excludes files and directories starting with `output` from any directory.
+
+`src`
+Excludes files named src and the directory src as well as any content in it.
+
+Lines starting with ! (exclamation mark) can be used to make exceptions to
+exclusions. The following is an example .dockerignore file that uses this
+mechanism:
+```
+*.doc
+!Help.doc
+```
+
+Exclude all doc files except Help.doc from the image.
+
+This functionality is compatible with the handling of .dockerignore files described here:
+
+https://docs.docker.com/engine/reference/builder/#dockerignore-file
+
 **registries.conf** (`/etc/containers/registries.conf`)
 
 registries.conf is the configuration file which specifies which container registries should be consulted when completing image names which do not include a registry or domain portion.
@@ -713,9 +794,14 @@ If you are using a useradd command within a Containerfile with a large UID/GID, 
 If you are using `useradd` within your build script, you should pass the `--no-log-init or -l` option to the `useradd` command.  This option tells useradd to stop creating the lastlog file.
 
 ## SEE ALSO
-podman(1), buildah(1), containers-registries.conf(5), crun(8), runc(8), useradd(8)
+podman(1), buildah(1), containers-registries.conf(5), crun(8), runc(8), useradd(8), podman-ps(1), podman-rm(1)
 
 ## HISTORY
+Aug 2020, Additional options and .dockerignore added by Dan Walsh <dwalsh@redhat.com>
+
 May 2018, Minor revisions added by Joe Doss <joe@solidadmin.com>
 
 December 2017, Originally compiled by Tom Sweeney <tsweeney@redhat.com>
+
+## FOOTNOTES
+<a name="Footnote1">1</a>: The Podman project is committed to inclusivity, a core value of open source. The `master` and `slave` mount propagation terminology used here is problematic and divisive, and should be changed. However, these terms are currently used within the Linux kernel and must be used as-is at this time. When the kernel maintainers rectify this usage, Podman will follow suit immediately.

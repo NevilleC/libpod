@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -14,33 +15,36 @@ import (
 var _ = Describe("Podman events", func() {
 	var (
 		tempdir    string
-		err        error
 		podmanTest *PodmanTestIntegration
 	)
 
 	BeforeEach(func() {
+		var err error
 		tempdir, err = CreateTempDirInTempDir()
 		if err != nil {
 			os.Exit(1)
 		}
 		podmanTest = PodmanTestCreate(tempdir)
+		podmanTest.Setup()
 		podmanTest.SeedImages()
 	})
 
 	AfterEach(func() {
 		podmanTest.Cleanup()
 		f := CurrentGinkgoTestDescription()
-		timedResult := fmt.Sprintf("Test: %s completed in %f seconds", f.TestText, f.Duration.Seconds())
-		GinkgoWriter.Write([]byte(timedResult))
-
+		processTestResult(f)
 	})
 
 	// For most, all, of these tests we do not "live" test following a log because it may make a fragile test
 	// system more complex.  Instead we run the "events" and then verify that the events are processed correctly.
 	// Perhaps a future version of this test would put events in a go func and send output back over a channel
 	// while events occur.
+
+	// These tests are only known to work on Fedora ATM.  Other distributions
+	// will be skipped.
 	It("podman events", func() {
-		Skip("need to verify images have correct packages for journald")
+		SkipIfRootless()
+		SkipIfNotFedora()
 		_, ec, _ := podmanTest.RunLsContainer("")
 		Expect(ec).To(Equal(0))
 		result := podmanTest.Podman([]string{"events", "--stream=false"})
@@ -49,7 +53,8 @@ var _ = Describe("Podman events", func() {
 	})
 
 	It("podman events with an event filter", func() {
-		Skip("need to verify images have correct packages for journald")
+		SkipIfRootless()
+		SkipIfNotFedora()
 		_, ec, _ := podmanTest.RunLsContainer("")
 		Expect(ec).To(Equal(0))
 		result := podmanTest.Podman([]string{"events", "--stream=false", "--filter", "event=start"})
@@ -59,11 +64,14 @@ var _ = Describe("Podman events", func() {
 	})
 
 	It("podman events with an event filter and container=cid", func() {
-		Skip("need to verify images have correct packages for journald")
+		Skip("Does not work on v2")
+		SkipIfRootless()
+		SkipIfNotFedora()
 		_, ec, cid := podmanTest.RunLsContainer("")
 		Expect(ec).To(Equal(0))
 		_, ec2, cid2 := podmanTest.RunLsContainer("")
 		Expect(ec2).To(Equal(0))
+		time.Sleep(5 * time.Second)
 		result := podmanTest.Podman([]string{"events", "--stream=false", "--filter", "event=start", "--filter", fmt.Sprintf("container=%s", cid)})
 		result.WaitWithDefaultTimeout()
 		Expect(result.ExitCode()).To(Equal(0))
@@ -72,7 +80,8 @@ var _ = Describe("Podman events", func() {
 	})
 
 	It("podman events with a type and filter container=id", func() {
-		Skip("need to verify images have correct packages for journald")
+		SkipIfRootless()
+		SkipIfNotFedora()
 		_, ec, cid := podmanTest.RunLsContainer("")
 		Expect(ec).To(Equal(0))
 		result := podmanTest.Podman([]string{"events", "--stream=false", "--filter", "type=pod", "--filter", fmt.Sprintf("container=%s", cid)})
@@ -82,7 +91,8 @@ var _ = Describe("Podman events", func() {
 	})
 
 	It("podman events with a type", func() {
-		Skip("need to verify images have correct packages for journald")
+		SkipIfRootless()
+		SkipIfNotFedora()
 		setup := podmanTest.Podman([]string{"run", "-dt", "--pod", "new:foobarpod", ALPINE, "top"})
 		setup.WaitWithDefaultTimeout()
 		stop := podmanTest.Podman([]string{"pod", "stop", "foobarpod"})
@@ -97,7 +107,8 @@ var _ = Describe("Podman events", func() {
 	})
 
 	It("podman events --since", func() {
-		Skip("need to verify images have correct packages for journald")
+		SkipIfRootless()
+		SkipIfNotFedora()
 		_, ec, _ := podmanTest.RunLsContainer("")
 		Expect(ec).To(Equal(0))
 		result := podmanTest.Podman([]string{"events", "--stream=false", "--since", "1m"})
@@ -106,7 +117,8 @@ var _ = Describe("Podman events", func() {
 	})
 
 	It("podman events --until", func() {
-		Skip("need to verify images have correct packages for journald")
+		SkipIfRootless()
+		SkipIfNotFedora()
 		_, ec, _ := podmanTest.RunLsContainer("")
 		Expect(ec).To(Equal(0))
 		test := podmanTest.Podman([]string{"events", "--help"})
@@ -118,24 +130,30 @@ var _ = Describe("Podman events", func() {
 	})
 
 	It("podman events format", func() {
-		info := GetHostDistributionInfo()
-		if info.Distribution != "fedora" {
-			Skip("need to verify images have correct packages for journald")
-		}
+		SkipIfRootless()
+		SkipIfNotFedora()
 		_, ec, _ := podmanTest.RunLsContainer("")
 		Expect(ec).To(Equal(0))
 		test := podmanTest.Podman([]string{"events", "--stream=false", "--format", "json"})
 		test.WaitWithDefaultTimeout()
-		fmt.Println(test.OutputToStringArray())
+		Expect(test.ExitCode()).To(BeZero())
 		jsonArr := test.OutputToStringArray()
 		Expect(len(jsonArr)).To(Not(BeZero()))
 		eventsMap := make(map[string]string)
 		err := json.Unmarshal([]byte(jsonArr[0]), &eventsMap)
-		if err != nil {
-			os.Exit(1)
-		}
+		Expect(err).To(BeNil())
 		_, exist := eventsMap["Status"]
 		Expect(exist).To(BeTrue())
+
+		test = podmanTest.Podman([]string{"events", "--stream=false", "--format", "{{json.}}"})
+		test.WaitWithDefaultTimeout()
 		Expect(test.ExitCode()).To(BeZero())
+		jsonArr = test.OutputToStringArray()
+		Expect(len(jsonArr)).To(Not(BeZero()))
+		eventsMap = make(map[string]string)
+		err = json.Unmarshal([]byte(jsonArr[0]), &eventsMap)
+		Expect(err).To(BeNil())
+		_, exist = eventsMap["Status"]
+		Expect(exist).To(BeTrue())
 	})
 })

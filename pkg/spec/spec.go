@@ -3,22 +3,27 @@ package createconfig
 import (
 	"strings"
 
-	"github.com/containers/libpod/libpod"
-	libpodconfig "github.com/containers/libpod/libpod/config"
-	"github.com/containers/libpod/libpod/define"
-	"github.com/containers/libpod/pkg/cgroups"
-	"github.com/containers/libpod/pkg/rootless"
-	"github.com/containers/libpod/pkg/sysinfo"
+	"github.com/containers/common/pkg/capabilities"
+	cconfig "github.com/containers/common/pkg/config"
+	"github.com/containers/common/pkg/sysinfo"
+	"github.com/containers/podman/v2/libpod"
+	"github.com/containers/podman/v2/libpod/define"
+	"github.com/containers/podman/v2/pkg/cgroups"
+	"github.com/containers/podman/v2/pkg/env"
+	"github.com/containers/podman/v2/pkg/rootless"
+	"github.com/containers/podman/v2/pkg/util"
 	"github.com/docker/go-units"
 	"github.com/opencontainers/runc/libcontainer/user"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-tools/generate"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
-const cpuPeriod = 100000
+const CpuPeriod = 100000
 
-func getAvailableGids() (int64, error) {
+func GetAvailableGids() (int64, error) {
 	idMap, err := user.ParseIDMapFile("/proc/self/gid_map")
 	if err != nil {
 		return 0, err
@@ -78,9 +83,40 @@ func (config *CreateConfig) createConfigToOCISpec(runtime *libpod.Runtime, userM
 			g.AddLinuxMaskedPaths("/sys/kernel")
 		}
 	}
+	var runtimeConfig *cconfig.Config
+
+	if runtime != nil {
+		runtimeConfig, err = runtime.GetConfig()
+		if err != nil {
+			return nil, err
+		}
+		g.Config.Process.Capabilities.Bounding = runtimeConfig.Containers.DefaultCapabilities
+		sysctls, err := util.ValidateSysctls(runtimeConfig.Containers.DefaultSysctls)
+		if err != nil {
+			return nil, err
+		}
+
+		for name, val := range config.Security.Sysctl {
+			sysctls[name] = val
+		}
+		config.Security.Sysctl = sysctls
+		if !util.StringInSlice("host", config.Resources.Ulimit) {
+			config.Resources.Ulimit = append(runtimeConfig.Containers.DefaultUlimits, config.Resources.Ulimit...)
+		}
+		if config.Resources.PidsLimit < 0 && !config.cgroupDisabled() {
+			config.Resources.PidsLimit = runtimeConfig.Containers.PidsLimit
+		}
+
+	} else {
+		g.Config.Process.Capabilities.Bounding = cconfig.DefaultCapabilities
+		if config.Resources.PidsLimit < 0 && !config.cgroupDisabled() {
+			config.Resources.PidsLimit = cconfig.DefaultPidsLimit
+		}
+	}
+
 	gid5Available := true
 	if isRootless {
-		nGids, err := getAvailableGids()
+		nGids, err := GetAvailableGids()
 		if err != nil {
 			return nil, err
 		}
@@ -144,13 +180,21 @@ func (config *CreateConfig) createConfigToOCISpec(runtime *libpod.Runtime, userM
 		g.AddMount(cgroupMnt)
 	}
 	g.SetProcessCwd(config.WorkDir)
-	g.SetProcessArgs(config.Command)
+
+	ProcessArgs := make([]string, 0)
+	if len(config.Entrypoint) > 0 {
+		ProcessArgs = config.Entrypoint
+	}
+	if len(config.Command) > 0 {
+		ProcessArgs = append(ProcessArgs, config.Command...)
+	}
+	g.SetProcessArgs(ProcessArgs)
+
 	g.SetProcessTerminal(config.Tty)
 
 	for key, val := range config.Annotations {
 		g.AddAnnotation(key, val)
 	}
-	g.AddProcessEnv("container", "podman")
 
 	addedResources := false
 
@@ -197,8 +241,8 @@ func (config *CreateConfig) createConfigToOCISpec(runtime *libpod.Runtime, userM
 		addedResources = true
 	}
 	if config.Resources.CPUs != 0 {
-		g.SetLinuxResourcesCPUPeriod(cpuPeriod)
-		g.SetLinuxResourcesCPUQuota(int64(config.Resources.CPUs * cpuPeriod))
+		g.SetLinuxResourcesCPUPeriod(CpuPeriod)
+		g.SetLinuxResourcesCPUQuota(int64(config.Resources.CPUs * CpuPeriod))
 		addedResources = true
 	}
 	if config.Resources.CPURtRuntime != 0 {
@@ -223,34 +267,42 @@ func (config *CreateConfig) createConfigToOCISpec(runtime *libpod.Runtime, userM
 		// If privileged, we need to add all the host devices to the
 		// spec.  We do not add the user provided ones because we are
 		// already adding them all.
-		if err := config.AddPrivilegedDevices(&g); err != nil {
+		if err := AddPrivilegedDevices(&g); err != nil {
 			return nil, err
 		}
 	} else {
 		for _, devicePath := range config.Devices {
-			if err := devicesFromPath(&g, devicePath); err != nil {
+			if err := DevicesFromPath(&g, devicePath); err != nil {
 				return nil, err
 			}
 		}
+		if len(config.Resources.DeviceCgroupRules) != 0 {
+			if err := deviceCgroupRules(&g, config.Resources.DeviceCgroupRules); err != nil {
+				return nil, err
+			}
+			addedResources = true
+		}
 	}
 
-	// SECURITY OPTS
 	g.SetProcessNoNewPrivileges(config.Security.NoNewPrivs)
 
 	if !config.Security.Privileged {
 		g.SetProcessApparmorProfile(config.Security.ApparmorProfile)
 	}
 
-	blockAccessToKernelFilesystems(config, &g)
-
-	var runtimeConfig *libpodconfig.Config
-
-	if runtime != nil {
-		runtimeConfig, err = runtime.GetConfig()
-		if err != nil {
+	// Unless already set via the CLI, check if we need to disable process
+	// labels or set the defaults.
+	if len(config.Security.LabelOpts) == 0 && runtimeConfig != nil {
+		if !runtimeConfig.Containers.EnableLabeling {
+			// Disabled in the config.
+			config.Security.LabelOpts = append(config.Security.LabelOpts, "disable")
+		} else if err := config.Security.SetLabelOpts(runtime, &config.Pid, &config.Ipc); err != nil {
+			// Defaults!
 			return nil, err
 		}
 	}
+
+	BlockAccessToKernelFilesystems(config.Security.Privileged, config.Pid.PidMode.IsHost(), &g)
 
 	// RESOURCES - PIDS
 	if config.Resources.PidsLimit > 0 {
@@ -264,7 +316,7 @@ func (config *CreateConfig) createConfigToOCISpec(runtime *libpod.Runtime, userM
 			if err != nil {
 				return nil, err
 			}
-			if (!cgroup2 || (runtimeConfig != nil && runtimeConfig.CgroupManager != define.SystemdCgroupsManager)) && config.Resources.PidsLimit == sysinfo.GetDefaultPidsLimit() {
+			if (!cgroup2 || (runtimeConfig != nil && runtimeConfig.Engine.CgroupManager != cconfig.SystemdCgroupsManager)) && config.Resources.PidsLimit == sysinfo.GetDefaultPidsLimit() {
 				setPidLimit = false
 			}
 		}
@@ -274,8 +326,17 @@ func (config *CreateConfig) createConfigToOCISpec(runtime *libpod.Runtime, userM
 		}
 	}
 
-	for name, val := range config.Env {
-		g.AddProcessEnv(name, val)
+	// Make sure to always set the default variables unless overridden in the
+	// config.
+	var defaultEnv map[string]string
+	if runtimeConfig == nil {
+		defaultEnv = env.DefaultEnvVariables()
+	} else {
+		defaultEnv, err = env.ParseSlice(runtimeConfig.Containers.Env)
+		if err != nil {
+			return nil, errors.Wrap(err, "Env fields in containers.conf failed to parse")
+		}
+		defaultEnv = env.Join(env.DefaultEnvVariables(), defaultEnv)
 	}
 
 	if err := addRlimits(config, &g); err != nil {
@@ -307,20 +368,35 @@ func (config *CreateConfig) createConfigToOCISpec(runtime *libpod.Runtime, userM
 	if err := config.Cgroup.ConfigureGenerator(&g); err != nil {
 		return nil, err
 	}
+
+	config.Env = env.Join(defaultEnv, config.Env)
+	for name, val := range config.Env {
+		g.AddProcessEnv(name, val)
+	}
 	configSpec := g.Config
+
+	// If the container image specifies an label with a
+	// capabilities.ContainerImageLabel then split the comma separated list
+	// of capabilities and record them.  This list indicates the only
+	// capabilities, required to run the container.
+	var capRequired []string
+	for key, val := range config.Labels {
+		if util.StringInSlice(key, capabilities.ContainerImageLabels) {
+			capRequired = strings.Split(val, ",")
+		}
+	}
+	config.Security.CapRequired = capRequired
 
 	if err := config.Security.ConfigureGenerator(&g, &config.User); err != nil {
 		return nil, err
 	}
 
 	// BIND MOUNTS
-	configSpec.Mounts = supercedeUserMounts(userMounts, configSpec.Mounts)
+	configSpec.Mounts = SupercedeUserMounts(userMounts, configSpec.Mounts)
 	// Process mounts to ensure correct options
-	finalMounts, err := initFSMounts(configSpec.Mounts)
-	if err != nil {
+	if err := InitFSMounts(configSpec.Mounts); err != nil {
 		return nil, err
 	}
-	configSpec.Mounts = finalMounts
 
 	// BLOCK IO
 	blkio, err := config.CreateBlockIO()
@@ -341,7 +417,7 @@ func (config *CreateConfig) createConfigToOCISpec(runtime *libpod.Runtime, userM
 			configSpec.Linux.Resources = &spec.LinuxResources{}
 		}
 
-		canUseResources := cgroup2 && runtimeConfig != nil && (runtimeConfig.CgroupManager == define.SystemdCgroupsManager)
+		canUseResources := cgroup2 && runtimeConfig != nil && (runtimeConfig.Engine.CgroupManager == cconfig.SystemdCgroupsManager)
 
 		if addedResources && !canUseResources {
 			return nil, errors.New("invalid configuration, cannot specify resource limits without cgroups v2 and --cgroup-manager=systemd")
@@ -358,10 +434,10 @@ func (config *CreateConfig) createConfigToOCISpec(runtime *libpod.Runtime, userM
 			return nil, errors.New("cannot specify resource limits when cgroups are disabled is specified")
 		}
 		configSpec.Linux.Resources = &spec.LinuxResources{}
-	case "enabled", "":
+	case "enabled", "no-conmon", "":
 		// Do nothing
 	default:
-		return nil, errors.New("unrecognized option for cgroups; supported are 'default' and 'disabled'")
+		return nil, errors.New("unrecognized option for cgroups; supported are 'default', 'disabled', 'no-conmon'")
 	}
 
 	// Add annotations
@@ -370,36 +446,40 @@ func (config *CreateConfig) createConfigToOCISpec(runtime *libpod.Runtime, userM
 	}
 
 	if config.CidFile != "" {
-		configSpec.Annotations[libpod.InspectAnnotationCIDFile] = config.CidFile
+		configSpec.Annotations[define.InspectAnnotationCIDFile] = config.CidFile
 	}
 
 	if config.Rm {
-		configSpec.Annotations[libpod.InspectAnnotationAutoremove] = libpod.InspectResponseTrue
+		configSpec.Annotations[define.InspectAnnotationAutoremove] = define.InspectResponseTrue
 	} else {
-		configSpec.Annotations[libpod.InspectAnnotationAutoremove] = libpod.InspectResponseFalse
+		configSpec.Annotations[define.InspectAnnotationAutoremove] = define.InspectResponseFalse
 	}
 
 	if len(config.VolumesFrom) > 0 {
-		configSpec.Annotations[libpod.InspectAnnotationVolumesFrom] = strings.Join(config.VolumesFrom, ",")
+		configSpec.Annotations[define.InspectAnnotationVolumesFrom] = strings.Join(config.VolumesFrom, ",")
 	}
 
 	if config.Security.Privileged {
-		configSpec.Annotations[libpod.InspectAnnotationPrivileged] = libpod.InspectResponseTrue
+		configSpec.Annotations[define.InspectAnnotationPrivileged] = define.InspectResponseTrue
 	} else {
-		configSpec.Annotations[libpod.InspectAnnotationPrivileged] = libpod.InspectResponseFalse
+		configSpec.Annotations[define.InspectAnnotationPrivileged] = define.InspectResponseFalse
 	}
 
 	if config.Init {
-		configSpec.Annotations[libpod.InspectAnnotationInit] = libpod.InspectResponseTrue
+		configSpec.Annotations[define.InspectAnnotationInit] = define.InspectResponseTrue
 	} else {
-		configSpec.Annotations[libpod.InspectAnnotationInit] = libpod.InspectResponseFalse
+		configSpec.Annotations[define.InspectAnnotationInit] = define.InspectResponseFalse
 	}
 
 	return configSpec, nil
 }
 
-func blockAccessToKernelFilesystems(config *CreateConfig, g *generate.Generator) {
-	if !config.Security.Privileged {
+func (config *CreateConfig) cgroupDisabled() bool {
+	return config.Cgroup.Cgroups == "disabled"
+}
+
+func BlockAccessToKernelFilesystems(privileged, pidModeIsHost bool, g *generate.Generator) {
+	if !privileged {
 		for _, mp := range []string{
 			"/proc/acpi",
 			"/proc/kcore",
@@ -415,7 +495,7 @@ func blockAccessToKernelFilesystems(config *CreateConfig, g *generate.Generator)
 			g.AddLinuxMaskedPaths(mp)
 		}
 
-		if config.Pid.PidMode.IsHost() && rootless.IsRootless() {
+		if pidModeIsHost && rootless.IsRootless() {
 			return
 		}
 
@@ -434,10 +514,9 @@ func blockAccessToKernelFilesystems(config *CreateConfig, g *generate.Generator)
 
 func addRlimits(config *CreateConfig, g *generate.Generator) error {
 	var (
-		kernelMax  uint64 = 1048576
-		isRootless        = rootless.IsRootless()
-		nofileSet         = false
-		nprocSet          = false
+		isRootless = rootless.IsRootless()
+		nofileSet  = false
+		nprocSet   = false
 	)
 
 	for _, u := range config.Resources.Ulimit {
@@ -466,11 +545,39 @@ func addRlimits(config *CreateConfig, g *generate.Generator) error {
 	// If not explicitly overridden by the user, default number of open
 	// files and number of processes to the maximum they can be set to
 	// (without overriding a sysctl)
-	if !nofileSet && !isRootless {
-		g.AddProcessRlimits("RLIMIT_NOFILE", kernelMax, kernelMax)
+	if !nofileSet {
+		max := define.RLimitDefaultValue
+		current := define.RLimitDefaultValue
+		if isRootless {
+			var rlimit unix.Rlimit
+			if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &rlimit); err != nil {
+				logrus.Warnf("failed to return RLIMIT_NOFILE ulimit %q", err)
+			}
+			if rlimit.Cur < current {
+				current = rlimit.Cur
+			}
+			if rlimit.Max < max {
+				max = rlimit.Max
+			}
+		}
+		g.AddProcessRlimits("RLIMIT_NOFILE", max, current)
 	}
-	if !nprocSet && !isRootless {
-		g.AddProcessRlimits("RLIMIT_NPROC", kernelMax, kernelMax)
+	if !nprocSet {
+		max := define.RLimitDefaultValue
+		current := define.RLimitDefaultValue
+		if isRootless {
+			var rlimit unix.Rlimit
+			if err := unix.Getrlimit(unix.RLIMIT_NPROC, &rlimit); err != nil {
+				logrus.Warnf("failed to return RLIMIT_NPROC ulimit %q", err)
+			}
+			if rlimit.Cur < current {
+				current = rlimit.Cur
+			}
+			if rlimit.Max < max {
+				max = rlimit.Max
+			}
+		}
+		g.AddProcessRlimits("RLIMIT_NPROC", max, current)
 	}
 
 	return nil

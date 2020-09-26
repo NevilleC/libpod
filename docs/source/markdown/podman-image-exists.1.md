@@ -4,7 +4,7 @@
 podman-image-exists - Check if an image exists in local storage
 
 ## SYNOPSIS
-**podman image exists** [*options*] *image*
+**podman image exists** *image*
 
 ## DESCRIPTION
 **podman image exists** checks if an image exists in local storage. The **ID** or **Name**
@@ -22,7 +22,7 @@ Print usage statement
 
 Check if an image called `webclient` exists in local storage (the image does actually exist).
 ```
-$ sudo podman image exists webclient
+$ podman image exists webclient
 $ echo $?
 0
 $
@@ -30,7 +30,7 @@ $
 
 Check if an image called `webbackend` exists in local storage (the image does not actually exist).
 ```
-$ sudo podman image exists webbackend
+$ podman image exists webbackend
 $ echo $?
 1
 $

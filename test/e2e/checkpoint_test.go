@@ -1,4 +1,4 @@
-// +build !remoteclient
+// +build !remote
 
 package integration
 
@@ -7,8 +7,8 @@ import (
 	"os"
 	"os/exec"
 
-	"github.com/containers/libpod/pkg/criu"
-	. "github.com/containers/libpod/test/utils"
+	"github.com/containers/podman/v2/pkg/criu"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -37,7 +37,7 @@ var _ = Describe("Podman checkpoint", func() {
 		podmanTest.SeedImages()
 		// Check if the runtime implements checkpointing. Currently only
 		// runc's checkpoint/restore implementation is supported.
-		cmd := exec.Command(podmanTest.OCIRuntime, "checkpoint", "-h")
+		cmd := exec.Command(podmanTest.OCIRuntime, "checkpoint", "--help")
 		if err := cmd.Start(); err != nil {
 			Skip("OCI runtime does not support checkpoint/restore")
 		}
@@ -232,6 +232,8 @@ var _ = Describe("Podman checkpoint", func() {
 	})
 
 	It("podman checkpoint container with established tcp connections", func() {
+		// Broken on Ubuntu.
+		SkipIfNotFedora()
 		localRunString := getRunString([]string{redis})
 		session := podmanTest.Podman(localRunString)
 		session.WaitWithDefaultTimeout()

@@ -7,13 +7,18 @@ import (
 
 	"github.com/containernetworking/cni/pkg/types"
 	"github.com/containernetworking/plugins/plugins/ipam/host-local/backend/allocator"
-	"github.com/containers/libpod/pkg/util"
+	"github.com/containers/common/pkg/config"
+	"github.com/containers/podman/v2/libpod/define"
+	"github.com/containers/podman/v2/pkg/util"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
+// DefaultNetworkDriver is the default network type used
+var DefaultNetworkDriver = "bridge"
+
 // SupportedNetworkDrivers describes the list of supported drivers
-var SupportedNetworkDrivers = []string{"bridge"}
+var SupportedNetworkDrivers = []string{DefaultNetworkDriver}
 
 // IsSupportedDriver checks if the user provided driver is supported
 func IsSupportedDriver(driver string) error {
@@ -26,11 +31,11 @@ func IsSupportedDriver(driver string) error {
 // GetLiveNetworks returns a slice of networks representing what the system
 // has defined as network interfaces
 func GetLiveNetworks() ([]*net.IPNet, error) {
-	var nets []*net.IPNet
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
 		return nil, err
 	}
+	nets := make([]*net.IPNet, 0, len(addrs))
 	for _, address := range addrs {
 		_, n, err := net.ParseCIDR(address.String())
 		if err != nil {
@@ -43,11 +48,11 @@ func GetLiveNetworks() ([]*net.IPNet, error) {
 
 // GetLiveNetworkNames returns a list of network interfaces on the system
 func GetLiveNetworkNames() ([]string, error) {
-	var interfaceNames []string
 	liveInterfaces, err := net.Interfaces()
 	if err != nil {
 		return nil, err
 	}
+	interfaceNames := make([]string, 0, len(liveInterfaces))
 	for _, i := range liveInterfaces {
 		interfaceNames = append(interfaceNames, i.Name)
 	}
@@ -56,8 +61,8 @@ func GetLiveNetworkNames() ([]string, error) {
 
 // GetFreeNetwork looks for a free network according to existing cni configuration
 // files and network interfaces.
-func GetFreeNetwork() (*net.IPNet, error) {
-	networks, err := GetNetworksFromFilesystem()
+func GetFreeNetwork(config *config.Config) (*net.IPNet, error) {
+	networks, err := GetNetworksFromFilesystem(config)
 	if err != nil {
 		return nil, err
 	}
@@ -131,8 +136,17 @@ func networkIntersect(n1, n2 *net.IPNet) bool {
 
 // ValidateUserNetworkIsAvailable returns via an error if a network is available
 // to be used
-func ValidateUserNetworkIsAvailable(userNet *net.IPNet) error {
-	networks, err := GetNetworksFromFilesystem()
+func ValidateUserNetworkIsAvailable(config *config.Config, userNet *net.IPNet) error {
+	if len(userNet.IP) == 0 || len(userNet.Mask) == 0 {
+		return errors.Errorf("network %s's ip or mask cannot be empty", userNet.String())
+	}
+
+	ones, bit := userNet.Mask.Size()
+	if ones == 0 || bit == 0 {
+		return errors.Errorf("network %s's mask is invalid", userNet.String())
+	}
+
+	networks, err := GetNetworksFromFilesystem(config)
 	if err != nil {
 		return err
 	}
@@ -153,8 +167,8 @@ func ValidateUserNetworkIsAvailable(userNet *net.IPNet) error {
 
 // RemoveNetwork removes a given network by name.  If the network has container associated with it, that
 // must be handled outside the context of this.
-func RemoveNetwork(name string) error {
-	cniPath, err := GetCNIConfigPathByName(name)
+func RemoveNetwork(config *config.Config, name string) error {
+	cniPath, err := GetCNIConfigPathByName(config, name)
 	if err != nil {
 		return err
 	}
@@ -181,12 +195,25 @@ func RemoveNetwork(name string) error {
 }
 
 // InspectNetwork reads a CNI config and returns its configuration
-func InspectNetwork(name string) (map[string]interface{}, error) {
-	b, err := ReadRawCNIConfByName(name)
+func InspectNetwork(config *config.Config, name string) (map[string]interface{}, error) {
+	b, err := ReadRawCNIConfByName(config, name)
 	if err != nil {
 		return nil, err
 	}
 	rawList := make(map[string]interface{})
 	err = json.Unmarshal(b, &rawList)
 	return rawList, err
+}
+
+// Exists says whether a given network exists or not; it meant
+// specifically for restful responses so 404s can be used
+func Exists(config *config.Config, name string) (bool, error) {
+	_, err := ReadRawCNIConfByName(config, name)
+	if err != nil {
+		if errors.Cause(err) == define.ErrNoSuchNetwork {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }

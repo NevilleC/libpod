@@ -3,8 +3,8 @@ package integration
 import (
 	"os"
 
-	"github.com/containers/libpod/pkg/annotations"
-	. "github.com/containers/libpod/test/utils"
+	"github.com/containers/podman/v2/pkg/annotations"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -27,7 +27,7 @@ var _ = Describe("Podman container inspect", func() {
 	})
 
 	AfterEach(func() {
-		podmanTest.CleanupPod()
+		podmanTest.Cleanup()
 		f := CurrentGinkgoTestDescription()
 		processTestResult(f)
 	})

@@ -2,7 +2,13 @@
 
 package libpod
 
-import "github.com/containers/libpod/libpod/define"
+import "github.com/containers/podman/v2/libpod/define"
+
+// Top gathers statistics about the running processes in a container. It returns a
+// []string for output
+func (c *Container) Top(descriptors []string) ([]string, error) {
+	return nil, define.ErrNotImplemented
+}
 
 // GetContainerPidInformation returns process-related data of all processes in
 // the container.  The output data can be controlled via the `descriptors`

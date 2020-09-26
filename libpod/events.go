@@ -1,9 +1,11 @@
 package libpod
 
 import (
+	"context"
 	"fmt"
+	"sync"
 
-	"github.com/containers/libpod/libpod/events"
+	"github.com/containers/podman/v2/libpod/events"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -11,8 +13,8 @@ import (
 // newEventer returns an eventer that can be used to read/write events
 func (r *Runtime) newEventer() (events.Eventer, error) {
 	options := events.EventerOptions{
-		EventerType: r.config.EventsLogger,
-		LogFilePath: r.config.EventsLogFilePath,
+		EventerType: r.config.Engine.EventsLogger,
+		LogFilePath: r.config.Engine.EventsLogFilePath,
 	}
 	return events.NewEventer(options)
 }
@@ -75,20 +77,16 @@ func (v *Volume) newVolumeEvent(status events.Status) {
 
 // Events is a wrapper function for everyone to begin tailing the events log
 // with options
-func (r *Runtime) Events(options events.ReadOptions) error {
+func (r *Runtime) Events(ctx context.Context, options events.ReadOptions) error {
 	eventer, err := r.newEventer()
 	if err != nil {
 		return err
 	}
-	return eventer.Read(options)
+	return eventer.Read(ctx, options)
 }
 
 // GetEvents reads the event log and returns events based on input filters
-func (r *Runtime) GetEvents(filters []string) ([]*events.Event, error) {
-	var (
-		logEvents []*events.Event
-		readErr   error
-	)
+func (r *Runtime) GetEvents(ctx context.Context, filters []string) ([]*events.Event, error) {
 	eventChannel := make(chan *events.Event)
 	options := events.ReadOptions{
 		EventChannel: eventChannel,
@@ -100,21 +98,25 @@ func (r *Runtime) GetEvents(filters []string) ([]*events.Event, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	logEvents := make([]*events.Event, 0, len(eventChannel))
+	readLock := sync.Mutex{}
+	readLock.Lock()
 	go func() {
-		readErr = eventer.Read(options)
+		for e := range eventChannel {
+			logEvents = append(logEvents, e)
+		}
+		readLock.Unlock()
 	}()
-	if readErr != nil {
-		return nil, readErr
-	}
-	for e := range eventChannel {
-		logEvents = append(logEvents, e)
-	}
-	return logEvents, nil
+
+	readErr := eventer.Read(ctx, options)
+	readLock.Lock() // Wait for the events to be consumed.
+	return logEvents, readErr
 }
 
 // GetLastContainerEvent takes a container name or ID and an event status and returns
 // the last occurrence of the container event
-func (r *Runtime) GetLastContainerEvent(nameOrID string, containerEvent events.Status) (*events.Event, error) {
+func (r *Runtime) GetLastContainerEvent(ctx context.Context, nameOrID string, containerEvent events.Status) (*events.Event, error) {
 	// check to make sure the event.Status is valid
 	if _, err := events.StringToStatus(containerEvent.String()); err != nil {
 		return nil, err
@@ -124,7 +126,7 @@ func (r *Runtime) GetLastContainerEvent(nameOrID string, containerEvent events.S
 		fmt.Sprintf("event=%s", containerEvent),
 		"type=container",
 	}
-	containerEvents, err := r.GetEvents(filters)
+	containerEvents, err := r.GetEvents(ctx, filters)
 	if err != nil {
 		return nil, err
 	}

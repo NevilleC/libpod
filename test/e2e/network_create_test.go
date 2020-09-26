@@ -1,5 +1,3 @@
-// +build !remoteclient
-
 package integration
 
 import (
@@ -10,8 +8,8 @@ import (
 	"strings"
 
 	cniversion "github.com/containernetworking/cni/pkg/version"
-	"github.com/containers/libpod/pkg/network"
-	. "github.com/containers/libpod/test/utils"
+	"github.com/containers/podman/v2/pkg/network"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/pkg/errors"
@@ -58,7 +56,7 @@ func genericPluginsToPortMap(plugins interface{}, pluginType string) (network.Po
 }
 
 func (p *PodmanTestIntegration) removeCNINetwork(name string) {
-	session := p.Podman([]string{"network", "rm", name})
+	session := p.Podman([]string{"network", "rm", "-f", name})
 	session.WaitWithDefaultTimeout()
 	Expect(session.ExitCode()).To(BeZero())
 }
@@ -76,7 +74,6 @@ var _ = Describe("Podman network create", func() {
 	)
 
 	BeforeEach(func() {
-		SkipIfRootless()
 		tempdir, err = CreateTempDirInTempDir()
 		if err != nil {
 			os.Exit(1)
@@ -140,6 +137,7 @@ var _ = Describe("Podman network create", func() {
 	})
 
 	It("podman network create with name and subnet", func() {
+		SkipIfRemote("FIXME, this should work on --remote")
 		var (
 			results []network.NcList
 		)
@@ -173,6 +171,47 @@ var _ = Describe("Podman network create", func() {
 		_, subnet, err := net.ParseCIDR("10.11.12.0/24")
 		Expect(err).To(BeNil())
 		// Note this is an IPv4 test only!
+		containerIP, _, err := net.ParseCIDR(try.OutputToString())
+		Expect(err).To(BeNil())
+		// Ensure that the IP the container got is within the subnet the user asked for
+		Expect(subnet.Contains(containerIP)).To(BeTrue())
+	})
+
+	It("podman network create with name and IPv6 subnet", func() {
+		SkipIfRootless()
+		var (
+			results []network.NcList
+		)
+		nc := podmanTest.Podman([]string{"network", "create", "--subnet", "fd00:1:2:3:4::/64", "newIPv6network"})
+		nc.WaitWithDefaultTimeout()
+		Expect(nc.ExitCode()).To(BeZero())
+
+		defer podmanTest.removeCNINetwork("newIPv6network")
+
+		// Inspect the network configuration
+		inspect := podmanTest.Podman([]string{"network", "inspect", "newIPv6network"})
+		inspect.WaitWithDefaultTimeout()
+
+		// JSON the network configuration into something usable
+		err := json.Unmarshal([]byte(inspect.OutputToString()), &results)
+		Expect(err).To(BeNil())
+		result := results[0]
+		Expect(result["name"]).To(Equal("newIPv6network"))
+
+		// JSON the bridge info
+		bridgePlugin, err := genericPluginsToBridge(result["plugins"], "bridge")
+		Expect(err).To(BeNil())
+		Expect(bridgePlugin.IPAM.Routes[0].Dest).To(Equal("::/0"))
+
+		// Once a container executes a new network, the nic will be created. We should clean those up
+		// best we can
+		defer removeNetworkDevice(bridgePlugin.BrName)
+
+		try := podmanTest.Podman([]string{"run", "-it", "--rm", "--network", "newIPv6network", ALPINE, "sh", "-c", "ip addr show eth0 |  grep global | awk ' /inet6 / {print $2}'"})
+		try.WaitWithDefaultTimeout()
+
+		_, subnet, err := net.ParseCIDR("fd00:1:2:3:4::/64")
+		Expect(err).To(BeNil())
 		containerIP, _, err := net.ParseCIDR(try.OutputToString())
 		Expect(err).To(BeNil())
 		// Ensure that the IP the container got is within the subnet the user asked for

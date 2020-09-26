@@ -1,11 +1,9 @@
-// +build !remoteclient
-
 package integration
 
 import (
 	"os"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -35,11 +33,12 @@ var _ = Describe("Podman run restart containers", func() {
 	})
 
 	It("Podman start after successful run", func() {
-		session := podmanTest.Podman([]string{"run", ALPINE, "ls"})
+		SkipIfRemote("FIXME This should work on podman-remote")
+		session := podmanTest.Podman([]string{"run", "--name", "test", ALPINE, "ls"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 
-		session2 := podmanTest.Podman([]string{"start", "--attach", "--latest"})
+		session2 := podmanTest.Podman([]string{"start", "--attach", "test"})
 		session2.WaitWithDefaultTimeout()
 		Expect(session2.ExitCode()).To(Equal(0))
 	})

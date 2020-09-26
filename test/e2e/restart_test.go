@@ -4,7 +4,7 @@ import (
 	"os"
 	"time"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -131,7 +131,11 @@ var _ = Describe("Podman restart", func() {
 		startTime := podmanTest.Podman([]string{"inspect", "--format='{{.State.StartedAt}}'", "test1", "test2"})
 		startTime.WaitWithDefaultTimeout()
 
-		session := podmanTest.Podman([]string{"restart", "-l"})
+		cid := "-l"
+		if IsRemote() {
+			cid = "test2"
+		}
+		session := podmanTest.Podman([]string{"restart", cid})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 		restartTime := podmanTest.Podman([]string{"inspect", "--format='{{.State.StartedAt}}'", "test1", "test2"})

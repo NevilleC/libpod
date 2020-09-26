@@ -3,7 +3,7 @@ package integration
 import (
 	"os"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -100,11 +100,15 @@ var _ = Describe("Podman kill", func() {
 	})
 
 	It("podman kill latest container", func() {
-		session := podmanTest.RunTopContainer("")
+		session := podmanTest.RunTopContainer("test1")
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 
-		result := podmanTest.Podman([]string{"kill", "-l"})
+		cid := "-l"
+		if IsRemote() {
+			cid = "test1"
+		}
+		result := podmanTest.Podman([]string{"kill", cid})
 		result.WaitWithDefaultTimeout()
 		Expect(result.ExitCode()).To(Equal(0))
 		Expect(podmanTest.NumberOfContainersRunning()).To(Equal(0))

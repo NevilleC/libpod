@@ -1,13 +1,13 @@
-// +build !remoteclient
+// +build
 
 package integration
 
 import (
 	"fmt"
 	"os"
+	"time"
 
-	"github.com/containers/libpod/pkg/cgroups"
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -21,12 +21,10 @@ var _ = Describe("Podman stats", func() {
 	)
 
 	BeforeEach(func() {
-		cgroupsv2, err := cgroups.IsCgroup2UnifiedMode()
-		Expect(err).To(BeNil())
-
-		if os.Geteuid() != 0 && !cgroupsv2 {
-			Skip("This function is not enabled for rootless podman not running on cgroups v2")
+		if os.Geteuid() != 0 {
+			SkipIfCgroupV1()
 		}
+		var err error
 		tempdir, err = CreateTempDirInTempDir()
 		if err != nil {
 			os.Exit(1)
@@ -87,13 +85,24 @@ var _ = Describe("Podman stats", func() {
 	})
 
 	It("podman stats with json output", func() {
+		var found bool
 		session := podmanTest.RunTopContainer("")
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
-		session = podmanTest.Podman([]string{"stats", "--all", "--no-stream", "--format", "json"})
-		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
-		Expect(session.IsJSONOutputValid()).To(BeTrue())
+		for i := 0; i < 5; i++ {
+			ps := podmanTest.Podman([]string{"ps", "-q"})
+			ps.WaitWithDefaultTimeout()
+			if len(ps.OutputToStringArray()) == 1 {
+				found = true
+				break
+			}
+			time.Sleep(time.Second)
+		}
+		Expect(found).To(BeTrue())
+		stats := podmanTest.Podman([]string{"stats", "--all", "--no-stream", "--format", "json"})
+		stats.WaitWithDefaultTimeout()
+		Expect(stats.ExitCode()).To(Equal(0))
+		Expect(stats.IsJSONOutputValid()).To(BeTrue())
 	})
 
 	It("podman stats on a container with no net ns", func() {

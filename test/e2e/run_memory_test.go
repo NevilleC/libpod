@@ -1,12 +1,10 @@
-// +build !remoteclient
-
 package integration
 
 import (
 	"os"
 
-	"github.com/containers/libpod/pkg/cgroups"
-	. "github.com/containers/libpod/test/utils"
+	"github.com/containers/podman/v2/pkg/cgroups"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -70,17 +68,15 @@ var _ = Describe("Podman run memory", func() {
 
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
-		Expect(session.OutputToString()).To(Equal("41943040"))
+		if cgroupsv2 {
+			Expect(session.OutputToString()).To(Equal("max"))
+		} else {
+			Expect(session.OutputToString()).To(Equal("41943040"))
+		}
 	})
 
 	It("podman run memory-swappiness test", func() {
-		cgroupsv2, err := cgroups.IsCgroup2UnifiedMode()
-		Expect(err).To(BeNil())
-
-		if cgroupsv2 {
-			Skip("Memory swappiness not supported on cgroups v2")
-		}
-
+		SkipIfCgroupV2()
 		session := podmanTest.Podman([]string{"run", "--memory-swappiness=15", ALPINE, "cat", "/sys/fs/cgroup/memory/memory.swappiness"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
@@ -88,12 +84,7 @@ var _ = Describe("Podman run memory", func() {
 	})
 
 	It("podman run kernel-memory test", func() {
-		cgroupsv2, err := cgroups.IsCgroup2UnifiedMode()
-		Expect(err).To(BeNil())
-
-		if cgroupsv2 {
-			Skip("Kernel memory not supported on cgroups v2")
-		}
+		SkipIfCgroupV2()
 		session := podmanTest.Podman([]string{"run", "--kernel-memory=40m", ALPINE, "cat", "/sys/fs/cgroup/memory/memory.kmem.limit_in_bytes"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))

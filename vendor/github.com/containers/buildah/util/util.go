@@ -7,14 +7,16 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"syscall"
 
-	"github.com/containers/common/pkg/cgroups"
+	"github.com/containers/common/pkg/config"
 	"github.com/containers/image/v5/docker/reference"
 	"github.com/containers/image/v5/pkg/sysregistriesv2"
 	"github.com/containers/image/v5/signature"
 	is "github.com/containers/image/v5/storage"
 	"github.com/containers/image/v5/transports"
+	"github.com/containers/image/v5/transports/alltransports"
 	"github.com/containers/image/v5/types"
 	"github.com/containers/storage"
 	"github.com/docker/distribution/registry/api/errcode"
@@ -72,7 +74,7 @@ func ResolveName(name string, firstRegistry string, sc *types.SystemContext, sto
 		return []string{strings.TrimPrefix(name, DefaultTransport)}, DefaultTransport, false, nil
 	}
 	split := strings.SplitN(name, ":", 2)
-	if len(split) == 2 {
+	if StartsWithValidTransport(name) && len(split) == 2 {
 		if trans := transports.Get(split[0]); trans != nil {
 			return []string{split[1]}, trans.Name(), false, nil
 		}
@@ -146,6 +148,12 @@ func ResolveName(name string, firstRegistry string, sc *types.SystemContext, sto
 	return candidates, DefaultTransport, searchRegistriesAreEmpty, nil
 }
 
+// StartsWithValidTransport validates the name starts with Buildah supported transport
+// to avoid the corner case image name same as the transport name
+func StartsWithValidTransport(name string) bool {
+	return strings.HasPrefix(name, "dir:") || strings.HasPrefix(name, "docker://") || strings.HasPrefix(name, "docker-archive:") || strings.HasPrefix(name, "docker-daemon:") || strings.HasPrefix(name, "oci:") || strings.HasPrefix(name, "oci-archive:")
+}
+
 // ExpandNames takes unqualified names, parses them as image names, and returns
 // the fully expanded result, including a tag.  Names which don't include a registry
 // name will be marked for the most-preferred registry (i.e., the first one in our
@@ -209,6 +217,36 @@ func FindImage(store storage.Store, firstRegistry string, systemContext *types.S
 	return ref, img, nil
 }
 
+// ResolveNameToReferences tries to create a list of possible references
+// (including their transports) from the provided image name.
+func ResolveNameToReferences(
+	store storage.Store,
+	systemContext *types.SystemContext,
+	image string,
+) (refs []types.ImageReference, err error) {
+	names, transport, _, err := ResolveName(image, "", systemContext, store)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error parsing name %q", image)
+	}
+
+	if transport != DefaultTransport {
+		transport += ":"
+	}
+
+	for _, name := range names {
+		ref, err := alltransports.ParseImageName(transport + name)
+		if err != nil {
+			logrus.Debugf("error parsing reference to image %q: %v", name, err)
+			continue
+		}
+		refs = append(refs, ref)
+	}
+	if len(refs) == 0 {
+		return nil, errors.Errorf("error locating images with names %v", names)
+	}
+	return refs, nil
+}
+
 // AddImageNames adds the specified names to the specified image.
 func AddImageNames(store storage.Store, firstRegistry string, systemContext *types.SystemContext, image *storage.Image, addNames []string) error {
 	names, err := ExpandNames(addNames, firstRegistry, systemContext, store)
@@ -252,7 +290,7 @@ func Runtime() string {
 	}
 
 	// Need to switch default until runc supports cgroups v2
-	if unified, _ := cgroups.IsCgroup2UnifiedMode(); unified {
+	if unified, _ := IsCgroup2UnifiedMode(); unified {
 		return "crun"
 	}
 
@@ -333,7 +371,7 @@ func GetHostIDs(uidmap, gidmap []specs.LinuxIDMapping, uid, gid uint32) (uint32,
 // GetHostRootIDs uses ID mappings in spec to compute the host-level IDs that will
 // correspond to UID/GID 0/0 in the container.
 func GetHostRootIDs(spec *specs.Spec) (uint32, uint32, error) {
-	if spec.Linux == nil {
+	if spec == nil || spec.Linux == nil {
 		return 0, 0, nil
 	}
 	return GetHostIDs(spec.Linux.UIDMappings, spec.Linux.GIDMappings, 0, 0)
@@ -394,4 +432,56 @@ func TruncateString(str string, to int) string {
 		newStr = str[0:to] + tr
 	}
 	return newStr
+}
+
+var (
+	isUnifiedOnce sync.Once
+	isUnified     bool
+	isUnifiedErr  error
+)
+
+// fileExistsAndNotADir - Check to see if a file exists
+// and that it is not a directory.
+func fileExistsAndNotADir(path string) bool {
+	file, err := os.Stat(path)
+
+	if file == nil || err != nil || os.IsNotExist(err) {
+		return false
+	}
+	return !file.IsDir()
+}
+
+// FindLocalRuntime find the local runtime of the
+// system searching through the config file for
+// possible locations.
+func FindLocalRuntime(runtime string) string {
+	var localRuntime string
+	conf, err := config.Default()
+	if err != nil {
+		logrus.Debugf("Error loading container config when searching for local runtime.")
+		return localRuntime
+	}
+	for _, val := range conf.Engine.OCIRuntimes[runtime] {
+		if fileExistsAndNotADir(val) {
+			localRuntime = val
+			break
+		}
+	}
+	return localRuntime
+}
+
+// MergeEnv merges two lists of environment variables, avoiding duplicates.
+func MergeEnv(defaults, overrides []string) []string {
+	s := make([]string, 0, len(defaults)+len(overrides))
+	index := make(map[string]int)
+	for _, envSpec := range append(defaults, overrides...) {
+		envVar := strings.SplitN(envSpec, "=", 2)
+		if i, ok := index[envVar[0]]; ok {
+			s[i] = envSpec
+			continue
+		}
+		s = append(s, envSpec)
+		index[envVar[0]] = len(s) - 1
+	}
+	return s
 }

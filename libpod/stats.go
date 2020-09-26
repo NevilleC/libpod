@@ -7,14 +7,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/containers/libpod/libpod/define"
-	"github.com/containers/libpod/pkg/cgroups"
+	"github.com/containers/podman/v2/libpod/define"
+	"github.com/containers/podman/v2/pkg/cgroups"
 	"github.com/pkg/errors"
 )
 
 // GetContainerStats gets the running stats for a given container
-func (c *Container) GetContainerStats(previousStats *ContainerStats) (*ContainerStats, error) {
-	stats := new(ContainerStats)
+func (c *Container) GetContainerStats(previousStats *define.ContainerStats) (*define.ContainerStats, error) {
+	stats := new(define.ContainerStats)
 	stats.ContainerID = c.ID()
 	stats.Name = c.Name()
 
@@ -66,7 +66,9 @@ func (c *Container) GetContainerStats(previousStats *ContainerStats) (*Container
 	}
 	stats.BlockInput, stats.BlockOutput = calculateBlockIO(cgroupStats)
 	stats.CPUNano = cgroupStats.CPU.Usage.Total
+	stats.CPUSystemNano = cgroupStats.CPU.Usage.Kernel
 	stats.SystemNano = now
+	stats.PerCPU = cgroupStats.CPU.Usage.PerCPU
 	// Handle case where the container is not in a network namespace
 	if netStats != nil {
 		stats.NetInput = netStats.TxBytes

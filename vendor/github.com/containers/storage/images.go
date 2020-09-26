@@ -10,6 +10,7 @@ import (
 
 	"github.com/containers/storage/pkg/ioutils"
 	"github.com/containers/storage/pkg/stringid"
+	"github.com/containers/storage/pkg/stringutils"
 	"github.com/containers/storage/pkg/truncindex"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
@@ -214,17 +215,17 @@ func bigDataNameIsManifest(name string) bool {
 
 // recomputeDigests takes a fixed digest and a name-to-digest map and builds a
 // list of the unique values that would identify the image.
-func (image *Image) recomputeDigests() error {
-	validDigests := make([]digest.Digest, 0, len(image.BigDataDigests)+1)
+func (i *Image) recomputeDigests() error {
+	validDigests := make([]digest.Digest, 0, len(i.BigDataDigests)+1)
 	digests := make(map[digest.Digest]struct{})
-	if image.Digest != "" {
-		if err := image.Digest.Validate(); err != nil {
-			return errors.Wrapf(err, "error validating image digest %q", string(image.Digest))
+	if i.Digest != "" {
+		if err := i.Digest.Validate(); err != nil {
+			return errors.Wrapf(err, "error validating image digest %q", string(i.Digest))
 		}
-		digests[image.Digest] = struct{}{}
-		validDigests = append(validDigests, image.Digest)
+		digests[i.Digest] = struct{}{}
+		validDigests = append(validDigests, i.Digest)
 	}
-	for name, digest := range image.BigDataDigests {
+	for name, digest := range i.BigDataDigests {
 		if !bigDataNameIsManifest(name) {
 			continue
 		}
@@ -237,10 +238,10 @@ func (image *Image) recomputeDigests() error {
 			validDigests = append(validDigests, digest)
 		}
 	}
-	if image.Digest == "" && len(validDigests) > 0 {
-		image.Digest = validDigests[0]
+	if i.Digest == "" && len(validDigests) > 0 {
+		i.Digest = validDigests[0]
 	}
-	image.Digests = validDigests
+	i.Digests = validDigests
 	return nil
 }
 
@@ -460,6 +461,19 @@ func (r *imageStore) Create(id string, names []string, layer, metadata string, c
 func (r *imageStore) addMappedTopLayer(id, layer string) error {
 	if image, ok := r.lookup(id); ok {
 		image.MappedTopLayers = append(image.MappedTopLayers, layer)
+		return r.Save()
+	}
+	return errors.Wrapf(ErrImageUnknown, "error locating image with ID %q", id)
+}
+
+func (r *imageStore) removeMappedTopLayer(id, layer string) error {
+	if image, ok := r.lookup(id); ok {
+		initialLen := len(image.MappedTopLayers)
+		image.MappedTopLayers = stringutils.RemoveFromSlice(image.MappedTopLayers, layer)
+		// No layer was removed.  No need to save.
+		if initialLen == len(image.MappedTopLayers) {
+			return nil
+		}
 		return r.Save()
 	}
 	return errors.Wrapf(ErrImageUnknown, "error locating image with ID %q", id)

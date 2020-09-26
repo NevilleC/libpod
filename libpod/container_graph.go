@@ -4,7 +4,7 @@ import (
 	"context"
 	"strings"
 
-	"github.com/containers/libpod/libpod/define"
+	"github.com/containers/podman/v2/libpod/define"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -113,7 +113,7 @@ func detectCycles(graph *ContainerGraph) (bool, error) {
 		info := new(nodeInfo)
 		info.index = index
 		info.lowLink = index
-		index = index + 1
+		index++
 
 		nodes[node.id] = info
 

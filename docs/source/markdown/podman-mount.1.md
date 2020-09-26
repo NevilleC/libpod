@@ -4,16 +4,19 @@
 podman\-mount - Mount a working container's root filesystem
 
 ## SYNOPSIS
-**podman mount** [*container* ...]
+**podman mount** [*options*] [*container* ...]
 
-**podman container mount** [*container* ...]
+**podman container mount** [*options*] [*container* ...]
 
 ## DESCRIPTION
 Mounts the specified containers' root file system in a location which can be
 accessed from the host, and returns its location.
 
-If you execute the command without any arguments, the tool will list all of the
+If you execute the command without any arguments, Podman will list all of the
 currently mounted containers.
+
+Rootless mode only supports mounting VFS driver, unless you enter the user namespace
+via the `podman unshare` command. All other storage drivers will fail to mount.
 
 ## RETURN VALUE
 The location of the mounted file system.  On error an empty string and errno is
@@ -21,13 +24,13 @@ returned.
 
 ## OPTIONS
 
-**--all**, **a**
+**--all**, **-a**
 
 Mount all containers.
 
 **--format**=*format*
 
-Print the mounted containers in specified format (json)
+Print the mounted containers in specified format (json).
 
 **--latest**, **-l**
 
@@ -70,4 +73,4 @@ a7060253093b /var/lib/containers/storage/overlay/0ff7d7ca68bed1ace424f9df154d2dd
 ```
 
 ## SEE ALSO
-podman(1), podman-umount(1), mount(8)
+podman(1), podman-umount(1), mount(8), podman-unshare(1)

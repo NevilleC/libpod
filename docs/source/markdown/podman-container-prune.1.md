@@ -11,6 +11,14 @@ podman-container-prune - Remove all stopped containers from local storage
 
 ## OPTIONS
 
+**--filter**=*filters*
+
+Provide filter values.
+
+**--force**, **-f**
+
+Do not provide an interactive prompt for container removal.
+
 **-h**, **--help**
 
 Print usage statement

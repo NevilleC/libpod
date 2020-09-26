@@ -9,7 +9,7 @@ podman\-stop - Stop one or more running containers
 **podman container stop** [*options*] *container* ...
 
 ## DESCRIPTION
-Stops one or more containers.  You may use container IDs or names as input. The **--timeout** switch
+Stops one or more containers.  You may use container IDs or names as input. The **--time** switch
 allows you to specify the number of seconds to wait before forcibly stopping the container after the stop command
 is issued to the container. The default is 10 seconds. By default, containers are stopped with SIGTERM
 and then SIGKILL after the timeout. The SIGTERM default can be overridden by the image used to create the
@@ -38,27 +38,27 @@ to run containers such as CRI-O, the last started container could be from either
 
 The latest option is not supported on the remote client.
 
-**--timeout**, **--time**, **t**=*time*
+**--time**, **-t**=*time*
 
-Timeout to wait before forcibly stopping the container
+Time to wait before forcibly stopping the container
 
-## EXAMPLE
+## EXAMPLES
 
-podman stop mywebserver
+$ podman stop mywebserver
 
-podman stop 860a4b235279
+$ podman stop 860a4b235279
 
-podman stop mywebserver 860a4b235279
+$ podman stop mywebserver 860a4b235279
 
-podman stop --cidfile /home/user/cidfile-1
+$ podman stop --cidfile /home/user/cidfile-1
 
-podman stop --cidfile /home/user/cidfile-1 --cidfile ./cidfile-2
+$ podman stop --cidfile /home/user/cidfile-1 --cidfile ./cidfile-2
 
-podman stop --timeout 2 860a4b235279
+$ podman stop --time 2 860a4b235279
 
-podman stop -a
+$ podman stop -a
 
-podman stop --latest
+$ podman stop --latest
 
 ## SEE ALSO
 podman(1), podman-rm(1)

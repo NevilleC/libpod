@@ -127,10 +127,10 @@ func StringToStatus(name string) (Status, error) {
 	switch name {
 	case Attach.String():
 		return Attach, nil
+	case Build.String():
+		return Build, nil
 	case Checkpoint.String():
 		return Checkpoint, nil
-	case Restore.String():
-		return Restore, nil
 	case Cleanup.String():
 		return Cleanup, nil
 	case Commit.String():
@@ -204,5 +204,5 @@ func (e EventLogFile) getTail(options ReadOptions) (*tail.Tail, error) {
 	if len(options.Until) > 0 {
 		stream = false
 	}
-	return tail.TailFile(e.options.LogFilePath, tail.Config{ReOpen: reopen, Follow: stream, Location: &seek, Logger: tail.DiscardingLogger})
+	return tail.TailFile(e.options.LogFilePath, tail.Config{ReOpen: reopen, Follow: stream, Location: &seek, Logger: tail.DiscardingLogger, Poll: true})
 }

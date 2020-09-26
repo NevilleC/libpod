@@ -37,9 +37,9 @@ Manage Containers
 
 :doc:`port <markdown/podman-port.1>` List port mappings or a specific mapping for the container
 
-:doc:`restart <markdown/podman-restart.1>` Restart one or more containers
-
 :doc:`prune <markdown/podman-container-prune.1>` Remove all stopped containers
+
+:doc:`restart <markdown/podman-restart.1>` Restart one or more containers
 
 :doc:`restore <markdown/podman-container-restore.1>` Restores one or more containers from a checkpoint
 
@@ -57,7 +57,7 @@ Manage Containers
 
 :doc:`top <markdown/podman-top.1>` Display the running processes of a container
 
-:doc:`umount <markdown/podman-umount.1>` Unmounts working container's root filesystem
+:doc:`unmount <markdown/podman-unmount.1>` Unmounts working container's root filesystem
 
 :doc:`unpause <markdown/podman-unpause.1>` Unpause the processes in one or more containers
 

@@ -6,7 +6,7 @@ load helpers
 @test "podman mount - basic test" {
     # Only works with root (FIXME: does it work with rootless + vfs?)
     skip_if_rootless "mount does not work rootless"
-    skip_if_remote
+    skip_if_remote "mounting remote is meaningless"
 
     f_path=/tmp/tmpfile_$(random_string 8)
     f_content=$(random_string 30)
@@ -33,6 +33,36 @@ load helpers
     if [ -e "$mount_path/$f_path" ]; then
         die "Mounted file exists even after umount: $mount_path/$f_path"
     fi
+}
+
+
+@test "podman image mount" {
+    skip_if_remote "mounting remote is meaningless"
+    skip_if_rootless "too hard to test rootless"
+
+    # Start with clean slate
+    run_podman image umount -a
+
+    run_podman image mount $IMAGE
+    mount_path="$output"
+
+    test -d $mount_path
+
+    # Image is custom-built and has a file containing the YMD tag. Check it.
+    testimage_file="/home/podman/testimage-id"
+    test -e "$mount_path$testimage_file"
+    is $(< "$mount_path$testimage_file") "$PODMAN_TEST_IMAGE_TAG"  \
+       "Contents of $testimage_file in image"
+
+    # 'image mount', no args, tells us what's mounted
+    run_podman image mount
+    is "$output" "$IMAGE $mount_path" "podman image mount with no args"
+
+    # Clean up
+    run_podman image umount $IMAGE
+
+    run_podman image mount
+    is "$output" "" "podman image mount, no args, after umount"
 }
 
 # vim: filetype=sh

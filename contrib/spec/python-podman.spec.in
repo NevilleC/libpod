@@ -18,7 +18,7 @@
 %global provider_tld    com
 %global project         containers
 %global repo            libpod
-# https://github.com/containers/libpod
+# https://github.com/containers/podman
 %global provider_prefix %{provider}.%{provider_tld}/%{project}/%{repo}
 %global import_path     %{provider_prefix}
 %global commit          #COMMIT#
@@ -92,7 +92,7 @@ popd
 
 %files
 %license LICENSE
-%doc README.md CONTRIBUTING.md install.md code-of-conduct.md transfer.md
+%doc README.md CONTRIBUTING.md install.md CODE-OF-CONDUCT.md transfer.md
 %{_bindir}/pypodman
 %{_mandir}/man1/pypodman.1*
 %dir %{python3_sitelib}/podman

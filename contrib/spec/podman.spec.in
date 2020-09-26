@@ -5,12 +5,6 @@
 %bcond_without doc
 %bcond_without debug
 
-%if 0%{?fedora} >= 28
-%bcond_without varlink
-%else
-%bcond_with varlink
-%endif
-
 %if %{with debug}
 %global _find_debuginfo_dwz_opts %{nil}
 %global _dwz_low_mem_die_limit 0
@@ -22,14 +16,14 @@
 %define gobuild(o:) go build -tags="$BUILDTAGS" -ldflags "${LDFLAGS:-} -B 0x$(head -c20 /dev/urandom|od -An -tx1|tr -d ' \\n')" -a -v -x %{?**};
 #% endif
 
-# libpod hack directory
+# podman hack directory
 %define hackdir %{_builddir}/%{repo}-%{shortcommit0}
 
 %global provider github
 %global provider_tld com
 %global project containers
-%global repo libpod
-# https://github.com/containers/libpod
+%global repo podman
+# https://github.com/containers/podman
 %global provider_prefix %{provider}.%{provider_tld}/%{project}/%{repo}
 %global import_path %{provider_prefix}
 %global git0 https://%{provider}.%{provider_tld}/%{project}/%{repo}
@@ -39,11 +33,16 @@
 # People want conmon packaged with the copr rpm
 %global import_path_conmon      github.com/containers/conmon
 %global git_conmon      https://%{import_path_conmon}
-%global commit_conmon   d532caebc788fafdd2a305b68cd1983b4039bea4
+%global commit_conmon   41877362fc4685d55e0473d2e4a1cbe5e1debee0
 %global shortcommit_conmon %(c=%{commit_conmon}; echo ${c:0:7})
 
 Name: podman
-Version: 1.7.1
+%if 0%{?fedora}
+Epoch: 99
+%else
+Epoch: 0
+%endif
+Version: 2.2.0
 Release: #COMMITDATE#.git%{shortcommit0}%{?dist}
 Summary: Manage Pods, Containers and Container Images
 License: ASL 2.0
@@ -75,17 +74,24 @@ BuildRequires: libselinux-devel
 BuildRequires: pkgconfig
 BuildRequires: make
 BuildRequires: systemd-devel
-Requires: runc
 Requires: skopeo-containers
 Requires: containernetworking-plugins >= 0.6.0-3
 Requires: iptables
-%if 0%{?rhel} <= 7
+%if 0%{?rhel} < 8 || 0%{?centos} < 8
 Requires: container-selinux
+Requires: runc
 %else
+%if 0%{?rhel} || 0%{?centos}
+Requires: runc
+%else
+Requires: oci-runtime
+Recommends: crun
+%endif
 Recommends: container-selinux
 Recommends: slirp4netns
 Recommends: fuse-overlayfs
 %endif
+Recommends: xz
 
 # vendored libraries
 # awk '{print "Provides: bundled(golang("$1")) = "$2}' vendor.conf | sort
@@ -372,12 +378,6 @@ Man pages for the %{name} commands
 # untar conmon
 tar zxf %{SOURCE1}
 
-sed -i 's/install.remote: podman-remote/install.remote:/' Makefile
-sed -i 's/install.bin: podman/install.bin:/' Makefile
-%if %{with doc}
-sed -i 's/install.man: docs/install.man:/' Makefile
-%endif
-
 %build
 mkdir _build
 pushd _build
@@ -385,10 +385,9 @@ mkdir -p src/%{provider}.%{provider_tld}/%{project}
 ln -s ../../../../ src/%{import_path}
 popd
 ln -s vendor src
+export GO111MODULE=on
 export GOPATH=$(pwd)/_build:$(pwd):$(pwd):%{gopath}
-export BUILDTAGS="varlink selinux seccomp $(%{hackdir}/hack/btrfs_installed_tag.sh) $(%{hackdir}/hack/btrfs_tag.sh) $(%{hackdir}/hack/libdm_tag.sh) exclude_graphdriver_devicemapper"
-
-GOPATH=$GOPATH go generate ./cmd/podman/varlink/...
+export BUILDTAGS="selinux seccomp systemd $(%{hackdir}/hack/btrfs_installed_tag.sh) $(%{hackdir}/hack/btrfs_tag.sh) $(%{hackdir}/hack/libdm_tag.sh) exclude_graphdriver_devicemapper"
 
 %if %{with doc}
 BUILDTAGS=$BUILDTAGS make binaries docs
@@ -404,35 +403,24 @@ mkdir -p src/%{provider}.%{provider_tld}/{containers,opencontainers}
 ln -s $(dirs +1 -l) src/%{import_path_conmon}
 popd
 
-export BUILDTAGS="selinux seccomp $(%{hackdir}/hack/btrfs_installed_tag.sh) $(%{hackdir}/hack/btrfs_tag.sh)"
+export BUILDTAGS="selinux seccomp systemd $(%{hackdir}/hack/btrfs_installed_tag.sh) $(%{hackdir}/hack/btrfs_tag.sh)"
 BUILDTAGS=$BUILDTAGS make
 popd
 
 %install
 install -dp %{buildroot}%{_unitdir}
 install -dp %{buildroot}%{_usr}/lib/systemd/user
+PODMAN_VERSION=%{version} %{__make} PREFIX=%{buildroot}%{_prefix} ETCDIR=%{buildroot}%{_sysconfdir} \
+        install.bin-nobuild \
+        install.remote-nobuild \
 %if %{with doc}
-PODMAN_VERSION=%{version} %{__make} PREFIX=%{buildroot}%{_prefix} ETCDIR=%{buildroot}%{_sysconfdir} \
-        install.bin \
-        install.remote \
-        install.man \
-        install.cni \
-        install.systemd \
-        install.completions
-%else
-PODMAN_VERSION=%{version} %{__make} PREFIX=%{buildroot}%{_prefix} ETCDIR=%{buildroot}%{_sysconfdir} \
-        install.bin \
-        install.remote \
-        install.cni \
-        install.systemd \
-        install.completions
+        install.man-nobuild \
 %endif
+        install.cni \
+        install.systemd \
+        install.completions
 
 mv pkg/hooks/README.md pkg/hooks/README-hooks.md
-
-# install libpod.conf
-install -dp %{buildroot}%{_datadir}/containers
-install -p -m 644 %{repo}.conf %{buildroot}%{_datadir}/containers
 
 # install conmon
 install -dp %{buildroot}%{_libexecdir}/%{name}
@@ -507,35 +495,37 @@ export GOPATH=%{buildroot}/%{gopath}:$(pwd)/vendor:%{gopath}
 
 %files
 %license LICENSE
-%doc README.md CONTRIBUTING.md pkg/hooks/README-hooks.md install.md code-of-conduct.md transfer.md
+%doc README.md CONTRIBUTING.md pkg/hooks/README-hooks.md install.md CODE-OF-CONDUCT.md transfer.md
 %{_bindir}/%{name}
 %{_datadir}/bash-completion/completions/*
 %{_datadir}/zsh/site-functions/*
 %{_libexecdir}/%{name}/conmon
 %config(noreplace) %{_sysconfdir}/cni/net.d/87-%{name}-bridge.conflist
-%{_datadir}/containers/%{repo}.conf
-%{_unitdir}/io.podman.service
-%{_unitdir}/io.podman.socket
-%{_usr}/lib/systemd/user/io.podman.service
-%{_usr}/lib/systemd/user/io.podman.socket
-%{_usr}/lib/tmpfiles.d/%{name}.conf
+%{_unitdir}/podman-auto-update.service
+%{_unitdir}/podman-auto-update.timer
+%{_unitdir}/podman.service
+%{_unitdir}/podman.socket
+%{_usr}/lib/systemd/user/podman.service
+%{_usr}/lib/systemd/user/podman.socket
+%{_usr}/lib/systemd/user/podman-auto-update.service
+%{_usr}/lib/systemd/user/podman-auto-update.timer
 
 %if 0%{?with_devel}
 %files -n libpod-devel -f devel.file-list
 %license LICENSE
-%doc README.md CONTRIBUTING.md pkg/hooks/README-hooks.md install.md code-of-conduct.md transfer.md
+%doc README.md CONTRIBUTING.md pkg/hooks/README-hooks.md install.md CODE-OF-CONDUCT.md transfer.md
 %dir %{gopath}/src/%{provider}.%{provider_tld}/%{project}
 %endif
 
 %if 0%{?with_unit_test} && 0%{?with_devel}
 %files unit-test-devel -f unit-test-devel.file-list
 %license LICENSE
-%doc README.md CONTRIBUTING.md pkg/hooks/README-hooks.md install.md code-of-conduct.md transfer.md
+%doc README.md CONTRIBUTING.md pkg/hooks/README-hooks.md install.md CODE-OF-CONDUCT.md transfer.md
 %endif
 
 %files -n podman-remote
 %license LICENSE
-%doc README.md CONTRIBUTING.md pkg/hooks/README-hooks.md install.md code-of-conduct.md transfer.md
+%doc README.md CONTRIBUTING.md pkg/hooks/README-hooks.md install.md CODE-OF-CONDUCT.md transfer.md
 %{_bindir}/%{name}-remote
 
 %if %{with doc}

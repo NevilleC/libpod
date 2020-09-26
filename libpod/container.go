@@ -11,11 +11,12 @@ import (
 
 	"github.com/containernetworking/cni/pkg/types"
 	cnitypes "github.com/containernetworking/cni/pkg/types/current"
+	"github.com/containers/common/pkg/config"
 	"github.com/containers/image/v5/manifest"
-	"github.com/containers/libpod/libpod/define"
-	"github.com/containers/libpod/libpod/lock"
-	"github.com/containers/libpod/pkg/namespaces"
-	"github.com/containers/libpod/pkg/rootless"
+	"github.com/containers/podman/v2/libpod/define"
+	"github.com/containers/podman/v2/libpod/lock"
+	"github.com/containers/podman/v2/pkg/rootless"
+	"github.com/containers/podman/v2/utils"
 	"github.com/containers/storage"
 	"github.com/cri-o/ocicni/pkg/ocicni"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
@@ -32,15 +33,6 @@ const SystemdDefaultCgroupParent = "machine.slice"
 // SystemdDefaultRootlessCgroupParent is the cgroup parent for the systemd cgroup
 // manager in libpod when running as rootless
 const SystemdDefaultRootlessCgroupParent = "user.slice"
-
-// JournaldLogging is the string conmon expects to specify journald logging
-const JournaldLogging = "journald"
-
-// KubernetesLogging is the string conmon expects when specifying to use the kubernetes logging format
-const KubernetesLogging = "k8s-file"
-
-// JSONLogging is the string conmon expects when specifying to use the json logging format
-const JSONLogging = "json-file"
 
 // DefaultWaitInterval is the default interval between container status checks
 // while waiting.
@@ -105,6 +97,10 @@ const (
 	// RestartPolicyOnFailure restarts the container on non-0 exit code,
 	// with an optional maximum number of retries.
 	RestartPolicyOnFailure = "on-failure"
+	// RestartPolicyUnlessStopped unconditionally restarts unless stopped
+	// by the user. It is identical to Always except with respect to
+	// handling of system restart, which Podman does not yet support.
+	RestartPolicyUnlessStopped = "unless-stopped"
 )
 
 // Container is a single OCI container.
@@ -134,6 +130,9 @@ type Container struct {
 
 	rootlessSlirpSyncR *os.File
 	rootlessSlirpSyncW *os.File
+
+	rootlessPortSyncR *os.File
+	rootlessPortSyncW *os.File
 
 	// A restored container should have the same IP address as before
 	// being checkpointed. If requestedIP is set it will be used instead
@@ -178,9 +177,13 @@ type ContainerState struct {
 	PID int `json:"pid,omitempty"`
 	// ConmonPID is the PID of the container's conmon
 	ConmonPID int `json:"conmonPid,omitempty"`
-	// ExecSessions contains active exec sessions for container
-	// Exec session ID is mapped to PID of exec process
-	ExecSessions map[string]*ExecSession `json:"execSessions,omitempty"`
+	// ExecSessions contains all exec sessions that are associated with this
+	// container.
+	ExecSessions map[string]*ExecSession `json:"newExecSessions,omitempty"`
+	// LegacyExecSessions are legacy exec sessions from older versions of
+	// Podman.
+	// These are DEPRECATED and will be removed in a future release.
+	LegacyExecSessions map[string]*legacyExecSession `json:"execSessions,omitempty"`
 	// NetworkStatus contains the configuration results for all networks
 	// the pod is attached to. Only populated if we created a network
 	// namespace for the container, and the network namespace is currently
@@ -211,210 +214,6 @@ type ContainerState struct {
 	containerPlatformState
 }
 
-// ExecSession contains information on an active exec session
-type ExecSession struct {
-	ID      string   `json:"id"`
-	Command []string `json:"command"`
-	PID     int      `json:"pid"`
-}
-
-// ContainerConfig contains all information that was used to create the
-// container. It may not be changed once created.
-// It is stored, read-only, on disk
-type ContainerConfig struct {
-	Spec *spec.Spec `json:"spec"`
-	ID   string     `json:"id"`
-	Name string     `json:"name"`
-	// Full ID of the pood the container belongs to
-	Pod string `json:"pod,omitempty"`
-	// Namespace the container is in
-	Namespace string `json:"namespace,omitempty"`
-	// ID of this container's lock
-	LockID uint32 `json:"lockID"`
-
-	// CreateCommand is the full command plus arguments of the process the
-	// container has been created with.
-	CreateCommand []string `json:"CreateCommand,omitempty"`
-
-	// TODO consider breaking these subsections up into smaller structs
-
-	// UID/GID mappings used by the storage
-	IDMappings storage.IDMappingOptions `json:"idMappingsOptions,omitempty"`
-
-	// Information on the image used for the root filesystem/
-	RootfsImageID   string `json:"rootfsImageID,omitempty"`
-	RootfsImageName string `json:"rootfsImageName,omitempty"`
-	// Rootfs to use for the container, this conflicts with RootfsImageID
-	Rootfs string `json:"rootfs,omitempty"`
-	// Whether to mount volumes specified in the image.
-	ImageVolumes bool `json:"imageVolumes"`
-	// Src path to be mounted on /dev/shm in container.
-	ShmDir string `json:"ShmDir,omitempty"`
-	// Size of the container's SHM.
-	ShmSize int64 `json:"shmSize"`
-	// Static directory for container content that will persist across
-	// reboot.
-	StaticDir string `json:"staticDir"`
-	// Mounts list contains all additional mounts into the container rootfs.
-	// These include the SHM mount.
-	// These must be unmounted before the container's rootfs is unmounted.
-	Mounts []string `json:"mounts,omitempty"`
-	// NamedVolumes lists the named volumes to mount into the container.
-	NamedVolumes []*ContainerNamedVolume `json:"namedVolumes,omitempty"`
-
-	// Security Config
-
-	// Whether the container is privileged
-	Privileged bool `json:"privileged"`
-	// SELinux process label for container
-	ProcessLabel string `json:"ProcessLabel,omitempty"`
-	// SELinux mount label for root filesystem
-	MountLabel string `json:"MountLabel,omitempty"`
-	// LabelOpts are options passed in by the user to setup SELinux labels
-	LabelOpts []string `json:"labelopts,omitempty"`
-	// User and group to use in the container
-	// Can be specified by name or UID/GID
-	User string `json:"user,omitempty"`
-	// Additional groups to add
-	Groups []string `json:"groups,omitempty"`
-
-	// Namespace Config
-	// IDs of container to share namespaces with
-	// NetNsCtr conflicts with the CreateNetNS bool
-	// These containers are considered dependencies of the given container
-	// They must be started before the given container is started
-	IPCNsCtr    string `json:"ipcNsCtr,omitempty"`
-	MountNsCtr  string `json:"mountNsCtr,omitempty"`
-	NetNsCtr    string `json:"netNsCtr,omitempty"`
-	PIDNsCtr    string `json:"pidNsCtr,omitempty"`
-	UserNsCtr   string `json:"userNsCtr,omitempty"`
-	UTSNsCtr    string `json:"utsNsCtr,omitempty"`
-	CgroupNsCtr string `json:"cgroupNsCtr,omitempty"`
-
-	// IDs of dependency containers.
-	// These containers must be started before this container is started.
-	Dependencies []string
-
-	// Network Config
-
-	// CreateNetNS indicates that libpod should create and configure a new
-	// network namespace for the container.
-	// This cannot be set if NetNsCtr is also set.
-	CreateNetNS bool `json:"createNetNS"`
-	// StaticIP is a static IP to request for the container.
-	// This cannot be set unless CreateNetNS is set.
-	// If not set, the container will be dynamically assigned an IP by CNI.
-	StaticIP net.IP `json:"staticIP"`
-	// StaticMAC is a static MAC to request for the container.
-	// This cannot be set unless CreateNetNS is set.
-	// If not set, the container will be dynamically assigned a MAC by CNI.
-	StaticMAC net.HardwareAddr `json:"staticMAC"`
-	// PortMappings are the ports forwarded to the container's network
-	// namespace
-	// These are not used unless CreateNetNS is true
-	PortMappings []ocicni.PortMapping `json:"portMappings,omitempty"`
-	// UseImageResolvConf indicates that resolv.conf should not be
-	// bind-mounted inside the container.
-	// Conflicts with DNSServer, DNSSearch, DNSOption.
-	UseImageResolvConf bool
-	// DNS servers to use in container resolv.conf
-	// Will override servers in host resolv if set
-	DNSServer []net.IP `json:"dnsServer,omitempty"`
-	// DNS Search domains to use in container resolv.conf
-	// Will override search domains in host resolv if set
-	DNSSearch []string `json:"dnsSearch,omitempty"`
-	// DNS options to be set in container resolv.conf
-	// With override options in host resolv if set
-	DNSOption []string `json:"dnsOption,omitempty"`
-	// UseImageHosts indicates that /etc/hosts should not be
-	// bind-mounted inside the container.
-	// Conflicts with HostAdd.
-	UseImageHosts bool
-	// Hosts to add in container
-	// Will be appended to host's host file
-	HostAdd []string `json:"hostsAdd,omitempty"`
-	// Network names (CNI) to add container to. Empty to use default network.
-	Networks []string `json:"networks,omitempty"`
-	// Network mode specified for the default network.
-	NetMode namespaces.NetworkMode `json:"networkMode,omitempty"`
-
-	// Image Config
-
-	// UserVolumes contains user-added volume mounts in the container.
-	// These will not be added to the container's spec, as it is assumed
-	// they are already present in the spec given to Libpod. Instead, it is
-	// used when committing containers to generate the VOLUMES field of the
-	// image that is created, and for triggering some OCI hooks which do not
-	// fire unless user-added volume mounts are present.
-	UserVolumes []string `json:"userVolumes,omitempty"`
-	// Entrypoint is the container's entrypoint.
-	// It is not used in spec generation, but will be used when the
-	// container is committed to populate the entrypoint of the new image.
-	Entrypoint []string `json:"entrypoint,omitempty"`
-	// Command is the container's command.
-	// It is not used in spec generation, but will be used when the
-	// container is committed to populate the command of the new image.
-	Command []string `json:"command,omitempty"`
-
-	// Misc Options
-
-	// Whether to keep container STDIN open
-	Stdin bool `json:"stdin,omitempty"`
-	// Labels is a set of key-value pairs providing additional information
-	// about a container
-	Labels map[string]string `json:"labels,omitempty"`
-	// StopSignal is the signal that will be used to stop the container
-	StopSignal uint `json:"stopSignal,omitempty"`
-	// StopTimeout is the signal that will be used to stop the container
-	StopTimeout uint `json:"stopTimeout,omitempty"`
-	// Time container was created
-	CreatedTime time.Time `json:"createdTime"`
-	// NoCgroups indicates that the container will not create CGroups. It is
-	// incompatible with CgroupParent.
-	NoCgroups bool `json:"noCgroups,omitempty"`
-	// Cgroup parent of the container
-	CgroupParent string `json:"cgroupParent"`
-	// LogPath log location
-	LogPath string `json:"logPath"`
-	// LogDriver driver for logs
-	LogDriver string `json:"logDriver"`
-	// File containing the conmon PID
-	ConmonPidFile string `json:"conmonPidFile,omitempty"`
-	// RestartPolicy indicates what action the container will take upon
-	// exiting naturally.
-	// Allowed options are "no" (take no action), "on-failure" (restart on
-	// non-zero exit code, up an a maximum of RestartRetries times),
-	// and "always" (always restart the container on any exit code).
-	// The empty string is treated as the default ("no")
-	RestartPolicy string `json:"restart_policy,omitempty"`
-	// RestartRetries indicates the number of attempts that will be made to
-	// restart the container. Used only if RestartPolicy is set to
-	// "on-failure".
-	RestartRetries uint `json:"restart_retries,omitempty"`
-	// TODO log options for log drivers
-
-	// PostConfigureNetNS needed when a user namespace is created by an OCI runtime
-	// if the network namespace is created before the user namespace it will be
-	// owned by the wrong user namespace.
-	PostConfigureNetNS bool `json:"postConfigureNetNS"`
-
-	// OCIRuntime used to create the container
-	OCIRuntime string `json:"runtime,omitempty"`
-
-	// ExitCommand is the container's exit command.
-	// This Command will be executed when the container exits
-	ExitCommand []string `json:"exitCommand,omitempty"`
-	// IsInfra is a bool indicating whether this container is an infra container used for
-	// sharing kernel namespaces in a pod
-	IsInfra bool `json:"pause"`
-
-	// Systemd tells libpod to setup the container in systemd mode
-	Systemd bool `json:"systemd"`
-
-	// HealthCheckConfig has the health check command and related timings
-	HealthCheckConfig *manifest.Schema2HealthConfig `json:"healthcheck"`
-}
-
 // ContainerNamedVolume is a named volume that will be mounted into the
 // container. Each named volume is a libpod Volume present in the state.
 type ContainerNamedVolume struct {
@@ -425,6 +224,15 @@ type ContainerNamedVolume struct {
 	Dest string `json:"dest"`
 	// Options are fstab style mount options
 	Options []string `json:"options,omitempty"`
+}
+
+// ContainerOverlayVolume is a overlay volume that will be mounted into the
+// container. Each volume is a libpod Volume present in the state.
+type ContainerOverlayVolume struct {
+	// Destination is the absolute path where the mount will be placed in the container.
+	Dest string `json:"dest"`
+	// Source specifies the source path of the mount.
+	Source string `json:"source,omitempty"`
 }
 
 // Config accessors
@@ -467,11 +275,9 @@ func (c *Container) specFromState() (*spec.Spec, error) {
 		if err := json.Unmarshal(content, &returnSpec); err != nil {
 			return nil, errors.Wrapf(err, "error unmarshalling container config")
 		}
-	} else {
+	} else if !os.IsNotExist(err) {
 		// ignore when the file does not exist
-		if !os.IsNotExist(err) {
-			return nil, errors.Wrapf(err, "error opening container config")
-		}
+		return nil, errors.Wrapf(err, "error opening container config")
 	}
 
 	return returnSpec, nil
@@ -499,15 +305,15 @@ func (c *Container) Namespace() string {
 	return c.config.Namespace
 }
 
-// Image returns the ID and name of the image used as the container's rootfs
+// Image returns the ID and name of the image used as the container's rootfs.
 func (c *Container) Image() (string, string) {
 	return c.config.RootfsImageID, c.config.RootfsImageName
 }
 
-// ImageVolumes returns whether the container is configured to create
-// persistent volumes requested by the image
-func (c *Container) ImageVolumes() bool {
-	return c.config.ImageVolumes
+// RawImageName returns the unprocessed and not-normalized user-specified image
+// name.
+func (c *Container) RawImageName() string {
+	return c.config.RawImageName
 }
 
 // ShmDir returns the sources path to be mounted on /dev/shm in container
@@ -554,6 +360,11 @@ func (c *Container) ProcessLabel() string {
 // MountLabel returns the SELinux mount label of the container
 func (c *Container) MountLabel() string {
 	return c.config.MountLabel
+}
+
+// Systemd returns whether the container will be running in systemd mode
+func (c *Container) Systemd() bool {
+	return c.config.Systemd
 }
 
 // User returns the user who the container is run as
@@ -723,6 +534,11 @@ func (c *Container) LogPath() string {
 	return c.config.LogPath
 }
 
+// LogTag returns the tag to the container's log file
+func (c *Container) LogTag() string {
+	return c.config.LogTag
+}
+
 // RestartPolicy returns the container's restart policy.
 func (c *Container) RestartPolicy() string {
 	return c.config.RestartPolicy
@@ -761,7 +577,10 @@ func (c *Container) Hostname() string {
 
 // WorkingDir returns the containers working dir
 func (c *Container) WorkingDir() string {
-	return c.config.Spec.Process.Cwd
+	if c.config.Spec.Process != nil {
+		return c.config.Spec.Process.Cwd
+	}
+	return "/"
 }
 
 // State Accessors
@@ -929,13 +748,13 @@ func (c *Container) ExecSession(id string) (*ExecSession, error) {
 
 	session, ok := c.state.ExecSessions[id]
 	if !ok {
-		return nil, errors.Wrapf(define.ErrNoSuchCtr, "no exec session with ID %s found in container %s", id, c.ID())
+		return nil, errors.Wrapf(define.ErrNoSuchExecSession, "no exec session with ID %s found in container %s", id, c.ID())
 	}
 
 	returnSession := new(ExecSession)
-	returnSession.ID = session.ID
-	returnSession.Command = session.Command
-	returnSession.PID = session.PID
+	if err := JSONDeepCopy(session, returnSession); err != nil {
+		return nil, errors.Wrapf(err, "error copying contents of container %s exec session %s", c.ID(), session.ID())
+	}
 
 	return returnSession, nil
 }
@@ -1071,10 +890,25 @@ func (c *Container) NamespacePath(linuxNS LinuxNS) (string, error) { //nolint:in
 
 // CGroupPath returns a cgroups "path" for a given container.
 func (c *Container) CGroupPath() (string, error) {
-	switch c.runtime.config.CgroupManager {
-	case define.CgroupfsCgroupsManager:
+	switch {
+	case c.config.CgroupsMode == cgroupSplit:
+		if c.config.CgroupParent != "" {
+			return "", errors.Errorf("cannot specify cgroup-parent with cgroup-mode %q", cgroupSplit)
+		}
+		cg, err := utils.GetCgroupProcess(c.state.ConmonPID)
+		if err != nil {
+			return "", err
+		}
+		// Use the conmon cgroup for two reasons: we validate the container
+		// delegation was correct, and the conmon cgroup doesn't change at runtime
+		// while we are not sure about the container that can create sub cgroups.
+		if !strings.HasSuffix(cg, "supervisor") {
+			return "", errors.Errorf("invalid cgroup for conmon %q", cg)
+		}
+		return strings.TrimSuffix(cg, "/supervisor") + "/container", nil
+	case c.runtime.config.Engine.CgroupManager == config.CgroupfsCgroupsManager:
 		return filepath.Join(c.config.CgroupParent, fmt.Sprintf("libpod-%s", c.ID())), nil
-	case define.SystemdCgroupsManager:
+	case c.runtime.config.Engine.CgroupManager == config.SystemdCgroupsManager:
 		if rootless.IsRootless() {
 			uid := rootless.GetRootlessUID()
 			parts := strings.SplitN(c.config.CgroupParent, "/", 2)
@@ -1088,7 +922,7 @@ func (c *Container) CGroupPath() (string, error) {
 		}
 		return filepath.Join(c.config.CgroupParent, createUnitName("libpod", c.ID())), nil
 	default:
-		return "", errors.Wrapf(define.ErrInvalidArg, "unsupported CGroup manager %s in use", c.runtime.config.CgroupManager)
+		return "", errors.Wrapf(define.ErrInvalidArg, "unsupported CGroup manager %s in use", c.runtime.config.Engine.CgroupManager)
 	}
 }
 
@@ -1212,5 +1046,16 @@ func (c *Container) AutoRemove() bool {
 	if spec.Annotations == nil {
 		return false
 	}
-	return c.Spec().Annotations[InspectAnnotationAutoremove] == InspectResponseTrue
+	return c.Spec().Annotations[define.InspectAnnotationAutoremove] == define.InspectResponseTrue
+}
+
+// Timezone returns the timezone configured inside the container.
+// Local means it has the same timezone as the host machine
+func (c *Container) Timezone() string {
+	return c.config.Timezone
+}
+
+// Umask returns the Umask bits configured inside the container.
+func (c *Container) Umask() string {
+	return c.config.Umask
 }

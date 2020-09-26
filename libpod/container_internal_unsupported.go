@@ -5,7 +5,8 @@ package libpod
 import (
 	"context"
 
-	"github.com/containers/libpod/libpod/define"
+	"github.com/containers/podman/v2/libpod/define"
+	"github.com/containers/podman/v2/pkg/lookup"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -17,7 +18,7 @@ func (c *Container) unmountSHM(mount string) error {
 	return define.ErrNotImplemented
 }
 
-func (c *Container) prepare() (err error) {
+func (c *Container) prepare() error {
 	return define.ErrNotImplemented
 }
 
@@ -41,10 +42,14 @@ func (c *Container) copyOwnerAndPerms(source, dest string) error {
 	return nil
 }
 
-func (c *Container) refreshCNI() error {
-	return define.ErrNotImplemented
-}
-
 func (c *Container) getOCICgroupPath() (string, error) {
 	return "", define.ErrNotImplemented
+}
+
+func (c *Container) cleanupOverlayMounts() error {
+	return nil
+}
+
+func (c *Container) getUserOverrides() *lookup.Overrides {
+	return nil
 }

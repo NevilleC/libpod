@@ -4,12 +4,12 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/containers/libpod/libpod/define"
+	"github.com/containers/podman/v2/libpod/define"
 	"github.com/pkg/errors"
 )
 
 // Creates a new volume
-func newVolume(runtime *Runtime) (*Volume, error) {
+func newVolume(runtime *Runtime) *Volume {
 	volume := new(Volume)
 	volume.config = new(VolumeConfig)
 	volume.state = new(VolumeState)
@@ -17,13 +17,12 @@ func newVolume(runtime *Runtime) (*Volume, error) {
 	volume.config.Labels = make(map[string]string)
 	volume.config.Options = make(map[string]string)
 	volume.state.NeedsCopyUp = true
-
-	return volume, nil
+	return volume
 }
 
 // teardownStorage deletes the volume from volumePath
 func (v *Volume) teardownStorage() error {
-	return os.RemoveAll(filepath.Join(v.runtime.config.VolumePath, v.Name()))
+	return os.RemoveAll(filepath.Join(v.runtime.config.Engine.VolumePath, v.Name()))
 }
 
 // Volumes with options set, or a filesystem type, or a device to mount need to

@@ -4,14 +4,15 @@
 package libpod
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"math"
 	"strings"
 	"time"
 
-	"github.com/containers/libpod/libpod/logs"
-	journal "github.com/coreos/go-systemd/sdjournal"
+	"github.com/containers/podman/v2/libpod/logs"
+	journal "github.com/coreos/go-systemd/v22/sdjournal"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -29,7 +30,7 @@ const (
 	bufLen = 16384
 )
 
-func (c *Container) readFromJournal(options *logs.LogOptions, logChannel chan *logs.LogLine) error {
+func (c *Container) readFromJournal(ctx context.Context, options *logs.LogOptions, logChannel chan *logs.LogLine) error {
 	var config journal.JournalReaderConfig
 	if options.Tail < 0 {
 		config.NumFromTail = math.MaxUint64
@@ -40,7 +41,7 @@ func (c *Container) readFromJournal(options *logs.LogOptions, logChannel chan *l
 	defaultTime := time.Time{}
 	if options.Since != defaultTime {
 		// coreos/go-systemd/sdjournal doesn't correctly handle requests for data in the future
-		// return nothing instead of fasely printing
+		// return nothing instead of falsely printing
 		if time.Now().Before(options.Since) {
 			return nil
 		}
@@ -65,13 +66,24 @@ func (c *Container) readFromJournal(options *logs.LogOptions, logChannel chan *l
 
 	if options.Follow {
 		go func() {
+			done := make(chan bool)
+			until := make(chan time.Time)
+			go func() {
+				select {
+				case <-ctx.Done():
+					until <- time.Time{}
+				case <-done:
+					// nothing to do anymore
+				}
+			}()
 			follower := FollowBuffer{logChannel}
-			err := r.Follow(nil, follower)
+			err := r.Follow(until, follower)
 			if err != nil {
 				logrus.Debugf(err.Error())
 			}
 			r.Close()
 			options.WaitGroup.Done()
+			done <- true
 			return
 		}()
 		return nil

@@ -4,8 +4,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/containers/libpod/pkg/rootless"
-	. "github.com/containers/libpod/test/utils"
+	"github.com/containers/podman/v2/pkg/rootless"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -51,7 +51,7 @@ var _ = Describe("Podman save", func() {
 	})
 
 	It("podman save with stdout", func() {
-		Skip("Pipe redirection in ginkgo probably wont work")
+		Skip("Pipe redirection in ginkgo probably won't work")
 		outfile := filepath.Join(podmanTest.TempDir, "alpine.tar")
 
 		save := podmanTest.PodmanNoCache([]string{"save", ALPINE, ">", outfile})
@@ -116,4 +116,63 @@ var _ = Describe("Podman save", func() {
 		Expect(save).To(ExitWithError())
 	})
 
+	It("podman save image with digest reference", func() {
+		// pull a digest reference
+		session := podmanTest.PodmanNoCache([]string{"pull", ALPINELISTDIGEST})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+
+		// save a digest reference should exit without error.
+		outfile := filepath.Join(podmanTest.TempDir, "temp.tar")
+		save := podmanTest.PodmanNoCache([]string{"save", "-o", outfile, ALPINELISTDIGEST})
+		save.WaitWithDefaultTimeout()
+		Expect(save.ExitCode()).To(Equal(0))
+	})
+
+	It("podman save --multi-image-archive (tagged images)", func() {
+		multiImageSave(podmanTest, RESTORE_IMAGES)
+	})
+
+	It("podman save --multi-image-archive (untagged images)", func() {
+		// Refer to images via ID instead of tag.
+		session := podmanTest.PodmanNoCache([]string{"images", "--format", "{{.ID}}"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		ids := session.OutputToStringArray()
+
+		Expect(len(RESTORE_IMAGES), len(ids))
+		multiImageSave(podmanTest, ids)
+	})
 })
+
+// Create a multi-image archive, remove all images, load it and
+// make sure that all images are (again) present.
+func multiImageSave(podmanTest *PodmanTestIntegration, images []string) {
+	// Create the archive.
+	outfile := filepath.Join(podmanTest.TempDir, "temp.tar")
+	session := podmanTest.PodmanNoCache(append([]string{"save", "-o", outfile, "--multi-image-archive"}, images...))
+	session.WaitWithDefaultTimeout()
+	Expect(session.ExitCode()).To(Equal(0))
+
+	// Remove all images.
+	session = podmanTest.PodmanNoCache([]string{"rmi", "-af"})
+	session.WaitWithDefaultTimeout()
+	Expect(session.ExitCode()).To(Equal(0))
+
+	// Now load the archive.
+	session = podmanTest.PodmanNoCache([]string{"load", "-i", outfile})
+	session.WaitWithDefaultTimeout()
+	Expect(session.ExitCode()).To(Equal(0))
+	// Grep for each image in the `podman load` output.
+	for _, image := range images {
+		found, _ := session.GrepString(image)
+		Expect(found).Should(BeTrue())
+	}
+
+	// Make sure that each image has really been loaded.
+	for _, image := range images {
+		session = podmanTest.PodmanNoCache([]string{"image", "exists", image})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+	}
+}

@@ -219,25 +219,6 @@ func TestGetImageConfigLabel(t *testing.T) {
 	assert.NotNil(t, err)
 }
 
-func TestGetImageConfigStopSignal(t *testing.T) {
-	stopSignalValidInt, err := GetImageConfig([]string{"STOPSIGNAL 9"})
-	require.Nil(t, err)
-	assert.Equal(t, stopSignalValidInt.StopSignal, "9")
-
-	stopSignalValidString, err := GetImageConfig([]string{"STOPSIGNAL SIGKILL"})
-	require.Nil(t, err)
-	assert.Equal(t, stopSignalValidString.StopSignal, "9")
-
-	_, err = GetImageConfig([]string{"STOPSIGNAL 0"})
-	assert.NotNil(t, err)
-
-	_, err = GetImageConfig([]string{"STOPSIGNAL garbage"})
-	assert.NotNil(t, err)
-
-	_, err = GetImageConfig([]string{"STOPSIGNAL "})
-	assert.NotNil(t, err)
-}
-
 func TestGetImageConfigOnBuild(t *testing.T) {
 	onBuildOne, err := GetImageConfig([]string{"ONBUILD ADD /testdir1"})
 	require.Nil(t, err)
@@ -263,4 +244,16 @@ func TestGetImageConfigMisc(t *testing.T) {
 
 	_, err = GetImageConfig([]string{"BADINST testvalue"})
 	assert.NotNil(t, err)
+}
+
+func TestValidateSysctls(t *testing.T) {
+	strSlice := []string{"net.core.test1=4", "kernel.msgmax=2"}
+	result, _ := ValidateSysctls(strSlice)
+	assert.Equal(t, result["net.core.test1"], "4")
+}
+
+func TestValidateSysctlBadSysctl(t *testing.T) {
+	strSlice := []string{"BLAU=BLUE", "GELB^YELLOW"}
+	_, err := ValidateSysctls(strSlice)
+	assert.Error(t, err)
 }

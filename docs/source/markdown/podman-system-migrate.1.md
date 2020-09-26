@@ -4,10 +4,10 @@
 podman\-system\-migrate - Migrate existing containers to a new podman version
 
 ## SYNOPSIS
-** podman system migrate**
+**podman system migrate** [*options*]
 
 ## DESCRIPTION
-** podman system migrate** migrates containers to the latest podman version.
+**podman system migrate** migrates containers to the latest podman version.
 
 **podman system migrate** takes care of migrating existing containers to the latest version of podman if any change is necessary.
 
@@ -32,11 +32,8 @@ Set a new OCI runtime for all containers.
 This can be used after a system upgrade which changes the default OCI runtime to move all containers to the new runtime.
 There are no guarantees that the containers will continue to work under the new runtime, as some runtimes support differing options and configurations.
 
-## SYNOPSIS
-**podman system migrate**
-
 ## SEE ALSO
-`podman(1)`, `libpod.conf(5)`, `usermod(8)`
+`podman(1)`, `containers.conf(5)`, `usermod(8)`
 
 ## HISTORY
 April 2019, Originally compiled by Giuseppe Scrivano (gscrivan at redhat dot com)

@@ -10,10 +10,12 @@ podman\-events - Monitor Podman events
 
 Monitor and print events that occur in Podman. Each event will include a timestamp,
 a type, a status, name (if applicable), and image (if applicable).  The default logging
-mechanism is *journald*. This can be changed in libpod.conf by changing the `events_logger`
+mechanism is *journald*. This can be changed in containers.conf by changing the `events_logger`
 value to `file`.  Only `file` and `journald` are accepted. A `none` logger is also
 available but this logging mechanism completely disables events; nothing will be reported by
 `podman events`.
+
+By default, streaming mode is used, printing new events as they occur.  Previous events can be listed via `--since` and `--until`.
 
 The *container* event type will report the follow statuses:
  * attach
@@ -142,13 +144,13 @@ $ sudo podman events --since 5m
 
 Show Podman events in JSON Lines format
 ```
-events --format json
+$ podman events --format json
 {"ID":"683b0909d556a9c02fa8cd2b61c3531a965db42158627622d1a67b391964d519","Image":"localhost/myshdemo:latest","Name":"agitated_diffie","Status":"cleanup","Time":"2019-04-27T22:47:00.849932843-04:00","Type":"container"}
 {"ID":"a0f8ab051bfd43f9c5141a8a2502139707e4b38d98ac0872e57c5315381e88ad","Image":"docker.io/library/alpine:latest","Name":"friendly_tereshkova","Status":"unmount","Time":"2019-04-28T13:43:38.063017276-04:00","Type":"container"}
 ```
 
 ## SEE ALSO
-podman(1)
+podman(1), containers.conf(5)
 
 ## HISTORY
 March 2019, Originally compiled by Brent Baude <bbaude@redhat.com>

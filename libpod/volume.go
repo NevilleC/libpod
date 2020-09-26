@@ -3,7 +3,8 @@ package libpod
 import (
 	"time"
 
-	"github.com/containers/libpod/libpod/lock"
+	"github.com/containers/podman/v2/libpod/define"
+	"github.com/containers/podman/v2/libpod/lock"
 )
 
 // Volume is a libpod named volume.
@@ -38,9 +39,8 @@ type VolumeConfig struct {
 	// a list of mount options. For other drivers, they are passed to the
 	// volume driver handling the volume.
 	Options map[string]string `json:"volumeOptions,omitempty"`
-	// Whether this volume was created for a specific container and will be
-	// removed with it.
-	IsCtrSpecific bool `json:"ctrSpecific"`
+	// Whether this volume is anonymous (will be removed on container exit)
+	IsAnon bool `json:"isAnon"`
 	// UID the volume will be created as.
 	UID int `json:"uid"`
 	// GID the volume will be created as.
@@ -64,6 +64,14 @@ type VolumeState struct {
 	// create time, then cleared after the copy up is done and never set
 	// again.
 	NeedsCopyUp bool `json:"notYetMounted,omitempty"`
+	// NeedsChown indicates that the next time the volume is mounted into
+	// a container, the container will chown the volume to the container process
+	// UID/GID.
+	NeedsChown bool `json:"notYetChowned,omitempty"`
+	// UIDChowned is the UID the volume was chowned to.
+	UIDChowned int `json:"uidChowned,omitempty"`
+	// GIDChowned is the GID the volume was chowned to.
+	GIDChowned int `json:"gidChowned,omitempty"`
 }
 
 // Name retrieves the volume's name
@@ -106,25 +114,73 @@ func (v *Volume) Options() map[string]string {
 	return options
 }
 
-// IsCtrSpecific returns whether this volume was created specifically for a
-// given container. Images with this set to true will be removed when the
-// container is removed with the Volumes parameter set to true.
-func (v *Volume) IsCtrSpecific() bool {
-	return v.config.IsCtrSpecific
+// Anonymous returns whether this volume is anonymous. Anonymous volumes were
+// created with a container, and will be removed when that container is removed.
+func (v *Volume) Anonymous() bool {
+	return v.config.IsAnon
 }
 
 // UID returns the UID the volume will be created as.
-func (v *Volume) UID() int {
-	return v.config.UID
+func (v *Volume) UID() (int, error) {
+	v.lock.Lock()
+	defer v.lock.Unlock()
+
+	if !v.valid {
+		return -1, define.ErrVolumeRemoved
+	}
+
+	if v.state.UIDChowned > 0 {
+		return v.state.UIDChowned, nil
+	}
+	return v.config.UID, nil
 }
 
 // GID returns the GID the volume will be created as.
-func (v *Volume) GID() int {
-	return v.config.GID
+func (v *Volume) GID() (int, error) {
+	v.lock.Lock()
+	defer v.lock.Unlock()
+
+	if !v.valid {
+		return -1, define.ErrVolumeRemoved
+	}
+
+	if v.state.GIDChowned > 0 {
+		return v.state.GIDChowned, nil
+	}
+	return v.config.GID, nil
 }
 
 // CreatedTime returns the time the volume was created at. It was not tracked
 // for some time, so older volumes may not contain one.
 func (v *Volume) CreatedTime() time.Time {
 	return v.config.CreatedTime
+}
+
+// Config returns the volume's configuration.
+func (v *Volume) Config() (*VolumeConfig, error) {
+	config := VolumeConfig{}
+	err := JSONDeepCopy(v.config, &config)
+	return &config, err
+}
+
+// VolumeInUse goes through the container dependencies of a volume
+// and checks if the volume is being used by any container.
+func (v *Volume) VolumeInUse() ([]string, error) {
+	v.lock.Lock()
+	defer v.lock.Unlock()
+
+	if !v.valid {
+		return nil, define.ErrVolumeRemoved
+	}
+	return v.runtime.state.VolumeInUse(v)
+}
+
+// IsDangling returns whether this volume is dangling (unused by any
+// containers).
+func (v *Volume) IsDangling() (bool, error) {
+	ctrs, err := v.VolumeInUse()
+	if err != nil {
+		return false, err
+	}
+	return len(ctrs) == 0, nil
 }

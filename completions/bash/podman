@@ -104,7 +104,7 @@ __podman_complete_containers_running() {
 }
 
 __podman_complete_containers_stopped() {
-	__podman_complete_containers "$@" --filter status=exited
+	__podman_complete_containers "$@" --all --filter status=exited
 }
 
 __podman_complete_containers_unpauseable() {
@@ -366,7 +366,7 @@ __podman_to_extglob() {
 # continue processing its completion.
 #
 # TODO if the preceding command has options that accept arguments and an
-# argument is equal ot one of the subcommands, this is falsely detected as
+# argument is equal to one of the subcommands, this is falsely detected as
 # a match.
 __podman_subcommands() {
 	local subcommands="$1"
@@ -402,6 +402,16 @@ __podman_complete_resolved_hostname() {
 __podman_local_interfaces() {
 	command -v ip >/dev/null 2>&1 || return
 	ip addr show scope global 2>/dev/null | sed -n 's| \+inet \([0-9.]\+\).* \([^ ]\+\)|\1 \2|p'
+}
+
+__podman_complete_restart() {
+	case "$prev" in
+		--restart)
+			COMPREPLY=( $( compgen -W "always no on-failure" -- "$cur") )
+			return
+			;;
+	esac
+	return 1
 }
 
 __podman_complete_local_interfaces() {
@@ -702,6 +712,27 @@ __podman_images() {
 	__podman_q images $images_args | awk "$awk_script" | grep -v '<none>$'
 }
 
+_podman_auto_update() {
+  local options_with_args="
+      --authfile
+  "
+
+  local boolean_options="
+    --help
+    -h
+  "
+
+  _complete_ "$options_with_args" "$boolean_options"
+    case "$cur" in
+        -*)
+            COMPREPLY=($(compgen -W "$boolean_options $options_with_args" -- "$cur"))
+            ;;
+        *)
+            __podman_complete_volume_names
+            ;;
+    esac
+}
+
 # __podman_complete_volumes applies completion of volumes based on the current
 # value of `$cur` or the value of the optional first option `--cur`, if given.
 __podman_complete_volumes() {
@@ -997,8 +1028,11 @@ _podman_network_create() {
 	    ;;
     esac
 }
+
 _podman_network_inspect() {
     local options_with_args="
+	--format
+	-f
      "
     local boolean_options="
 	--help
@@ -1015,6 +1049,9 @@ _podman_network_inspect() {
 
 _podman_network_ls() {
     local options_with_args="
+	--format
+	-f
+	--filter
      "
     local boolean_options="
     --help
@@ -1200,6 +1237,19 @@ _podman_system_prune() {
     esac
 }
 
+_podman_system_service() {
+	local options_with_args="
+	-t
+	--timeout
+	"
+	local boolean_options="
+	      --help
+	      -h
+	      --varlink
+	"
+	_complete_ "$options_with_args" "$boolean_options"
+}
+
 _podman_system() {
     local boolean_options="
 	--help
@@ -1208,8 +1258,11 @@ _podman_system() {
      subcommands="
 	df
 	info
+	migrate
 	prune
+	renumber
 	reset
+	service
      "
      __podman_subcommands "$subcommands" && return
 
@@ -1231,6 +1284,7 @@ _podman_commit() {
 	-c
 	--message
 	-m
+	--iidfile
      "
     local boolean_options="
 	--help
@@ -1298,7 +1352,6 @@ _podman_build() {
      --net
      --network
      --pid
-     --runtime
      --runtime-flag
      --security-opt
      --shm-size
@@ -1316,15 +1369,10 @@ _podman_build() {
      -v
   "
 
-     local all_options="$options_with_args $boolean_options"
-
-     case "$prev" in
-	 --runtime)
-	     COMPREPLY=($(compgen -W 'runc runv' -- "$cur"))
+ case "$prev" in
+	 --file|-f)
+	     COMPREPLY=($(compgen -W "`ls`" -- "$cur"))
 	     ;;
-	 $(__podman_to_extglob "$options_with_args"))
- return
- ;;
  esac
 
  case "$cur" in
@@ -1486,6 +1534,56 @@ _podman_info() {
     esac
 }
 
+_podman_image_umount() {
+     _podman_image_unmount
+}
+
+_podman_image_unmount() {
+    local boolean_options="
+	--all
+	-a
+	--help
+	-h
+	--force
+	-f
+    "
+    local options_with_args="
+    "
+
+    local all_options="$options_with_args $boolean_options"
+    case "$cur" in
+	-*)
+	    COMPREPLY=($(compgen -W "$boolean_options $options_with_args" -- "$cur"))
+	    ;;
+	*)
+	    __podman_complete_images --force-tag --id
+	    ;;
+    esac
+}
+
+_podman_image_mount() {
+    local boolean_options="
+       --all
+       -a
+       --help
+       -h
+    "
+
+    local options_with_args="
+	  --format
+    "
+
+    local all_options="$options_with_args $boolean_options"
+    case "$cur" in
+	-*)
+	    COMPREPLY=($(compgen -W "$boolean_options $options_with_args" -- "$cur"))
+	    ;;
+	*)
+	    __podman_complete_images --force-tag --id
+	    ;;
+    esac
+}
+
 _podman_image_build() {
      _podman_build
 }
@@ -1534,6 +1632,11 @@ _podman_image_tag() {
      _podman_tag
 }
 
+
+_podman_image_untag() {
+     _podman_untag
+}
+
 _podman_image() {
     local boolean_options="
 	--help
@@ -1547,6 +1650,7 @@ _podman_image() {
 	 inspect
 	 load
 	 ls
+	 mount
 	 prune
 	 pull
 	 push
@@ -1555,6 +1659,9 @@ _podman_image() {
 	 sign
 	 tag
 	 trust
+	 umount
+	 unmount
+	 untag
      "
      local aliases="
 	 list
@@ -1722,15 +1829,181 @@ _podman_logs() {
     esac
 }
 
+_podman_manifest() {
+     local boolean_options="
+     --help
+     -h
+     "
+     subcommands="
+     add
+     create
+     inspect
+     push
+     remove
+    "
+     __podman_subcommands "$subcommands" && return
+
+     case "$cur" in
+    -*)
+        COMPREPLY=( $( compgen -W "--help" -- "$cur" ) )
+        ;;
+    *)
+        COMPREPLY=( $( compgen -W "$subcommands" -- "$cur" ) )
+        ;;
+     esac
+}
+
+_podman_manifest_add() {
+	 local options_with_args="
+     --annotation
+     --authfile
+     --cert-dir
+     --creds
+     --arch
+     --features
+     --os
+     --os-version
+     --variant
+     "
+
+     local boolean_options="
+     --all
+     --help
+     -h
+     --tls-verify
+     "
+
+     _complete_ "$options_with_args" "$boolean_options"
+     case "$cur" in
+         -*)
+             COMPREPLY=($(compgen -W "$boolean_options $options_with_args" -- "$cur"))
+             ;;
+         *)
+             __podman_complete_images --id
+             ;;
+     esac
+}
+
+_podman_manifest_annotate() {
+	 local options_with_args="
+     --annotation
+     --arch
+     --features
+     --os
+     --os-features
+     --os-version
+     --variant
+     "
+
+     local boolean_options="
+     --help
+     -h
+     "
+
+     _complete_ "$options_with_args" "$boolean_options"
+     case "$cur" in
+         -*)
+             COMPREPLY=($(compgen -W "$boolean_options $options_with_args" -- "$cur"))
+             ;;
+         *)
+             __podman_complete_images --id
+             ;;
+     esac
+}
+
+_podman_manifest_create() {
+    local boolean_options="
+    --all
+    --help
+    -h
+    "
+
+    _complete_ "$boolean_options"
+}
+
+_podman_manifest_inspect() {
+  local options_with_args="
+  "
+
+  local boolean_options="
+  "
+
+  _complete_ "$options_with_args" "$boolean_options"
+    case "$cur" in
+        -*)
+            COMPREPLY=($(compgen -W "$boolean_options $options_with_args" -- "$cur"))
+            ;;
+        *)
+			__podman_complete_images --id
+
+            ;;
+    esac
+}
+
+_podman_manifest_push() {
+	local options_with_args="
+      --authfile
+      --cert-dir
+      --creds
+      --digestfile
+      --format
+      -f
+      --sign-by
+      --signature-policy,
+    "
+
+    local boolean_options="
+      --all
+      --purge
+      --help
+      -h
+      --remove-signatures
+      --tls-verify
+      --quiet
+    "
+
+  _complete_ "$options_with_args" "$boolean_options"
+    case "$cur" in
+        -*)
+            COMPREPLY=($(compgen -W "$boolean_options $options_with_args" -- "$cur"))
+            ;;
+        *)
+            __podman_complete_images --id
+            ;;
+    esac
+}
+
+_podman_manifest_remove() {
+	local options_with_args="
+    "
+
+    local boolean_options="
+    "
+
+  _complete_ "$options_with_args" "$boolean_options"
+    case "$cur" in
+        -*)
+            COMPREPLY=($(compgen -W "$boolean_options $options_with_args" -- "$cur"))
+            ;;
+        *)
+            __podman_complete_images --id
+            ;;
+    esac
+}
+
 _podman_pull() {
     local options_with_args="
     --authfile
-    --creds
     --cert-dir
+    --creds
+    --override-arch
+    --override-os
+    --override-variant
     "
     local boolean_options="
 	--all-tags
 	-a
+	--disable-content-trust
 	--help
 	-h
 	--quiet
@@ -1852,6 +2125,7 @@ _podman_container_run() {
 		--cap-add
 		--cap-drop
 		--cgroup-parent
+		--cgroup-conf
 		--cidfile
 		--conmon-pidfile
 		--cpu-period
@@ -1863,6 +2137,7 @@ _podman_container_run() {
 		--cpuset-mems
 		--cpu-shares -c
 		--device
+		--device-cgroup-rule
 		--device-read-bps
 		--device-read-iops
 		--device-write-bps
@@ -1877,6 +2152,11 @@ _podman_container_run() {
 		--expose
 		--gidmap
 		--group-add
+		--health-cmd
+		--health-interval
+		--health-retries
+		--health-start-period
+		--health-timeout
 		--hostname -h
 		--http-proxy
 		--image-volume
@@ -1895,24 +2175,33 @@ _podman_container_run() {
 		--memory-reservation
 		--name
 		--network
+		--no-healthcheck
 		--no-hosts
 		--oom-score-adj
+		--override-arch
+		--override-os
+		--override-variant
 		--pid
 		--pids-limit
 		--pod
+		--pod-id-file
+		--preserve-fds
 		--publish -p
 		--pull
+		--restart
 		--runtime
 		--rootfs
 		--security-opt
 		--shm-size
 		--stop-signal
 		--stop-timeout
-		--tmpfs
 		--subgidname
 		--subuidname
 		--sysctl
 		--systemd
+		--tmpfs
+		--tz
+		--umask
 		--uidmap
 		--ulimit
 		--user -u
@@ -1950,9 +2239,11 @@ _podman_container_run() {
 		boolean_options="$boolean_options
 			--detach -d
 			--rm
+			--rmi
 			--sig-proxy=false
 		"
 		__podman_complete_detach_keys && return
+		__podman_complete_restart && return
 	fi
 
     case "$cur" in
@@ -2003,7 +2294,7 @@ _podman_container_run() {
 			__podman_complete_capabilities
 			return
 			;;
-		--cidfile|--env-file|--init-path|--label-file)
+		--cidfile|--env-file|--init-path|--label-file|--pod-id-file)
 			_filedir
 			return
 			;;
@@ -2036,7 +2327,7 @@ _podman_container_run() {
 					__podman_complete_containers_running
 					;;
 				*)
-					COMPREPLY=( $( compgen -W 'host container:' -- "$cur" ) )
+					COMPREPLY=( $( compgen -W 'host private container:' -- "$cur" ) )
 					if [ "$COMPREPLY" = "container:" ]; then
 						__podman_nospace
 					fi
@@ -2058,7 +2349,7 @@ _podman_container_run() {
 					__podman_complete_containers_all --cur "${cur#*:}"
 					;;
 				*)
-					COMPREPLY=( $( compgen -W "$(__podman_plugins_bundled --type Network) $(__podman_networks) container:" -- "$cur") )
+					COMPREPLY=( $(compgen -W "bridge none host ns: private slirp4netns $(__podman_networks) container:" -- "$cur"))
 					if [ "${COMPREPLY[*]}" = "container:" ] ; then
 						__podman_nospace
 					fi
@@ -2076,7 +2367,7 @@ _podman_container_run() {
 					__podman_complete_containers_running --cur "${cur#*:}"
 					;;
 				*)
-					COMPREPLY=( $( compgen -W 'host container:' -- "$cur" ) )
+					COMPREPLY=( $( compgen -W 'host container: private' -- "$cur" ) )
 					if [ "$COMPREPLY" = "container:" ]; then
 						__podman_nospace
 					fi
@@ -2105,7 +2396,7 @@ _podman_container_run() {
 			return
 			;;
 		--userns)
-			COMPREPLY=( $( compgen -W "host" -- "$cur" ) )
+			COMPREPLY=( $( compgen -W "auto container: host keep-id ns: private" -- "$cur" ) )
 			return
 			;;
 		--volumes-from)
@@ -2142,7 +2433,7 @@ _podman_run() {
 
 _podman_restart() {
      local options_with_args="
-     --timeout -t
+     --time -t
      "
      local boolean_options="
 	  --all
@@ -2152,8 +2443,6 @@ _podman_restart() {
 	  --latest
 	  -l
 	  --running
-	  --timeout
-	  -t
      "
      case "$cur" in
 	-*)
@@ -2240,6 +2529,23 @@ _podman_stats() {
 }
 
 _podman_tag() {
+    local options_with_args="
+    "
+    local boolean_options="
+	--help
+	-h
+    "
+    case "$cur" in
+	-*)
+	    COMPREPLY=($(compgen -W "$boolean_options $options_with_args" -- "$cur"))
+	    ;;
+	*)
+	    __podman_complete_images
+	    ;;
+    esac
+}
+
+_podman_untag() {
     local options_with_args="
     "
     local boolean_options="
@@ -2389,6 +2695,7 @@ _podman_ps() {
 	  --pod -p
 	  --quiet -q
 	  --size -s
+	  --storage
 	  --namespace --ns
 	  --sync
      "
@@ -2437,13 +2744,13 @@ _podman_start() {
 	    COMPREPLY=($(compgen -W "$boolean_options $options_with_args" -- "$cur"))
 	    ;;
 	*)
-	    __podman_complete_container_names
+	    __podman_complete_containers_stopped
 	    ;;
     esac
 }
 _podman_stop() {
      local options_with_args="
-     --timeout -t
+     --time -t
      "
      local boolean_options="
 	  --all
@@ -2637,7 +2944,10 @@ _podman_generate_systemd() {
     local options_with_args="
     --restart-policy
     -t
-    --timeout"
+    --time
+	--container-prefix
+	--pod-prefix
+	--separator"
 
     local boolean_options="
     -h
@@ -2664,6 +2974,7 @@ _podman_play_kube() {
     --authfile
     --cert-dir
     --creds
+    --network
     "
 
     local boolean_options="
@@ -2672,6 +2983,7 @@ _podman_play_kube() {
     --quiet
     -q
     --tls-verify
+    --seccomp-profile-root
     "
 
     case "$cur" in
@@ -2885,13 +3197,22 @@ _podman_image_exists() {
 
 _podman_pod_create() {
   local options_with_args="
+      --add-host
       --cgroup-parent
+      --dns
+      --dns-opt
+      --dns-search
       --infra-command
+      --infra-conmon-pidfile
       --infra-image
+      --ip
       --label-file
       --label
       -l
+      --mac-address
       --name
+      --network
+      --no-hosts
       --podidfile
       --publish
       -p
@@ -2902,6 +3223,7 @@ _podman_pod_create() {
       --help
       -h
       --infra
+      --replace
   "
   _complete_ "$options_with_args" "$boolean_options"
 }
@@ -3009,6 +3331,7 @@ _podman_pod_restart() {
 
 _podman_pod_rm() {
   local options_with_args="
+      --pod-id-file
   "
 
   local boolean_options="
@@ -3036,6 +3359,7 @@ _podman_pod_rm() {
 
 _podman_pod_start() {
   local options_with_args="
+      --pod-id-file
   "
 
   local boolean_options="
@@ -3060,7 +3384,8 @@ _podman_pod_start() {
 _podman_pod_stop() {
   local options_with_args="
       -t
-      --timeout
+      --time
+      --pod-id-file
   "
 
   local boolean_options="
@@ -3131,6 +3456,18 @@ _podman_pod_unpause() {
     esac
 }
 
+_podman_pod_inspect() {
+  local options_with_args="
+   --format
+   -f
+   --latest
+   -l
+  "
+
+  _complete_ "$options_with_args"
+}
+
+
 _podman_pod() {
     local boolean_options="
 	--help
@@ -3148,6 +3485,7 @@ _podman_pod() {
      stop
      top
      unpause
+     inspect
     "
     local aliases="
      list
@@ -3289,24 +3627,34 @@ _podman_volume() {
 
 _podman_podman() {
      local options_with_args="
-	   --config -c
-	   --cpu-profile
+	   --cni-config-dir
+	   --conmon
+	   --connection -c
+	   --events-backend
+	   --hooks-dir
+	   --identity
+	   --log-level
+	   --namespace
+	   --network-cmd-path
 	   --root
 	   --runroot
 	   --storage-driver
 	   --storage-opt
-	   --log-level
-	   --namespace
-    "
+	   --tmpdir
+	   --runtime
+	   --url
+     "
      local boolean_options="
 	   --help
-	   -h
-	   --version
-	   -v
 	   --syslog
+	   --version
+	   -h
+	   -r, --remote
+	   -v
      "
-     commands="
+    commands="
     attach
+    auto-update
     build
     commit
     container
@@ -3329,7 +3677,9 @@ _podman_podman() {
     login
     logout
     logs
+    manifest
     mount
+    network
     pause
     pod
     port
@@ -3346,11 +3696,13 @@ _podman_podman() {
     start
     stats
     stop
+    system
     tag
     top
     umount
     unmount
     unpause
+    untag
     varlink
     version
     volume

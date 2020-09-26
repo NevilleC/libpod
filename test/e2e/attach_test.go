@@ -1,5 +1,3 @@
-// +build !remoteclient
-
 package integration
 
 import (
@@ -7,7 +5,7 @@ import (
 	"syscall"
 	"time"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -33,7 +31,6 @@ var _ = Describe("Podman attach", func() {
 		podmanTest.Cleanup()
 		f := CurrentGinkgoTestDescription()
 		processTestResult(f)
-
 	})
 
 	It("podman attach to bogus container", func() {
@@ -54,6 +51,7 @@ var _ = Describe("Podman attach", func() {
 
 	It("podman container attach to non-running container", func() {
 		session := podmanTest.Podman([]string{"container", "create", "--name", "test1", "-d", "-i", ALPINE, "ls"})
+
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 
@@ -96,7 +94,11 @@ var _ = Describe("Podman attach", func() {
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 
-		results := podmanTest.Podman([]string{"attach", "-l"})
+		cid := "-l"
+		if IsRemote() {
+			cid = "test2"
+		}
+		results := podmanTest.Podman([]string{"attach", cid})
 		time.Sleep(2 * time.Second)
 		results.Signal(syscall.SIGTSTP)
 		Expect(results.OutputToString()).To(ContainSubstring("test2"))

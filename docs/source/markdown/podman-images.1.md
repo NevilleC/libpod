@@ -29,11 +29,11 @@ Filter output based on conditions provided
 
   Filters:
 
-  **after==TIMESTRING**
-    Filter on images created after the given time.Time.
+  **since=IMAGE**
+    Filter on images created after the given IMAGE (name or tag).
 
-  **before==TIMESTRING**
-    Filter on images created before the given time.Time.
+  **before=IMAGE**
+    Filter on images created before the given IMAGE (name or tag).
 
   **dangling=true|false**
     Show dangling images. Dangling images are a file system layer that was used in a previous build of an image and is no longer referenced by any active images. They are denoted with the <none> tag, consume disk space and serve no active purpose.
@@ -51,6 +51,18 @@ Filter output based on conditions provided
 
 Change the default output format.  This can be of a supported type like 'json'
 or a Go template.
+Valid placeholders for the Go template are listed below:
+
+| **Placeholder** | **Description**                                                               |
+| --------------- | ----------------------------------------------------------------------------- |
+| .ID             | Image ID                                                                      |
+| .Repository     | Image repository                                                              |
+| .Tag            | Image tag                                                                     |
+| .Digest         | Image digest                                                                  |
+| .CreatedSince   | Elapsed time since the image was created			     					  |
+| .CreatedAt      | Time when the image was created                                               |
+| .Size           | Size of layer on disk                                                         |
+| .History        | History of the image layer                                                    |
 
 **--history**
 
@@ -60,7 +72,7 @@ Display the history of image names.  If an image gets re-tagged or untagged, the
 
 Omit the table headings from the listing of images.
 
-**--no-trunc**, **--notruncate**
+**--no-trunc**
 
 Do not truncate output.
 

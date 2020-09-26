@@ -6,8 +6,8 @@ PODMAN=${PODMAN:-podman}
 # Standard image to use for most tests
 PODMAN_TEST_IMAGE_REGISTRY=${PODMAN_TEST_IMAGE_REGISTRY:-"quay.io"}
 PODMAN_TEST_IMAGE_USER=${PODMAN_TEST_IMAGE_USER:-"libpod"}
-PODMAN_TEST_IMAGE_NAME=${PODMAN_TEST_IMAGE_NAME:-"alpine_labels"}
-PODMAN_TEST_IMAGE_TAG=${PODMAN_TEST_IMAGE_TAG:-"latest"}
+PODMAN_TEST_IMAGE_NAME=${PODMAN_TEST_IMAGE_NAME:-"testimage"}
+PODMAN_TEST_IMAGE_TAG=${PODMAN_TEST_IMAGE_TAG:-"20200917"}
 PODMAN_TEST_IMAGE_FQN="$PODMAN_TEST_IMAGE_REGISTRY/$PODMAN_TEST_IMAGE_USER/$PODMAN_TEST_IMAGE_NAME:$PODMAN_TEST_IMAGE_TAG"
 
 # Because who wants to spell that out each time?
@@ -15,6 +15,12 @@ IMAGE=$PODMAN_TEST_IMAGE_FQN
 
 # Default timeout for a podman command.
 PODMAN_TIMEOUT=${PODMAN_TIMEOUT:-60}
+
+# Prompt to display when logging podman commands; distinguish root/rootless
+_LOG_PROMPT='$'
+if [ $(id -u) -eq 0 ]; then
+    _LOG_PROMPT='#'
+fi
 
 ###############################################################################
 # BEGIN setup/teardown tools
@@ -61,7 +67,7 @@ function basic_teardown() {
     run_podman '?' pod rm --all --force
     run_podman '?'     rm --all --force
 
-    /bin/rm -rf $PODMAN_TMPDIR
+    command rm -rf $PODMAN_TMPDIR
 }
 
 
@@ -132,7 +138,7 @@ function run_podman() {
     esac
 
     # stdout is only emitted upon error; this echo is to help a debugger
-    echo "\$ $PODMAN $*"
+    echo "$_LOG_PROMPT $PODMAN $*"
     # BATS hangs if a subprocess remains and keeps FD 3 open; this happens
     # if podman crashes unexpectedly without cleaning up subprocesses.
     run timeout --foreground -v --kill=10 $PODMAN_TIMEOUT $PODMAN "$@" 3>/dev/null
@@ -192,13 +198,22 @@ function wait_for_output {
         fi
     done
 
-    [ -n "$cid" ] || die "FATAL: wait_for_ready: no container name/ID in '$*'"
+    [ -n "$cid" ] || die "FATAL: wait_for_output: no container name/ID in '$*'"
 
     t1=$(expr $SECONDS + $how_long)
     while [ $SECONDS -lt $t1 ]; do
         run_podman logs $cid
-        if expr "$output" : ".*$expect" >/dev/null; then
+        logs=$output
+        if expr "$logs" : ".*$expect" >/dev/null; then
             return
+        fi
+
+        # Barf if container is not running
+        run_podman inspect --format '{{.State.Running}}' $cid
+        if [ $output != "true" ]; then
+            run_podman inspect --format '{{.State.ExitCode}}' $cid
+            exitcode=$output
+            die "Container exited (status: $exitcode) before we saw '$expect': $logs"
         fi
 
         sleep $sleep_delay
@@ -225,12 +240,29 @@ function is_remote() {
     [[ "$PODMAN" =~ -remote ]]
 }
 
+###########################
+#  _add_label_if_missing  #  make sure skip messages include rootless/remote
+###########################
+function _add_label_if_missing() {
+    local msg="$1"
+    local want="$2"
+
+    if [ -z "$msg" ]; then
+        echo
+    elif expr "$msg" : ".*$want" &>/dev/null; then
+        echo "$msg"
+    else
+        echo "[$want] $msg"
+    fi
+}
+
 ######################
 #  skip_if_rootless  #  ...with an optional message
 ######################
 function skip_if_rootless() {
     if is_rootless; then
-        skip "${1:-not applicable under rootless podman}"
+        local msg=$(_add_label_if_missing "$1" "rootless")
+        skip "${msg:-not applicable under rootless podman}"
     fi
 }
 
@@ -239,25 +271,16 @@ function skip_if_rootless() {
 ####################
 function skip_if_remote() {
     if is_remote; then
-        skip "${1:-test does not work with podman-remote}"
+        local msg=$(_add_label_if_missing "$1" "remote")
+        skip "${msg:-test does not work with podman-remote}"
     fi
-}
-
-#########################
-#  skip_if_not_systemd  #  ...with an optional message
-#########################
-function skip_if_not_systemd() {
-    if systemctl --user >/dev/null 2>&1; then
-        return
-    fi
-
-    skip "${1:-no systemd or daemon does not respond}"
 }
 
 #########
 #  die  #  Abort with helpful message
 #########
 function die() {
+    # FIXME: handle multi-line output
     echo "#/vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"  >&2
     echo "#| FAIL: $*"                                           >&2
     echo "#\\^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^" >&2
@@ -353,7 +376,12 @@ function parse_table() {
         while read col; do
             dprint "col=<<$col>>"
             row+=("$col")
-        done <  <(echo "$line" | tr '|' '\012' | sed -e 's/^ *//' -e 's/\\/\\\\/g')
+        done <  <(echo "$line" | sed -E -e 's/(^|\s)\|(\s|$)/\n /g' | sed -e 's/^ *//' -e 's/\\/\\\\/g')
+        # the above seds:
+        #   1) Convert '|' to newline, but only if bracketed by spaces or
+        #      at beginning/end of line (this allows 'foo|bar' in tests);
+        #   2) then remove leading whitespace;
+        #   3) then double-escape all backslashes
 
         printf "%q " "${row[@]}"
         printf "\n"
@@ -374,6 +402,35 @@ function random_string() {
 }
 
 
+###########################
+#  random_rfc1918_subnet  #
+###########################
+#
+# Use the class B set, because much of our CI environment (Google, RH)
+# already uses up much of the class A, and it's really hard to test
+# if a block is in use.
+#
+# This returns THREE OCTETS! It is up to our caller to append .0/24, .255, &c.
+#
+function random_rfc1918_subnet() {
+    local retries=1024
+
+    while [ "$retries" -gt 0 ];do
+        local cidr=172.$(( 16 + $RANDOM % 16 )).$(( $RANDOM & 255 ))
+
+        in_use=$(ip route list | fgrep $cidr)
+        if [ -z "$in_use" ]; then
+            echo "$cidr"
+            return
+        fi
+
+        retries=$(( retries - 1 ))
+    done
+
+    die "Could not find a random not-in-use rfc1918 subnet"
+}
+
+
 #########################
 #  find_exec_pid_files  #  Returns nothing or exec_pid hash files
 #########################
@@ -381,11 +438,49 @@ function random_string() {
 # Return exec_pid hash files if exists, otherwise, return nothing
 #
 function find_exec_pid_files() {
-    run_podman info --format '{{.store.RunRoot}}'
+    run_podman info --format '{{.Store.RunRoot}}'
     local storage_path="$output"
     if [ -d $storage_path ]; then
         find $storage_path -type f -iname 'exec_pid_*'
     fi
 }
+
+
+#############################
+#  remove_same_dev_warning  #  Filter out useless warning from output
+#############################
+#
+# On some CI systems, 'podman run --privileged' emits a useless warning:
+#
+#    WARNING: The same type, major and minor should not be used for multiple devices.
+#
+# This obviously screws us up when we look at output results.
+#
+# This function removes the warning from $output and $lines. We don't
+# do a full string match because there's another variant of that message:
+#
+#    WARNING: Creating device "/dev/null" with same type, major and minor as existing "/dev/foodevdir/null".
+#
+# (We should never again see that precise error ever again, but we could
+# see variants of it).
+#
+function remove_same_dev_warning() {
+    # No input arguments. We operate in-place on $output and $lines
+
+    local i=0
+    local -a new_lines=()
+    while [[ $i -lt ${#lines[@]} ]]; do
+        if expr "${lines[$i]}" : 'WARNING: .* same type, major' >/dev/null; then
+            :
+        else
+            new_lines+=("${lines[$i]}")
+        fi
+        i=$(( i + 1 ))
+    done
+
+    lines=("${new_lines[@]}")
+    output=$(printf '%s\n' "${lines[@]}")
+}
+
 # END   miscellaneous tools
 ###############################################################################

@@ -1,5 +1,3 @@
-// +build !remoteclient
-
 package integration
 
 import (
@@ -7,7 +5,7 @@ import (
 	"os"
 	"strings"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -49,14 +47,17 @@ var _ = Describe("Podman port", func() {
 	})
 
 	It("podman port -l nginx", func() {
-		session, cid := podmanTest.RunNginxWithHealthCheck("")
+		session, cid := podmanTest.RunNginxWithHealthCheck("test1")
 		Expect(session.ExitCode()).To(Equal(0))
 
 		if err := podmanTest.RunHealthCheck(cid); err != nil {
 			Fail(err.Error())
 		}
 
-		result := podmanTest.Podman([]string{"port", "-l"})
+		if !IsRemote() {
+			cid = "-l"
+		}
+		result := podmanTest.Podman([]string{"port", cid})
 		result.WaitWithDefaultTimeout()
 		Expect(result.ExitCode()).To(Equal(0))
 		port := strings.Split(result.OutputToStringArray()[0], ":")[1]
@@ -71,7 +72,10 @@ var _ = Describe("Podman port", func() {
 			Fail(err.Error())
 		}
 
-		result := podmanTest.Podman([]string{"container", "port", "-l"})
+		if !IsRemote() {
+			cid = "-l"
+		}
+		result := podmanTest.Podman([]string{"container", "port", cid})
 		result.WaitWithDefaultTimeout()
 		Expect(result.ExitCode()).To(Equal(0))
 		port := strings.Split(result.OutputToStringArray()[0], ":")[1]
@@ -86,7 +90,10 @@ var _ = Describe("Podman port", func() {
 			Fail(err.Error())
 		}
 
-		result := podmanTest.Podman([]string{"port", "-l", "80"})
+		if !IsRemote() {
+			cid = "-l"
+		}
+		result := podmanTest.Podman([]string{"port", cid, "80"})
 		result.WaitWithDefaultTimeout()
 		Expect(result.ExitCode()).To(Equal(0))
 		port := strings.Split(result.OutputToStringArray()[0], ":")[1]
@@ -127,18 +134,18 @@ var _ = Describe("Podman port", func() {
 		lock2 := GetPortLock("5001")
 		defer lock2.Unlock()
 
-		setup := podmanTest.Podman([]string{"run", "-dt", "-p", "5000:5000", "-p", "5001:5001", ALPINE, "top"})
+		setup := podmanTest.Podman([]string{"run", "--name", "test", "-dt", "-p", "5000:5000", "-p", "5001:5001", ALPINE, "top"})
 		setup.WaitWithDefaultTimeout()
 		Expect(setup.ExitCode()).To(BeZero())
 
 		// Check that the first port was honored
-		result1 := podmanTest.Podman([]string{"port", "-l", "5000"})
+		result1 := podmanTest.Podman([]string{"port", "test", "5000"})
 		result1.WaitWithDefaultTimeout()
 		Expect(result1.ExitCode()).To(BeZero())
 		Expect(result1.LineInOuputStartsWith("0.0.0.0:5000")).To(BeTrue())
 
 		// Check that the second port was honored
-		result2 := podmanTest.Podman([]string{"port", "-l", "5001"})
+		result2 := podmanTest.Podman([]string{"port", "test", "5001"})
 		result2.WaitWithDefaultTimeout()
 		Expect(result2.ExitCode()).To(BeZero())
 		Expect(result2.LineInOuputStartsWith("0.0.0.0:5001")).To(BeTrue())

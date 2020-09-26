@@ -1,4 +1,4 @@
-// +build !remoteclient
+// +build !remote
 
 package integration
 
@@ -11,8 +11,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/containers/libpod/pkg/rootless"
-	. "github.com/containers/libpod/test/utils"
+	"github.com/containers/podman/v2/pkg/rootless"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"golang.org/x/sys/unix"
@@ -47,7 +47,7 @@ var _ = Describe("Podman run with --sig-proxy", func() {
 
 	Specify("signals are forwarded to container using sig-proxy", func() {
 		if podmanTest.Host.Arch == "ppc64le" {
-			Skip("Doesnt work on ppc64le")
+			Skip("Doesn't work on ppc64le")
 		}
 		signal := syscall.SIGFPE
 		// Set up a socket for communication
@@ -132,7 +132,7 @@ var _ = Describe("Podman run with --sig-proxy", func() {
 		Expect(killSession.ExitCode()).To(Equal(0))
 
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(137))
+		Expect(session.ExitCode()).ToNot(Equal(0))
 		ok, _ = session.GrepString("Received")
 		Expect(ok).To(BeFalse())
 	})

@@ -10,7 +10,7 @@ podman\-system\-df - Show podman disk usage
 Show podman disk usage
 
 ## OPTIONS
-**--format=***format*
+**--format**=*format*
 
 Pretty-print images using a Go template
 
@@ -18,7 +18,7 @@ Pretty-print images using a Go template
 Show detailed information on space usage
 
 ## EXAMPLE
-
+```
 $ podman system df
 TYPE            TOTAL   ACTIVE   SIZE    RECLAIMABLE
 Images          6       2        281MB   168MB (59%)
@@ -49,7 +49,7 @@ $ podman system df --format "{{.Type}}\t{{.Total}}"
 Images          1
 Containers      5
 Local Volumes   1
-
+```
 ## SEE ALSO
 podman-system(1)
 

@@ -1,5 +1,3 @@
-// +build !remoteclient
-
 package integration
 
 import (
@@ -7,10 +5,11 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"regexp"
 	"strconv"
 	"text/template"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -100,6 +99,15 @@ registries = ['{{.Host}}:{{.Port}}']`
 		Expect(search.LineInOutputContains("quay.io/libpod/gate")).To(BeTrue())
 	})
 
+	It("podman search image with description", func() {
+		search := podmanTest.Podman([]string{"search", "quay.io/libpod/whalesay"})
+		search.WaitWithDefaultTimeout()
+		Expect(search.ExitCode()).To(Equal(0))
+		output := string(search.Out.Contents())
+		match, _ := regexp.MatchString(`(?m)^quay.io\s+quay.io/libpod/whalesay\s+Static image used for automated testing.+$`, output)
+		Expect(match).To(BeTrue())
+	})
+
 	It("podman search format flag", func() {
 		search := podmanTest.Podman([]string{"search", "--format", "table {{.Index}} {{.Name}}", "alpine"})
 		search.WaitWithDefaultTimeout()
@@ -164,13 +172,6 @@ registries = ['{{.Host}}:{{.Port}}']`
 		}
 	})
 
-	It("podman search v2 registry with empty query", func() {
-		search := podmanTest.Podman([]string{"search", "registry.fedoraproject.org/"})
-		search.WaitWithDefaultTimeout()
-		Expect(search.ExitCode()).To(Equal(0))
-		Expect(len(search.OutputToStringArray())).To(BeNumerically(">=", 1))
-	})
-
 	It("podman search attempts HTTP if tls-verify flag is set false", func() {
 		if podmanTest.Host.Arch == "ppc64le" {
 			Skip("No registry image for ppc64le")
@@ -225,9 +226,18 @@ registries = ['{{.Host}}:{{.Port}}']`
 
 		Expect(search.ExitCode()).To(Equal(0))
 		Expect(search.OutputToString()).ShouldNot(BeEmpty())
+
+		// podman search v2 registry with empty query
+		searchEmpty := podmanTest.PodmanNoCache([]string{"search", fmt.Sprintf("%s/", registryEndpoints[3].Address()), "--tls-verify=false"})
+		searchEmpty.WaitWithDefaultTimeout()
+		Expect(searchEmpty.ExitCode()).To(BeZero())
+		Expect(len(searchEmpty.OutputToStringArray())).To(BeNumerically(">=", 1))
+		match, _ := search.GrepString("my-alpine")
+		Expect(match).Should(BeTrue())
 	})
 
 	It("podman search attempts HTTP if registry is in registries.insecure and force secure is false", func() {
+		SkipIfRemote("FIXME This should work on podman-remote")
 		if podmanTest.Host.Arch == "ppc64le" {
 			Skip("No registry image for ppc64le")
 		}
@@ -268,6 +278,7 @@ registries = ['{{.Host}}:{{.Port}}']`
 	})
 
 	It("podman search doesn't attempt HTTP if force secure is true", func() {
+		SkipIfRemote("FIXME This should work on podman-remote")
 		if podmanTest.Host.Arch == "ppc64le" {
 			Skip("No registry image for ppc64le")
 		}
@@ -306,6 +317,7 @@ registries = ['{{.Host}}:{{.Port}}']`
 	})
 
 	It("podman search doesn't attempt HTTP if registry is not listed as insecure", func() {
+		SkipIfRemote("FIXME This should work on podman-remote")
 		if podmanTest.Host.Arch == "ppc64le" {
 			Skip("No registry image for ppc64le")
 		}
@@ -344,6 +356,7 @@ registries = ['{{.Host}}:{{.Port}}']`
 	})
 
 	It("podman search doesn't attempt HTTP if one registry is not listed as insecure", func() {
+		SkipIfRemote("FIXME This should work on podman-remote")
 		if podmanTest.Host.Arch == "ppc64le" {
 			Skip("No registry image for ppc64le")
 		}
@@ -394,9 +407,20 @@ registries = ['{{.Host}}:{{.Port}}']`
 
 	// search should fail with nonexist authfile
 	It("podman search fail with nonexist --authfile", func() {
-		SkipIfRemote()
 		search := podmanTest.Podman([]string{"search", "--authfile", "/tmp/nonexist", ALPINE})
 		search.WaitWithDefaultTimeout()
 		Expect(search.ExitCode()).To(Not(Equal(0)))
+	})
+
+	It("podman search with wildcards", func() {
+		search := podmanTest.Podman([]string{"search", "--limit", "30", "registry.redhat.io/*"})
+		search.WaitWithDefaultTimeout()
+		Expect(search.ExitCode()).To(Equal(0))
+		Expect(len(search.OutputToStringArray())).To(Equal(31))
+
+		search = podmanTest.Podman([]string{"search", "registry.redhat.io/*openshift*"})
+		search.WaitWithDefaultTimeout()
+		Expect(search.ExitCode()).To(Equal(0))
+		Expect(len(search.OutputToStringArray()) > 1).To(BeTrue())
 	})
 })

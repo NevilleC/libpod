@@ -1,3 +1,5 @@
+// +build varlink
+
 package endpoint
 
 import (
@@ -11,8 +13,8 @@ import (
 	"syscall"
 	"time"
 
-	iopodman "github.com/containers/libpod/cmd/podman/varlink"
-	"github.com/containers/libpod/pkg/rootless"
+	"github.com/containers/podman/v2/pkg/rootless"
+	iopodman "github.com/containers/podman/v2/pkg/varlink"
 	. "github.com/onsi/ginkgo"
 	"github.com/onsi/gomega/gexec"
 )
@@ -26,10 +28,10 @@ var (
 	ImageCacheDir    = "/tmp/podman/imagecachedir"
 	VarlinkBinary    = "/usr/bin/varlink"
 	ALPINE           = "docker.io/library/alpine:latest"
-	infra            = "k8s.gcr.io/pause:3.1"
+	infra            = "k8s.gcr.io/pause:3.2"
 	BB               = "docker.io/library/busybox:latest"
 	redis            = "docker.io/library/redis:alpine"
-	fedoraMinimal    = "registry.fedoraproject.org/fedora-minimal:latest"
+	fedoraMinimal    = "quay.io/libpod/fedora-minimal:latest"
 )
 
 type EndpointTestIntegration struct {
@@ -71,9 +73,9 @@ func (p *EndpointTestIntegration) startVarlink(useImageCache bool) {
 		os.MkdirAll("/run/podman", 0755)
 	}
 	varlinkEndpoint := p.VarlinkEndpoint
-	//p.SetVarlinkAddress(p.VarlinkEndpoint)
+	//p.SetVarlinkAddress(p.RemoteSocket)
 
-	args := []string{"varlink", "--timeout", "0", varlinkEndpoint}
+	args := []string{"varlink", "--time", "0", varlinkEndpoint}
 	podmanOptions := getVarlinkOptions(p, args)
 	if useImageCache {
 		cacheOptions := []string{"--storage-opt", fmt.Sprintf("%s.imagestore=%s", p.ImageCacheFS, p.ImageCacheDir)}
@@ -190,12 +192,12 @@ func (p *EndpointTestIntegration) Varlink(endpoint, message string, more bool) *
 }
 
 func (s *EndpointSession) StdErrToString() string {
-	fields := strings.Fields(fmt.Sprintf("%s", s.Err.Contents()))
+	fields := strings.Fields(string(s.Err.Contents()))
 	return strings.Join(fields, " ")
 }
 
 func (s *EndpointSession) OutputToString() string {
-	fields := strings.Fields(fmt.Sprintf("%s", s.Out.Contents()))
+	fields := strings.Fields(string(s.Out.Contents()))
 	return strings.Join(fields, " ")
 }
 

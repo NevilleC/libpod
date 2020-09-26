@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -e
 
@@ -6,15 +6,19 @@ source $(dirname $0)/lib.sh
 
 req_env_var USER HOME GOSRC SCRIPT_BASE SETUP_MARKER_FILEPATH
 
-show_env_vars
-
 # Ensure this script only executes successfully once and always logs ending timestamp
-[[ ! -e "$SETUP_MARKER_FILEPATH" ]] || exit 0
+if [[ -e "$SETUP_MARKER_FILEPATH" ]]; then
+    show_env_vars
+    exit 0
+fi
+
 exithandler() {
     RET=$?
     echo "."
     echo "$(basename $0) exit status: $RET"
     [[ "$RET" -eq "0" ]] && date +%s >> "$SETUP_MARKER_FILEPATH"
+    show_env_vars
+    [[ "$RET" -eq "0" ]] || warn "Non-zero exit caused by error ABOVE env. var. display."
 }
 trap exithandler EXIT
 
@@ -29,24 +33,21 @@ done
 
 # Sometimes environment setup needs to vary between distros
 # Note: This should only be used for environment variables, and temporary workarounds.
-#       Anything externally dependent, should be made fixed-in-time by adding to
-#       contrib/cirrus/packer/*_setup.sh to be incorporated into VM cache-images
-#       (see docs).
 cd "${GOSRC}/"
 case "${OS_RELEASE_ID}" in
     ubuntu)
-        CRIO_RUNC_PATH="/usr/lib/cri-o-runc/sbin/runc"
-        if dpkg -L cri-o-runc | grep -m 1 -q "$CRIO_RUNC_PATH"
-        then
-            echo "Linking $CRIO_RUNC_PATH to /usr/bin/runc for ease of testing."
-            ln -f "$CRIO_RUNC_PATH" "/usr/bin/runc"
-        fi
         ;;
     fedora)
         # All SELinux distros need this for systemd-in-a-container
         setsebool container_manage_cgroup true
+
         if [[ "$ADD_SECOND_PARTITION" == "true" ]]; then
-            bash "$SCRIPT_BASE/add_second_partition.sh"; fi
+            bash "$SCRIPT_BASE/add_second_partition.sh"
+        fi
+
+        warn "Forcing systemd cgroup manager"
+        X=$(echo "export CGROUP_MANAGER=systemd" | \
+            tee -a /etc/environment) && eval "$X" && echo "$X"
         ;;
     centos)  # Current VM is an image-builder-image no local podman/testing
         echo "No further setup required for VM image building"
@@ -58,18 +59,41 @@ esac
 # Reload to incorporate any changes from above
 source "$SCRIPT_BASE/lib.sh"
 
+case "$CG_FS_TYPE" in
+    tmpfs)
+        warn "Forcing testing with runc instead of crun"
+        # On ubuntu, the default runc is usually not new enough.
+        if [[ "$OS_RELEASE_ID" == "ubuntu" ]]; then
+            X=$(echo "export OCI_RUNTIME=/usr/lib/cri-o-runc/sbin/runc" | \
+                tee -a /etc/environment) && eval "$X" && echo "$X"
+        else
+            X=$(echo "export OCI_RUNTIME=/usr/bin/runc" | \
+                tee -a /etc/environment) && eval "$X" && echo "$X"
+        fi
+        ;;
+    cgroup2fs)
+        # This is necessary since we've built/installed from source, which uses runc as the default.
+        warn "Forcing testing with crun instead of runc"
+        X=$(echo "export OCI_RUNTIME=/usr/bin/crun" | \
+            tee -a /etc/environment) && eval "$X" && echo "$X"
+        ;;
+    *)
+        die 110 "Unsure how to handle cgroup filesystem type '$CG_FS_TYPE'"
+        ;;
+esac
+
 # Must execute before possible setup_rootless()
 make install.tools
 
 case "$SPECIALMODE" in
-    cgroupv2)
-        remove_packaged_podman_files  # we're building from source
-        ;;
     none)
         [[ -n "$CROSS_PLATFORM" ]] || \
             remove_packaged_podman_files
         ;;
     endpoint)
+        remove_packaged_podman_files
+        ;;
+    bindings)
         remove_packaged_podman_files
         ;;
     rootless)
@@ -80,7 +104,7 @@ case "$SPECIALMODE" in
                 tee -a /etc/environment) && eval "$X" && echo "$X"
             X=$(echo "export SPECIALMODE='${SPECIALMODE}'" | \
                 tee -a /etc/environment) && eval "$X" && echo "$X"
-            X=$(echo "export TEST_REMOTE_CLIENT='${TEST_REMOTE_CLIENT}'" | \
+            X=$(echo "export RCLI='${RCLI}'" | \
                 tee -a /etc/environment) && eval "$X" && echo "$X"
             setup_rootless
         fi

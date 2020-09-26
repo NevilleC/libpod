@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -e
 
@@ -12,6 +12,7 @@ make localunit
 
 case "$SPECIALMODE" in
     in_podman) ;&
+    bindings) ;&
     rootless) ;&
     none)
         make

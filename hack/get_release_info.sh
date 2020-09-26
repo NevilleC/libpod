@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # This script produces various bits of metadata needed by Makefile.  Using
 # a script allows uniform behavior across multiple environments and
@@ -6,8 +6,7 @@
 
 set -euo pipefail
 
-DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
-cd "${GOSRC:-${DIR}/../}"
+cd "${GOSRC:-$(dirname $0)/../}"
 
 valid_args() {
     REGEX='^\s+[[:upper:]]+\*[)]'

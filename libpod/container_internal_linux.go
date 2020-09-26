@@ -9,6 +9,7 @@ import (
 	"io/ioutil"
 	"net"
 	"os"
+	"os/user"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -19,19 +20,23 @@ import (
 
 	cnitypes "github.com/containernetworking/cni/pkg/types/current"
 	"github.com/containernetworking/plugins/pkg/ns"
+	"github.com/containers/buildah/pkg/overlay"
 	"github.com/containers/buildah/pkg/secrets"
-	"github.com/containers/libpod/libpod/define"
-	"github.com/containers/libpod/libpod/events"
-	"github.com/containers/libpod/pkg/annotations"
-	"github.com/containers/libpod/pkg/apparmor"
-	"github.com/containers/libpod/pkg/cgroups"
-	"github.com/containers/libpod/pkg/criu"
-	"github.com/containers/libpod/pkg/lookup"
-	"github.com/containers/libpod/pkg/resolvconf"
-	"github.com/containers/libpod/pkg/rootless"
+	"github.com/containers/common/pkg/apparmor"
+	"github.com/containers/common/pkg/config"
+	"github.com/containers/podman/v2/libpod/define"
+	"github.com/containers/podman/v2/libpod/events"
+	"github.com/containers/podman/v2/pkg/annotations"
+	"github.com/containers/podman/v2/pkg/cgroups"
+	"github.com/containers/podman/v2/pkg/criu"
+	"github.com/containers/podman/v2/pkg/lookup"
+	"github.com/containers/podman/v2/pkg/resolvconf"
+	"github.com/containers/podman/v2/pkg/rootless"
+	"github.com/containers/podman/v2/pkg/util"
+	"github.com/containers/podman/v2/utils"
 	"github.com/containers/storage/pkg/archive"
 	securejoin "github.com/cyphar/filepath-securejoin"
-	"github.com/opencontainers/runc/libcontainer/user"
+	runcuser "github.com/opencontainers/runc/libcontainer/user"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-tools/generate"
 	"github.com/opencontainers/selinux/go-selinux/label"
@@ -62,7 +67,7 @@ func (c *Container) unmountSHM(mount string) error {
 
 // prepare mounts the container and sets up other required resources like net
 // namespaces
-func (c *Container) prepare() (Err error) {
+func (c *Container) prepare() error {
 	var (
 		wg                              sync.WaitGroup
 		netNS                           ns.NetNS
@@ -77,8 +82,13 @@ func (c *Container) prepare() (Err error) {
 	go func() {
 		defer wg.Done()
 		// Set up network namespace if not already set up
-		if c.config.CreateNetNS && c.state.NetNS == nil && !c.config.PostConfigureNetNS {
-			netNS, networkStatus, createNetNSErr = c.runtime.createNetNS(c)
+		noNetNS := c.state.NetNS == nil
+		if c.config.CreateNetNS && noNetNS && !c.config.PostConfigureNetNS {
+			if rootless.IsRootless() && len(c.config.Networks) > 0 {
+				netNS, networkStatus, createNetNSErr = AllocRootlessCNI(context.Background(), c)
+			} else {
+				netNS, networkStatus, createNetNSErr = c.runtime.createNetNS(c)
+			}
 			if createNetNSErr != nil {
 				return
 			}
@@ -92,8 +102,12 @@ func (c *Container) prepare() (Err error) {
 		}
 
 		// handle rootless network namespace setup
-		if c.state.NetNS != nil && c.config.NetMode == "slirp4netns" && !c.config.PostConfigureNetNS {
-			createNetNSErr = c.runtime.setupRootlessNetNS(c)
+		if noNetNS && !c.config.PostConfigureNetNS {
+			if rootless.IsRootless() {
+				createNetNSErr = c.runtime.setupRootlessNetNS(c)
+			} else if c.config.NetMode.IsSlirp4netns() {
+				createNetNSErr = c.runtime.setupSlirp4netns(c)
+			}
 		}
 	}()
 	// Mount storage if not mounted
@@ -153,7 +167,32 @@ func (c *Container) prepare() (Err error) {
 	}
 
 	// Save changes to container state
-	return c.save()
+	if err := c.save(); err != nil {
+		return err
+	}
+
+	// Ensure container entrypoint is created (if required)
+	if c.config.CreateWorkingDir {
+		workdir, err := securejoin.SecureJoin(c.state.Mountpoint, c.WorkingDir())
+		if err != nil {
+			return errors.Wrapf(err, "error creating path to container %s working dir", c.ID())
+		}
+		rootUID := c.RootUID()
+		rootGID := c.RootGID()
+
+		if err := os.MkdirAll(workdir, 0755); err != nil {
+			if os.IsExist(err) {
+				return nil
+			}
+			return errors.Wrapf(err, "error creating container %s working dir", c.ID())
+		}
+
+		if err := os.Chown(workdir, rootUID, rootGID); err != nil {
+			return errors.Wrapf(err, "error chowning container %s working directory to container root", c.ID())
+		}
+	}
+
+	return nil
 }
 
 // cleanupNetwork unmounts and cleans up the container's network
@@ -209,6 +248,9 @@ func (c *Container) getUserOverrides() *lookup.Overrides {
 			}
 		}
 	}
+	if path, ok := c.state.BindMounts["/etc/passwd"]; ok {
+		overrides.ContainerEtcPasswdPath = path
+	}
 	return &overrides
 }
 
@@ -241,7 +283,7 @@ func (c *Container) generateSpec(ctx context.Context) (*spec.Spec, error) {
 	}
 
 	// Apply AppArmor checks and load the default profile if needed.
-	if !c.config.Privileged {
+	if len(c.config.Spec.Process.ApparmorProfile) > 0 {
 		updatedProfile, err := apparmor.CheckProfileAndLoadDefault(c.config.Spec.Process.ApparmorProfile)
 		if err != nil {
 			return nil, err
@@ -311,6 +353,19 @@ func (c *Container) generateSpec(ctx context.Context) (*spec.Spec, error) {
 		}
 	}
 
+	// Add overlay volumes
+	for _, overlayVol := range c.config.OverlayVolumes {
+		contentDir, err := overlay.TempDir(c.config.StaticDir, c.RootUID(), c.RootGID())
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to create TempDir in the %s directory", c.config.StaticDir)
+		}
+		overlayMount, err := overlay.Mount(contentDir, overlayVol.Source, overlayVol.Dest, c.RootUID(), c.RootGID(), c.runtime.store.GraphOptions())
+		if err != nil {
+			return nil, errors.Wrapf(err, "creating overlay failed %q", overlayVol.Source)
+		}
+		g.AddMount(overlayMount)
+	}
+
 	hasHomeSet := false
 	for _, s := range c.config.Spec.Process.Env {
 		if strings.HasPrefix(s, "HOME=") {
@@ -323,14 +378,31 @@ func (c *Container) generateSpec(ctx context.Context) (*spec.Spec, error) {
 	}
 
 	if c.config.User != "" {
+		if rootless.IsRootless() {
+			if err := util.CheckRootlessUIDRange(execUser.Uid); err != nil {
+				return nil, err
+			}
+		}
 		// User and Group must go together
 		g.SetProcessUID(uint32(execUser.Uid))
 		g.SetProcessGID(uint32(execUser.Gid))
 	}
 
+	if c.config.Umask != "" {
+		decVal, err := strconv.ParseUint(c.config.Umask, 8, 32)
+		if err != nil {
+			return nil, errors.Wrapf(err, "Invalid Umask Value")
+		}
+		umask := uint32(decVal)
+		g.Config.Process.User.Umask = &umask
+	}
+
 	// Add addition groups if c.config.GroupAdd is not empty
 	if len(c.config.Groups) > 0 {
-		gids, _ := lookup.GetContainerGroups(c.config.Groups, c.state.Mountpoint, nil)
+		gids, err := lookup.GetContainerGroups(c.config.Groups, c.state.Mountpoint, overrides)
+		if err != nil {
+			return nil, errors.Wrapf(err, "error looking up supplemental groups for container %s", c.ID())
+		}
 		for _, gid := range gids {
 			g.AddProcessAdditionalGid(gid)
 		}
@@ -380,6 +452,16 @@ func (c *Container) generateSpec(ctx context.Context) (*spec.Spec, error) {
 			g.AddLinuxGIDMapping(uint32(0), uint32(0), uint32(1))
 		}
 	}
+
+	for _, i := range c.config.Spec.Linux.Namespaces {
+		if i.Type == spec.UTSNamespace && i.Path == "" {
+			hostname := c.Hostname()
+			g.SetHostname(hostname)
+			g.AddProcessEnv("HOSTNAME", hostname)
+			break
+		}
+	}
+
 	if c.config.UTSNsCtr != "" {
 		if err := c.addNamespaceContainer(&g, UTSNS, c.config.UTSNsCtr, spec.UTSNamespace); err != nil {
 			return nil, err
@@ -391,21 +473,26 @@ func (c *Container) generateSpec(ctx context.Context) (*spec.Spec, error) {
 		}
 	}
 
+	if c.config.IDMappings.AutoUserNs {
+		if err := g.AddOrReplaceLinuxNamespace(string(spec.UserNamespace), ""); err != nil {
+			return nil, err
+		}
+		g.ClearLinuxUIDMappings()
+		for _, uidmap := range c.config.IDMappings.UIDMap {
+			g.AddLinuxUIDMapping(uint32(uidmap.HostID), uint32(uidmap.ContainerID), uint32(uidmap.Size))
+		}
+		g.ClearLinuxGIDMappings()
+		for _, gidmap := range c.config.IDMappings.GIDMap {
+			g.AddLinuxGIDMapping(uint32(gidmap.HostID), uint32(gidmap.ContainerID), uint32(gidmap.Size))
+		}
+	}
+
 	g.SetRootPath(c.state.Mountpoint)
 	g.AddAnnotation(annotations.Created, c.config.CreatedTime.Format(time.RFC3339Nano))
 	g.AddAnnotation("org.opencontainers.image.stopSignal", fmt.Sprintf("%d", c.config.StopSignal))
 
 	if _, exists := g.Config.Annotations[annotations.ContainerManager]; !exists {
 		g.AddAnnotation(annotations.ContainerManager, annotations.ContainerManagerLibpod)
-	}
-
-	for _, i := range c.config.Spec.Linux.Namespaces {
-		if i.Type == spec.UTSNamespace {
-			hostname := c.Hostname()
-			g.SetHostname(hostname)
-			g.AddProcessEnv("HOSTNAME", hostname)
-			break
-		}
 	}
 
 	// Only add container environment variable if not already present
@@ -484,7 +571,7 @@ func (c *Container) generateSpec(ctx context.Context) (*spec.Spec, error) {
 // systemd expects to have /run, /run/lock and /tmp on tmpfs
 // It also expects to be able to write to /sys/fs/cgroup/systemd and /var/log/journal
 func (c *Container) setupSystemd(mounts []spec.Mount, g generate.Generator) error {
-	options := []string{"rw", "rprivate", "noexec", "nosuid", "nodev"}
+	options := []string{"rw", "rprivate", "nosuid", "nodev"}
 	for _, dest := range []string{"/run", "/run/lock"} {
 		if MountExists(mounts, dest) {
 			continue
@@ -493,7 +580,7 @@ func (c *Container) setupSystemd(mounts []spec.Mount, g generate.Generator) erro
 			Destination: dest,
 			Type:        "tmpfs",
 			Source:      "tmpfs",
-			Options:     append(options, "tmpcopyup", "size=65536k"),
+			Options:     append(options, "tmpcopyup"),
 		}
 		g.AddMount(tmpfsMnt)
 	}
@@ -548,7 +635,7 @@ func (c *Container) setupSystemd(mounts []spec.Mount, g generate.Generator) erro
 			Destination: "/sys/fs/cgroup/systemd",
 			Type:        "bind",
 			Source:      "/sys/fs/cgroup/systemd",
-			Options:     []string{"bind", "nodev", "noexec", "nosuid"},
+			Options:     []string{"bind", "nodev", "noexec", "nosuid", "rprivate"},
 		}
 		g.AddMount(systemdMnt)
 		g.AddLinuxMaskedPaths("/sys/fs/cgroup/systemd/release_agent")
@@ -564,6 +651,13 @@ func (c *Container) addNamespaceContainer(g *generate.Generator, ns LinuxNS, ctr
 		return errors.Wrapf(err, "error retrieving dependency %s of container %s from state", ctr, c.ID())
 	}
 
+	if specNS == spec.UTSNamespace {
+		hostname := nsCtr.Hostname()
+		// Joining an existing namespace, cannot set the hostname
+		g.SetHostname("")
+		g.AddProcessEnv("HOSTNAME", hostname)
+	}
+
 	// TODO need unlocked version of this for use in pods
 	nsPath, err := nsCtr.NamespacePath(ns)
 	if err != nil {
@@ -577,7 +671,7 @@ func (c *Container) addNamespaceContainer(g *generate.Generator, ns LinuxNS, ctr
 	return nil
 }
 
-func (c *Container) exportCheckpoint(dest string, ignoreRootfs bool) (err error) {
+func (c *Container) exportCheckpoint(dest string, ignoreRootfs bool) error {
 	if (len(c.config.NamedVolumes) > 0) || (len(c.Dependencies()) > 0) {
 		return errors.Errorf("Cannot export checkpoints of containers with named volumes or dependencies")
 	}
@@ -688,7 +782,7 @@ func (c *Container) exportCheckpoint(dest string, ignoreRootfs bool) (err error)
 	return nil
 }
 
-func (c *Container) checkpointRestoreSupported() (err error) {
+func (c *Container) checkpointRestoreSupported() error {
 	if !criu.CheckForCriu() {
 		return errors.Errorf("Checkpoint/Restore requires at least CRIU %d", criu.MinCriuVersion)
 	}
@@ -698,7 +792,7 @@ func (c *Container) checkpointRestoreSupported() (err error) {
 	return nil
 }
 
-func (c *Container) checkpointRestoreLabelLog(fileName string) (err error) {
+func (c *Container) checkpointRestoreLabelLog(fileName string) error {
 	// Create the CRIU log file and label it
 	dumpLog := filepath.Join(c.bundlePath(), fileName)
 
@@ -715,7 +809,7 @@ func (c *Container) checkpointRestoreLabelLog(fileName string) (err error) {
 	return nil
 }
 
-func (c *Container) checkpoint(ctx context.Context, options ContainerCheckpointOptions) (err error) {
+func (c *Container) checkpoint(ctx context.Context, options ContainerCheckpointOptions) error {
 	if err := c.checkpointRestoreSupported(); err != nil {
 		return err
 	}
@@ -785,7 +879,7 @@ func (c *Container) checkpoint(ctx context.Context, options ContainerCheckpointO
 	return c.save()
 }
 
-func (c *Container) importCheckpoint(input string) (err error) {
+func (c *Container) importCheckpoint(input string) error {
 	archiveFile, err := os.Open(input)
 	if err != nil {
 		return errors.Wrapf(err, "Failed to open checkpoint archive %s for import", input)
@@ -814,8 +908,7 @@ func (c *Container) importCheckpoint(input string) (err error) {
 	return nil
 }
 
-func (c *Container) restore(ctx context.Context, options ContainerCheckpointOptions) (err error) {
-
+func (c *Container) restore(ctx context.Context, options ContainerCheckpointOptions) (retErr error) {
 	if err := c.checkpointRestoreSupported(); err != nil {
 		return err
 	}
@@ -825,7 +918,7 @@ func (c *Container) restore(ctx context.Context, options ContainerCheckpointOpti
 	}
 
 	if options.TargetFile != "" {
-		if err = c.importCheckpoint(options.TargetFile); err != nil {
+		if err := c.importCheckpoint(options.TargetFile); err != nil {
 			return err
 		}
 	}
@@ -911,9 +1004,9 @@ func (c *Container) restore(ctx context.Context, options ContainerCheckpointOpti
 	}
 
 	defer func() {
-		if err != nil {
-			if err2 := c.cleanup(ctx); err2 != nil {
-				logrus.Errorf("error cleaning up container %s: %v", c.ID(), err2)
+		if retErr != nil {
+			if err := c.cleanup(ctx); err != nil {
+				logrus.Errorf("error cleaning up container %s: %v", c.ID(), err)
 			}
 		}
 	}()
@@ -1114,22 +1207,17 @@ func (c *Container) makeBindMounts() error {
 				return errors.Wrapf(err, "error fetching bind mounts from dependency %s of container %s", depCtr.ID(), c.ID())
 			}
 
-			if !c.config.UseImageResolvConf {
-				// The other container may not have a resolv.conf or /etc/hosts
-				// If it doesn't, don't copy them
-				resolvPath, exists := bindMounts["/etc/resolv.conf"]
-				if exists {
-					c.state.BindMounts["/etc/resolv.conf"] = resolvPath
-				}
+			// The other container may not have a resolv.conf or /etc/hosts
+			// If it doesn't, don't copy them
+			resolvPath, exists := bindMounts["/etc/resolv.conf"]
+			if !c.config.UseImageResolvConf && exists {
+				c.state.BindMounts["/etc/resolv.conf"] = resolvPath
 			}
 
-			if !c.config.UseImageHosts {
-				// check if dependency container has an /etc/hosts file
-				hostsPath, exists := bindMounts["/etc/hosts"]
-				if !exists {
-					return errors.Errorf("error finding hosts file of dependency container %s for container %s", depCtr.ID(), c.ID())
-				}
-
+			// check if dependency container has an /etc/hosts file.
+			// It may not have one, so only use it if it does.
+			hostsPath, exists := bindMounts["/etc/hosts"]
+			if !c.config.UseImageHosts && exists {
 				depCtr.lock.Lock()
 				// generate a hosts file for the dependency container,
 				// based on either its old hosts file, or the default,
@@ -1144,6 +1232,15 @@ func (c *Container) makeBindMounts() error {
 
 				// finally, save it in the new container
 				c.state.BindMounts["/etc/hosts"] = hostsPath
+			}
+
+			if !hasCurrentUserMapped(c) {
+				if err := makeAccessible(resolvPath, c.RootUID(), c.RootGID()); err != nil {
+					return err
+				}
+				if err := makeAccessible(hostsPath, c.RootUID(), c.RootGID()); err != nil {
+					return err
+				}
 			}
 		} else {
 			if !c.config.UseImageResolvConf {
@@ -1179,7 +1276,7 @@ func (c *Container) makeBindMounts() error {
 	// SHM is always added when we mount the container
 	c.state.BindMounts["/dev/shm"] = c.config.ShmDir
 
-	newPasswd, err := c.generatePasswd()
+	newPasswd, newGroup, err := c.generatePasswdAndGroup()
 	if err != nil {
 		return errors.Wrapf(err, "error creating temporary passwd file for container %s", c.ID())
 	}
@@ -1189,8 +1286,15 @@ func (c *Container) makeBindMounts() error {
 			// If it already exists, delete so we can recreate
 			delete(c.state.BindMounts, "/etc/passwd")
 		}
-		logrus.Debugf("adding entry to /etc/passwd for non existent default user")
 		c.state.BindMounts["/etc/passwd"] = newPasswd
+	}
+	if newGroup != "" {
+		// Make /etc/group
+		if _, ok := c.state.BindMounts["/etc/group"]; ok {
+			// If it already exists, delete so we can recreate
+			delete(c.state.BindMounts, "/etc/group")
+		}
+		c.state.BindMounts["/etc/group"] = newGroup
 	}
 
 	// Make /etc/hostname
@@ -1201,6 +1305,31 @@ func (c *Container) makeBindMounts() error {
 			return errors.Wrapf(err, "error creating hostname file for container %s", c.ID())
 		}
 		c.state.BindMounts["/etc/hostname"] = hostnamePath
+	}
+
+	// Make /etc/localtime
+	if c.Timezone() != "" {
+		if _, ok := c.state.BindMounts["/etc/localtime"]; !ok {
+			var zonePath string
+			if c.Timezone() == "local" {
+				zonePath, err = filepath.EvalSymlinks("/etc/localtime")
+				if err != nil {
+					return errors.Wrapf(err, "error finding local timezone for container %s", c.ID())
+				}
+			} else {
+				zone := filepath.Join("/usr/share/zoneinfo", c.Timezone())
+				zonePath, err = filepath.EvalSymlinks(zone)
+				if err != nil {
+					return errors.Wrapf(err, "error setting timezone for container %s", c.ID())
+				}
+			}
+			localtimePath, err := c.copyTimezoneFile(zonePath)
+			if err != nil {
+				return errors.Wrapf(err, "error setting timezone for container %s", c.ID())
+			}
+			c.state.BindMounts["/etc/localtime"] = localtimePath
+
+		}
 	}
 
 	// Make .containerenv
@@ -1215,7 +1344,7 @@ func (c *Container) makeBindMounts() error {
 	}
 
 	// Add Secret Mounts
-	secretMounts := secrets.SecretMountsWithUIDGID(c.config.MountLabel, c.state.RunDir, c.runtime.config.DefaultMountsFile, c.state.RunDir, c.RootUID(), c.RootGID(), rootless.IsRootless(), false)
+	secretMounts := secrets.SecretMountsWithUIDGID(c.config.MountLabel, c.state.RunDir, c.runtime.config.Containers.DefaultMountsFile, c.state.Mountpoint, c.RootUID(), c.RootGID(), rootless.IsRootless(), false)
 	for _, mount := range secretMounts {
 		if _, ok := c.state.BindMounts[mount.Destination]; !ok {
 			c.state.BindMounts[mount.Destination] = mount.Source
@@ -1254,6 +1383,11 @@ func (c *Container) generateResolvConf() (string, error) {
 		return "", err
 	}
 
+	// Determine if symlink points to any of the systemd-resolved files
+	if strings.HasPrefix(resolvPath, "/run/systemd/resolve/") {
+		resolvPath = "/run/systemd/resolve/resolv.conf"
+	}
+
 	contents, err := ioutil.ReadFile(resolvPath)
 	if err != nil {
 		return "", errors.Wrapf(err, "unable to read %s", resolvPath)
@@ -1276,32 +1410,50 @@ func (c *Container) generateResolvConf() (string, error) {
 		}
 	}
 
+	dns := make([]net.IP, 0, len(c.runtime.config.Containers.DNSServers))
+	for _, i := range c.runtime.config.Containers.DNSServers {
+		result := net.ParseIP(i)
+		if result == nil {
+			return "", errors.Wrapf(define.ErrInvalidArg, "invalid IP address %s", i)
+		}
+		dns = append(dns, result)
+	}
+	dnsServers := append(dns, c.config.DNSServer...)
 	// If the user provided dns, it trumps all; then dns masq; then resolv.conf
-	if len(c.config.DNSServer) > 0 {
+	switch {
+	case len(dnsServers) > 0:
+
 		// We store DNS servers as net.IP, so need to convert to string
-		for _, server := range c.config.DNSServer {
+		for _, server := range dnsServers {
 			nameservers = append(nameservers, server.String())
 		}
-	} else if len(cniNameServers) > 0 {
+	case len(cniNameServers) > 0:
 		nameservers = append(nameservers, cniNameServers...)
-	} else {
+	default:
 		// Make a new resolv.conf
 		nameservers = resolvconf.GetNameservers(resolv.Content)
 		// slirp4netns has a built in DNS server.
 		if c.config.NetMode.IsSlirp4netns() {
 			nameservers = append([]string{"10.0.2.3"}, nameservers...)
 		}
-
 	}
 
-	search := resolvconf.GetSearchDomains(resolv.Content)
-	if len(c.config.DNSSearch) > 0 {
-		search = c.config.DNSSearch
+	var search []string
+	if len(c.config.DNSSearch) > 0 || len(c.runtime.config.Containers.DNSSearches) > 0 {
+		if !util.StringInSlice(".", c.config.DNSSearch) {
+			search = c.runtime.config.Containers.DNSSearches
+			search = append(search, c.config.DNSSearch...)
+		}
+	} else {
+		search = resolvconf.GetSearchDomains(resolv.Content)
 	}
 
-	options := resolvconf.GetOptions(resolv.Content)
-	if len(c.config.DNSOption) > 0 {
-		options = c.config.DNSOption
+	var options []string
+	if len(c.config.DNSOption) > 0 || len(c.runtime.config.Containers.DNSOptions) > 0 {
+		options = c.runtime.config.Containers.DNSOptions
+		options = append(options, c.config.DNSOption...)
+	} else {
+		options = resolvconf.GetOptions(resolv.Content)
 	}
 
 	destPath := filepath.Join(c.state.RunDir, "resolv.conf")
@@ -1338,7 +1490,9 @@ func (c *Container) generateHosts(path string) (string, error) {
 // local hosts file. netCtr is the container from which the netNS information is
 // taken.
 // path is the basis of the hosts file, into which netCtr's netNS information will be appended.
-func (c *Container) appendHosts(path string, netCtr *Container) (string, error) {
+// FIXME.  Path should be used by this function,but I am not sure what is correct; remove //lint
+// once this is fixed
+func (c *Container) appendHosts(path string, netCtr *Container) (string, error) { //nolint
 	return c.appendStringToRundir("hosts", netCtr.getHosts())
 }
 
@@ -1353,26 +1507,208 @@ func (c *Container) getHosts() string {
 			hosts += fmt.Sprintf("%s %s\n", fields[1], fields[0])
 		}
 	}
+
 	if c.config.NetMode.IsSlirp4netns() {
 		// When using slirp4netns, the interface gets a static IP
-		hosts += fmt.Sprintf("# used by slirp4netns\n%s\t%s\n", "10.0.2.100", c.Hostname())
+		hosts += fmt.Sprintf("# used by slirp4netns\n%s\t%s %s\n", "10.0.2.100", c.Hostname(), c.Config().Name)
 	}
 	if len(c.state.NetworkStatus) > 0 && len(c.state.NetworkStatus[0].IPs) > 0 {
 		ipAddress := strings.Split(c.state.NetworkStatus[0].IPs[0].Address.String(), "/")[0]
-		hosts += fmt.Sprintf("%s\t%s\n", ipAddress, c.Hostname())
+		hosts += fmt.Sprintf("%s\t%s %s\n", ipAddress, c.Hostname(), c.Config().Name)
 	}
 	return hosts
 }
 
-// generatePasswd generates a container specific passwd file,
-// iff g.config.User is a number
-func (c *Container) generatePasswd() (string, error) {
+// generateGroupEntry generates an entry or entries into /etc/group as
+// required by container configuration.
+// Generatlly speaking, we will make an entry under two circumstances:
+// 1. The container is started as a specific user:group, and that group is both
+//    numeric, and does not already exist in /etc/group.
+// 2. It is requested that Libpod add the group that launched Podman to
+//    /etc/group via AddCurrentUserPasswdEntry (though this does not trigger if
+//    the group in question already exists in /etc/passwd).
+// Returns group entry (as a string that can be appended to /etc/group) and any
+// error that occurred.
+func (c *Container) generateGroupEntry() (string, error) {
+	groupString := ""
+
+	// Things we *can't* handle: adding the user we added in
+	// generatePasswdEntry to any *existing* groups.
+	addedGID := 0
+	if c.config.AddCurrentUserPasswdEntry {
+		entry, gid, err := c.generateCurrentUserGroupEntry()
+		if err != nil {
+			return "", err
+		}
+		groupString += entry
+		addedGID = gid
+	}
+	if c.config.User != "" {
+		entry, _, err := c.generateUserGroupEntry(addedGID)
+		if err != nil {
+			return "", err
+		}
+		groupString += entry
+	}
+
+	return groupString, nil
+}
+
+// Make an entry in /etc/group for the group of the user running podman iff we
+// are rootless.
+func (c *Container) generateCurrentUserGroupEntry() (string, int, error) {
+	gid := rootless.GetRootlessGID()
+	if gid == 0 {
+		return "", 0, nil
+	}
+
+	g, err := user.LookupGroupId(strconv.Itoa(gid))
+	if err != nil {
+		return "", 0, errors.Wrapf(err, "failed to get current group")
+	}
+
+	// Lookup group name to see if it exists in the image.
+	_, err = lookup.GetGroup(c.state.Mountpoint, g.Name)
+	if err != runcuser.ErrNoGroupEntries {
+		return "", 0, err
+	}
+
+	// Lookup GID to see if it exists in the image.
+	_, err = lookup.GetGroup(c.state.Mountpoint, g.Gid)
+	if err != runcuser.ErrNoGroupEntries {
+		return "", 0, err
+	}
+
+	// We need to get the username of the rootless user so we can add it to
+	// the group.
+	username := ""
+	uid := rootless.GetRootlessUID()
+	if uid != 0 {
+		u, err := user.LookupId(strconv.Itoa(uid))
+		if err != nil {
+			return "", 0, errors.Wrapf(err, "failed to get current user to make group entry")
+		}
+		username = u.Username
+	}
+
+	// Make the entry.
+	return fmt.Sprintf("%s:x:%s:%s\n", g.Name, g.Gid, username), gid, nil
+}
+
+// Make an entry in /etc/group for the group the container was specified to run
+// as.
+func (c *Container) generateUserGroupEntry(addedGID int) (string, int, error) {
+	if c.config.User == "" {
+		return "", 0, nil
+	}
+
+	splitUser := strings.SplitN(c.config.User, ":", 2)
+	group := splitUser[0]
+	if len(splitUser) > 1 {
+		group = splitUser[1]
+	}
+
+	gid, err := strconv.ParseUint(group, 10, 32)
+	if err != nil {
+		return "", 0, nil
+	}
+
+	if addedGID != 0 && addedGID == int(gid) {
+		return "", 0, nil
+	}
+
+	// Check if the group already exists
+	_, err = lookup.GetGroup(c.state.Mountpoint, group)
+	if err != runcuser.ErrNoGroupEntries {
+		return "", 0, err
+	}
+
+	return fmt.Sprintf("%d:x:%d:%s\n", gid, gid, splitUser[0]), int(gid), nil
+}
+
+// generatePasswdEntry generates an entry or entries into /etc/passwd as
+// required by container configuration.
+// Generally speaking, we will make an entry under two circumstances:
+// 1. The container is started as a specific user who is not in /etc/passwd.
+//    This only triggers if the user is given as a *numeric* ID.
+// 2. It is requested that Libpod add the user that launched Podman to
+//    /etc/passwd via AddCurrentUserPasswdEntry (though this does not trigger if
+//    the user in question already exists in /etc/passwd) or the UID to be added
+//    is 0).
+// Returns password entry (as a string that can be appended to /etc/passwd) and
+// any error that occurred.
+func (c *Container) generatePasswdEntry() (string, error) {
+	passwdString := ""
+
+	addedUID := 0
+	if c.config.AddCurrentUserPasswdEntry {
+		entry, uid, _, err := c.generateCurrentUserPasswdEntry()
+		if err != nil {
+			return "", err
+		}
+		passwdString += entry
+		addedUID = uid
+	}
+	if c.config.User != "" {
+		entry, _, _, err := c.generateUserPasswdEntry(addedUID)
+		if err != nil {
+			return "", err
+		}
+		passwdString += entry
+	}
+
+	return passwdString, nil
+}
+
+// generateCurrentUserPasswdEntry generates an /etc/passwd entry for the user
+// running the container engine.
+// Returns a passwd entry for the user, and the UID and GID of the added entry.
+func (c *Container) generateCurrentUserPasswdEntry() (string, int, int, error) {
+	uid := rootless.GetRootlessUID()
+	if uid == 0 {
+		return "", 0, 0, nil
+	}
+
+	u, err := user.LookupId(strconv.Itoa(uid))
+	if err != nil {
+		return "", 0, 0, errors.Wrapf(err, "failed to get current user")
+	}
+
+	// Lookup the user to see if it exists in the container image.
+	_, err = lookup.GetUser(c.state.Mountpoint, u.Username)
+	if err != runcuser.ErrNoPasswdEntries {
+		return "", 0, 0, err
+	}
+
+	// Lookup the UID to see if it exists in the container image.
+	_, err = lookup.GetUser(c.state.Mountpoint, u.Uid)
+	if err != runcuser.ErrNoPasswdEntries {
+		return "", 0, 0, err
+	}
+
+	// If the user's actual home directory exists, or was mounted in - use
+	// that.
+	homeDir := c.WorkingDir()
+	if MountExists(c.config.Spec.Mounts, u.HomeDir) {
+		homeDir = u.HomeDir
+	}
+
+	return fmt.Sprintf("%s:*:%s:%s:%s:%s:/bin/sh\n", u.Username, u.Uid, u.Gid, u.Username, homeDir), uid, rootless.GetRootlessGID(), nil
+}
+
+// generateUserPasswdEntry generates an /etc/passwd entry for the container user
+// to run in the container.
+// The UID and GID of the added entry will also be returned.
+// Accepts one argument, that being any UID that has already been added to the
+// passwd file by other functions; if it matches the UID we were given, we don't
+// need to do anything.
+func (c *Container) generateUserPasswdEntry(addedUID int) (string, int, int, error) {
 	var (
 		groupspec string
 		gid       int
 	)
 	if c.config.User == "" {
-		return "", nil
+		return "", 0, 0, nil
 	}
 	splitSpec := strings.SplitN(c.config.User, ":", 2)
 	userspec := splitSpec[0]
@@ -1382,16 +1718,19 @@ func (c *Container) generatePasswd() (string, error) {
 	// If a non numeric User, then don't generate passwd
 	uid, err := strconv.ParseUint(userspec, 10, 32)
 	if err != nil {
-		return "", nil
+		return "", 0, 0, nil
 	}
+
+	if addedUID != 0 && int(uid) == addedUID {
+		return "", 0, 0, nil
+	}
+
 	// Lookup the user to see if it exists in the container image
 	_, err = lookup.GetUser(c.state.Mountpoint, userspec)
-	if err != nil && err != user.ErrNoPasswdEntries {
-		return "", err
+	if err != runcuser.ErrNoPasswdEntries {
+		return "", 0, 0, err
 	}
-	if err == nil {
-		return "", nil
-	}
+
 	if groupspec != "" {
 		ugid, err := strconv.ParseUint(groupspec, 10, 32)
 		if err == nil {
@@ -1399,26 +1738,180 @@ func (c *Container) generatePasswd() (string, error) {
 		} else {
 			group, err := lookup.GetGroup(c.state.Mountpoint, groupspec)
 			if err != nil {
-				return "", errors.Wrapf(err, "unable to get gid %s from group file", groupspec)
+				return "", 0, 0, errors.Wrapf(err, "unable to get gid %s from group file", groupspec)
 			}
 			gid = group.Gid
 		}
 	}
-	originPasswdFile := filepath.Join(c.state.Mountpoint, "/etc/passwd")
-	orig, err := ioutil.ReadFile(originPasswdFile)
-	if err != nil && !os.IsNotExist(err) {
-		return "", errors.Wrapf(err, "unable to read passwd file %s", originPasswdFile)
+	return fmt.Sprintf("%d:*:%d:%d:container user:%s:/bin/sh\n", uid, uid, gid, c.WorkingDir()), int(uid), gid, nil
+}
+
+// generatePasswdAndGroup generates container-specific passwd and group files
+// iff g.config.User is a number or we are configured to make a passwd entry for
+// the current user.
+// Returns path to file to mount at /etc/passwd, path to file to mount at
+// /etc/group, and any error that occurred. If no passwd/group file were
+// required, the empty string will be returned for those path (this may occur
+// even if no error happened).
+// This may modify the mounted container's /etc/passwd and /etc/group instead of
+// making copies to bind-mount in, so we don't break useradd (it wants to make a
+// copy of /etc/passwd and rename the copy to /etc/passwd, which is impossible
+// with a bind mount). This is done in cases where the container is *not*
+// read-only. In this case, the function will return nothing ("", "", nil).
+func (c *Container) generatePasswdAndGroup() (string, string, error) {
+	if !c.config.AddCurrentUserPasswdEntry && c.config.User == "" {
+		return "", "", nil
 	}
 
-	pwd := fmt.Sprintf("%s%d:x:%d:%d:container user:%s:/bin/sh\n", orig, uid, uid, gid, c.WorkingDir())
-	passwdFile, err := c.writeStringToRundir("passwd", pwd)
-	if err != nil {
-		return "", errors.Wrapf(err, "failed to create temporary passwd file")
+	needPasswd := true
+	needGroup := true
+
+	// First, check if there's a mount at /etc/passwd or group, we don't
+	// want to interfere with user mounts.
+	if MountExists(c.config.Spec.Mounts, "/etc/passwd") {
+		needPasswd = false
 	}
-	if err := os.Chmod(passwdFile, 0644); err != nil {
-		return "", err
+	if MountExists(c.config.Spec.Mounts, "/etc/group") {
+		needGroup = false
 	}
-	return passwdFile, nil
+
+	// Next, check if we already made the files. If we didn, don't need to
+	// do anything more.
+	if needPasswd {
+		passwdPath := filepath.Join(c.config.StaticDir, "passwd")
+		if _, err := os.Stat(passwdPath); err == nil {
+			needPasswd = false
+		}
+	}
+	if needGroup {
+		groupPath := filepath.Join(c.config.StaticDir, "group")
+		if _, err := os.Stat(groupPath); err == nil {
+			needGroup = false
+		}
+	}
+
+	// Next, check if the container even has a /etc/passwd or /etc/group.
+	// If it doesn't we don't want to create them ourselves.
+	if needPasswd {
+		exists, err := c.checkFileExistsInRootfs("/etc/passwd")
+		if err != nil {
+			return "", "", err
+		}
+		needPasswd = exists
+	}
+	if needGroup {
+		exists, err := c.checkFileExistsInRootfs("/etc/group")
+		if err != nil {
+			return "", "", err
+		}
+		needGroup = exists
+	}
+
+	// If we don't need a /etc/passwd or /etc/group at this point we can
+	// just return.
+	if !needPasswd && !needGroup {
+		return "", "", nil
+	}
+
+	passwdPath := ""
+	groupPath := ""
+
+	ro := c.IsReadOnly()
+
+	if needPasswd {
+		passwdEntry, err := c.generatePasswdEntry()
+		if err != nil {
+			return "", "", err
+		}
+
+		needsWrite := passwdEntry != ""
+		switch {
+		case ro && needsWrite:
+			logrus.Debugf("Making /etc/passwd for container %s", c.ID())
+			originPasswdFile, err := securejoin.SecureJoin(c.state.Mountpoint, "/etc/passwd")
+			if err != nil {
+				return "", "", errors.Wrapf(err, "error creating path to container %s /etc/passwd", c.ID())
+			}
+			orig, err := ioutil.ReadFile(originPasswdFile)
+			if err != nil && !os.IsNotExist(err) {
+				return "", "", errors.Wrapf(err, "unable to read passwd file %s", originPasswdFile)
+			}
+			passwdFile, err := c.writeStringToStaticDir("passwd", string(orig)+passwdEntry)
+			if err != nil {
+				return "", "", errors.Wrapf(err, "failed to create temporary passwd file")
+			}
+			if err := os.Chmod(passwdFile, 0644); err != nil {
+				return "", "", err
+			}
+			passwdPath = passwdFile
+		case !ro && needsWrite:
+			logrus.Debugf("Modifying container %s /etc/passwd", c.ID())
+			containerPasswd, err := securejoin.SecureJoin(c.state.Mountpoint, "/etc/passwd")
+			if err != nil {
+				return "", "", errors.Wrapf(err, "error looking up location of container %s /etc/passwd", c.ID())
+			}
+
+			f, err := os.OpenFile(containerPasswd, os.O_APPEND|os.O_WRONLY, 0600)
+			if err != nil {
+				return "", "", errors.Wrapf(err, "error opening container %s /etc/passwd", c.ID())
+			}
+			defer f.Close()
+
+			if _, err := f.WriteString(passwdEntry); err != nil {
+				return "", "", errors.Wrapf(err, "unable to append to container %s /etc/passwd", c.ID())
+			}
+		default:
+			logrus.Debugf("Not modifying container %s /etc/passwd", c.ID())
+		}
+	}
+	if needGroup {
+		groupEntry, err := c.generateGroupEntry()
+		if err != nil {
+			return "", "", err
+		}
+
+		needsWrite := groupEntry != ""
+		switch {
+		case ro && needsWrite:
+			logrus.Debugf("Making /etc/group for container %s", c.ID())
+			originGroupFile, err := securejoin.SecureJoin(c.state.Mountpoint, "/etc/group")
+			if err != nil {
+				return "", "", errors.Wrapf(err, "error creating path to container %s /etc/group", c.ID())
+			}
+			orig, err := ioutil.ReadFile(originGroupFile)
+			if err != nil && !os.IsNotExist(err) {
+				return "", "", errors.Wrapf(err, "unable to read group file %s", originGroupFile)
+			}
+			groupFile, err := c.writeStringToStaticDir("group", string(orig)+groupEntry)
+			if err != nil {
+				return "", "", errors.Wrapf(err, "failed to create temporary group file")
+			}
+			if err := os.Chmod(groupFile, 0644); err != nil {
+				return "", "", err
+			}
+			groupPath = groupFile
+		case !ro && needsWrite:
+			logrus.Debugf("Modifying container %s /etc/group", c.ID())
+			containerGroup, err := securejoin.SecureJoin(c.state.Mountpoint, "/etc/group")
+			if err != nil {
+				return "", "", errors.Wrapf(err, "error looking up location of container %s /etc/group", c.ID())
+			}
+
+			f, err := os.OpenFile(containerGroup, os.O_APPEND|os.O_WRONLY, 0600)
+			if err != nil {
+				return "", "", errors.Wrapf(err, "error opening container %s /etc/group", c.ID())
+			}
+			defer f.Close()
+
+			if _, err := f.WriteString(groupEntry); err != nil {
+				return "", "", errors.Wrapf(err, "unable to append to container %s /etc/group", c.ID())
+			}
+		default:
+			logrus.Debugf("Not modifying container %s /etc/group", c.ID())
+		}
+	}
+
+	return passwdPath, groupPath, nil
 }
 
 func (c *Container) copyOwnerAndPerms(source, dest string) error {
@@ -1438,36 +1931,95 @@ func (c *Container) copyOwnerAndPerms(source, dest string) error {
 	return nil
 }
 
-// Teardown CNI config on refresh
-func (c *Container) refreshCNI() error {
-	// Let's try and delete any lingering network config...
-	podNetwork := c.runtime.getPodNetwork(c.ID(), c.config.Name, "", c.config.Networks, c.config.PortMappings, c.config.StaticIP, c.config.StaticMAC)
-	return c.runtime.netPlugin.TearDownPod(podNetwork)
-}
-
 // Get cgroup path in a format suitable for the OCI spec
 func (c *Container) getOCICgroupPath() (string, error) {
 	unified, err := cgroups.IsCgroup2UnifiedMode()
 	if err != nil {
 		return "", err
 	}
-	if (rootless.IsRootless() && !unified) || c.config.NoCgroups {
+	switch {
+	case (rootless.IsRootless() && !unified) || c.config.NoCgroups:
 		return "", nil
-	} else if c.runtime.config.CgroupManager == define.SystemdCgroupsManager {
-		// When runc is set to use Systemd as a cgroup manager, it
+	case c.config.CgroupsMode == cgroupSplit:
+		if c.config.CgroupParent != "" {
+			return c.config.CgroupParent, nil
+		}
+		selfCgroup, err := utils.GetOwnCgroup()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(selfCgroup, "container"), nil
+	case c.runtime.config.Engine.CgroupManager == config.SystemdCgroupsManager:
+		// When the OCI runtime is set to use Systemd as a cgroup manager, it
 		// expects cgroups to be passed as follows:
 		// slice:prefix:name
 		systemdCgroups := fmt.Sprintf("%s:libpod:%s", path.Base(c.config.CgroupParent), c.ID())
 		logrus.Debugf("Setting CGroups for container %s to %s", c.ID(), systemdCgroups)
 		return systemdCgroups, nil
-	} else if c.runtime.config.CgroupManager == define.CgroupfsCgroupsManager {
+	case c.runtime.config.Engine.CgroupManager == config.CgroupfsCgroupsManager:
 		cgroupPath, err := c.CGroupPath()
 		if err != nil {
 			return "", err
 		}
 		logrus.Debugf("Setting CGroup path for container %s to %s", c.ID(), cgroupPath)
 		return cgroupPath, nil
-	} else {
-		return "", errors.Wrapf(define.ErrInvalidArg, "invalid cgroup manager %s requested", c.runtime.config.CgroupManager)
+	default:
+		return "", errors.Wrapf(define.ErrInvalidArg, "invalid cgroup manager %s requested", c.runtime.config.Engine.CgroupManager)
 	}
+}
+
+func (c *Container) copyTimezoneFile(zonePath string) (string, error) {
+	var localtimeCopy string = filepath.Join(c.state.RunDir, "localtime")
+	file, err := os.Stat(zonePath)
+	if err != nil {
+		return "", err
+	}
+	if file.IsDir() {
+		return "", errors.New("Invalid timezone: is a directory")
+	}
+	src, err := os.Open(zonePath)
+	if err != nil {
+		return "", err
+	}
+	defer src.Close()
+	dest, err := os.Create(localtimeCopy)
+	if err != nil {
+		return "", err
+	}
+	defer dest.Close()
+	_, err = io.Copy(dest, src)
+	if err != nil {
+		return "", err
+	}
+	if err := label.Relabel(localtimeCopy, c.config.MountLabel, false); err != nil {
+		return "", err
+	}
+	if err := dest.Chown(c.RootUID(), c.RootGID()); err != nil {
+		return "", err
+	}
+	return localtimeCopy, err
+}
+
+func (c *Container) cleanupOverlayMounts() error {
+	return overlay.CleanupContent(c.config.StaticDir)
+}
+
+// Check if a file exists at the given path in the container's root filesystem.
+// Container must already be mounted for this to be used.
+func (c *Container) checkFileExistsInRootfs(file string) (bool, error) {
+	checkPath, err := securejoin.SecureJoin(c.state.Mountpoint, file)
+	if err != nil {
+		return false, errors.Wrapf(err, "cannot create path to container %s file %q", c.ID(), file)
+	}
+	stat, err := os.Stat(checkPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, errors.Wrapf(err, "error accessing container %s file %q", c.ID(), file)
+	}
+	if stat.IsDir() {
+		return false, nil
+	}
+	return true, nil
 }

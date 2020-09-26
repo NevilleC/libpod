@@ -30,10 +30,13 @@ const (
 
 func pullAndFindImage(ctx context.Context, store storage.Store, srcRef types.ImageReference, options BuilderOptions, sc *types.SystemContext) (*storage.Image, types.ImageReference, error) {
 	pullOptions := PullOptions{
-		ReportWriter:  options.ReportWriter,
-		Store:         store,
-		SystemContext: options.SystemContext,
-		BlobDirectory: options.BlobDirectory,
+		ReportWriter:     options.ReportWriter,
+		Store:            store,
+		SystemContext:    options.SystemContext,
+		BlobDirectory:    options.BlobDirectory,
+		MaxRetries:       options.MaxPullRetries,
+		RetryDelay:       options.PullRetryDelay,
+		OciDecryptConfig: options.OciDecryptConfig,
 	}
 	ref, err := pullImage(ctx, store, srcRef, pullOptions, sc)
 	if err != nil {
@@ -68,13 +71,13 @@ func getImageName(name string, img *storage.Image) string {
 
 func imageNamePrefix(imageName string) string {
 	prefix := imageName
-	s := strings.Split(imageName, "/")
-	if len(s) > 0 {
-		prefix = s[len(s)-1]
-	}
-	s = strings.Split(prefix, ":")
+	s := strings.Split(prefix, ":")
 	if len(s) > 0 {
 		prefix = s[0]
+	}
+	s = strings.Split(prefix, "/")
+	if len(s) > 0 {
+		prefix = s[len(s)-1]
 	}
 	s = strings.Split(prefix, "@")
 	if len(s) > 0 {
@@ -194,7 +197,7 @@ func resolveImage(ctx context.Context, systemContext *types.SystemContext, store
 				logrus.Debugf("no such image %q: %v", transports.ImageName(ref), err)
 				failures = append(failures, failure{
 					resolvedImageName: image,
-					err:               fmt.Errorf("no such image %q", transports.ImageName(ref)),
+					err:               errors.Errorf("no such image %q", transports.ImageName(ref)),
 				})
 				continue
 			}
@@ -210,7 +213,7 @@ func resolveImage(ctx context.Context, systemContext *types.SystemContext, store
 	}
 
 	if len(failures) != len(candidates) {
-		return nil, "", nil, fmt.Errorf("internal error: %d candidates (%#v) vs. %d failures (%#v)", len(candidates), candidates, len(failures), failures)
+		return nil, "", nil, errors.Errorf("internal error: %d candidates (%#v) vs. %d failures (%#v)", len(candidates), candidates, len(failures), failures)
 	}
 
 	registriesConfPath := sysregistriesv2.ConfigPath(systemContext)
@@ -219,7 +222,7 @@ func resolveImage(ctx context.Context, systemContext *types.SystemContext, store
 		if searchRegistriesWereUsedButEmpty {
 			return nil, "", nil, errors.Errorf("image name %q is a short name and no search registries are defined in %s.", options.FromImage, registriesConfPath)
 		}
-		return nil, "", nil, fmt.Errorf("internal error: no pull candidates were available for %q for an unknown reason", options.FromImage)
+		return nil, "", nil, errors.Errorf("internal error: no pull candidates were available for %q for an unknown reason", options.FromImage)
 
 	case 1:
 		err := failures[0].err
@@ -398,14 +401,13 @@ func newBuilder(ctx context.Context, store storage.Store, options BuilderOptions
 			UIDMap:         uidmap,
 			GIDMap:         gidmap,
 		},
-		AddCapabilities:  copyStringSlice(options.AddCapabilities),
-		DropCapabilities: copyStringSlice(options.DropCapabilities),
-		CommonBuildOpts:  options.CommonBuildOpts,
-		TopLayer:         topLayer,
-		Args:             options.Args,
-		Format:           options.Format,
-		TempVolumes:      map[string]bool{},
-		Devices:          options.Devices,
+		Capabilities:    copyStringSlice(options.Capabilities),
+		CommonBuildOpts: options.CommonBuildOpts,
+		TopLayer:        topLayer,
+		Args:            options.Args,
+		Format:          options.Format,
+		TempVolumes:     map[string]bool{},
+		Devices:         options.Devices,
 	}
 
 	if options.Mount {

@@ -6,12 +6,12 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/containers/libpod/libpod/define"
-	"github.com/containers/libpod/pkg/rootless"
+	"github.com/containers/podman/v2/libpod/define"
+	"github.com/containers/podman/v2/pkg/rootless"
 	"github.com/containers/storage"
-	bolt "github.com/etcd-io/bbolt"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	bolt "go.etcd.io/bbolt"
 )
 
 const (
@@ -24,6 +24,7 @@ const (
 	allPodsName       = "allPods"
 	volName           = "vol"
 	allVolsName       = "allVolumes"
+	execName          = "exec"
 	runtimeConfigName = "runtime-config"
 
 	configName         = "config"
@@ -54,6 +55,7 @@ var (
 	allPodsBkt       = []byte(allPodsName)
 	volBkt           = []byte(volName)
 	allVolsBkt       = []byte(allVolsName)
+	execBkt          = []byte(execName)
 	runtimeConfigBkt = []byte(runtimeConfigName)
 
 	configKey          = []byte(configName)
@@ -102,37 +104,37 @@ func checkRuntimeConfig(db *bolt.DB, rt *Runtime) error {
 		},
 		{
 			"libpod root directory (staticdir)",
-			rt.config.StaticDir,
+			rt.config.Engine.StaticDir,
 			staticDirKey,
 			"",
 		},
 		{
 			"libpod temporary files directory (tmpdir)",
-			rt.config.TmpDir,
+			rt.config.Engine.TmpDir,
 			tmpDirKey,
 			"",
 		},
 		{
 			"storage temporary directory (runroot)",
-			rt.config.StorageConfig.RunRoot,
+			rt.StorageConfig().RunRoot,
 			runRootKey,
 			storeOpts.RunRoot,
 		},
 		{
 			"storage graph root directory (graphroot)",
-			rt.config.StorageConfig.GraphRoot,
+			rt.StorageConfig().GraphRoot,
 			graphRootKey,
 			storeOpts.GraphRoot,
 		},
 		{
 			"storage graph driver",
-			rt.config.StorageConfig.GraphDriverName,
+			rt.StorageConfig().GraphDriverName,
 			graphDriverKey,
 			storeOpts.GraphDriverName,
 		},
 		{
 			"volume path",
-			rt.config.VolumePath,
+			rt.config.Engine.VolumePath,
 			volPathKey,
 			"",
 		},
@@ -339,6 +341,14 @@ func getAllVolsBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
 	return bkt, nil
 }
 
+func getExecBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
+	bkt := tx.Bucket(execBkt)
+	if bkt == nil {
+		return nil, errors.Wrapf(define.ErrDBBadConfig, "exec bucket not found in DB")
+	}
+	return bkt, nil
+}
+
 func getRuntimeConfigBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
 	bkt := tx.Bucket(runtimeConfigBkt)
 	if bkt == nil {
@@ -397,10 +407,7 @@ func (s *BoltState) getContainerFromDB(id []byte, ctr *Container, ctrsBkt *bolt.
 		ociRuntime, ok := s.runtime.ociRuntimes[runtimeName]
 		if !ok {
 			// Use a MissingRuntime implementation
-			ociRuntime, err = getMissingRuntime(runtimeName, s.runtime)
-			if err != nil {
-				return err
-			}
+			ociRuntime = getMissingRuntime(runtimeName, s.runtime)
 		}
 		ctr.ociRuntime = ociRuntime
 	}
@@ -579,11 +586,19 @@ func (s *BoltState) addContainer(ctr *Container, pod *Pod) error {
 		// Check if we already have a container with the given ID and name
 		idExist := idsBucket.Get(ctrID)
 		if idExist != nil {
-			return errors.Wrapf(define.ErrCtrExists, "ID %s is in use", ctr.ID())
+			err = define.ErrCtrExists
+			if allCtrsBucket.Get(idExist) == nil {
+				err = define.ErrPodExists
+			}
+			return errors.Wrapf(err, "ID \"%s\" is in use", ctr.ID())
 		}
 		nameExist := namesBucket.Get(ctrName)
 		if nameExist != nil {
-			return errors.Wrapf(define.ErrCtrExists, "name %s is in use", ctr.Name())
+			err = define.ErrCtrExists
+			if allCtrsBucket.Get(nameExist) == nil {
+				err = define.ErrPodExists
+			}
+			return errors.Wrapf(err, "name \"%s\" is in use", ctr.Name())
 		}
 
 		// No overlapping containers
@@ -652,11 +667,9 @@ func (s *BoltState) addContainer(ctr *Container, pod *Pod) error {
 				if string(depCtrPod) != pod.ID() {
 					return errors.Wrapf(define.ErrInvalidArg, "container %s depends on container %s which is in a different pod (%s)", ctr.ID(), dependsCtr, string(depCtrPod))
 				}
-			} else {
+			} else if depCtrPod != nil {
 				// If we're not part of a pod, we cannot depend on containers in a pod
-				if depCtrPod != nil {
-					return errors.Wrapf(define.ErrInvalidArg, "container %s depends on container %s which is in a pod - containers not in pods cannot depend on containers in pods", ctr.ID(), dependsCtr)
-				}
+				return errors.Wrapf(define.ErrInvalidArg, "container %s depends on container %s which is in a pod - containers not in pods cannot depend on containers in pods", ctr.ID(), dependsCtr)
 			}
 
 			depNamespace := depCtrBkt.Get(namespaceKey)
@@ -687,7 +700,10 @@ func (s *BoltState) addContainer(ctr *Container, pod *Pod) error {
 				return errors.Wrapf(define.ErrNoSuchVolume, "no volume with name %s found in database when adding container %s", vol.Name, ctr.ID())
 			}
 
-			ctrDepsBkt := volDB.Bucket(volDependenciesBkt)
+			ctrDepsBkt, err := volDB.CreateBucketIfNotExists(volDependenciesBkt)
+			if err != nil {
+				return errors.Wrapf(err, "error creating volume %s dependencies bucket to add container %s", vol.Name, ctr.ID())
+			}
 			if depExists := ctrDepsBkt.Get(ctrID); depExists == nil {
 				if err := ctrDepsBkt.Put(ctrID, ctrID); err != nil {
 					return errors.Wrapf(err, "error adding container %s to volume %s dependencies", ctr.ID(), vol.Name)
@@ -789,6 +805,23 @@ func (s *BoltState) removeContainer(ctr *Container, pod *Pod, tx *bolt.Tx) error
 		}
 	}
 
+	// Does the container have exec sessions?
+	ctrExecSessionsBkt := ctrExists.Bucket(execBkt)
+	if ctrExecSessionsBkt != nil {
+		sessions := []string{}
+		err = ctrExecSessionsBkt.ForEach(func(id, value []byte) error {
+			sessions = append(sessions, string(id))
+
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if len(sessions) > 0 {
+			return errors.Wrapf(define.ErrExecSessionExists, "container %s has active exec sessions: %s", ctr.ID(), strings.Join(sessions, ", "))
+		}
+	}
+
 	// Does the container have dependencies?
 	ctrDepsBkt := ctrExists.Bucket(dependenciesBkt)
 	if ctrDepsBkt == nil {
@@ -865,6 +898,9 @@ func (s *BoltState) removeContainer(ctr *Container, pod *Pod, tx *bolt.Tx) error
 		}
 
 		ctrDepsBkt := volDB.Bucket(volDependenciesBkt)
+		if ctrDepsBkt == nil {
+			return errors.Wrapf(define.ErrInternal, "volume %s is missing container dependencies bucket, cannot remove container %s from dependencies", vol.Name, ctr.ID())
+		}
 		if depExists := ctrDepsBkt.Get(ctrID); depExists == nil {
 			if err := ctrDepsBkt.Delete(ctrID); err != nil {
 				return errors.Wrapf(err, "error deleting container %s dependency on volume %s", ctr.ID(), vol.Name)

@@ -3,7 +3,7 @@
 package libpod
 
 import (
-	"github.com/containers/libpod/libpod/define"
+	"github.com/containers/podman/v2/libpod/define"
 	"github.com/pkg/errors"
 )
 
@@ -25,7 +25,7 @@ func assembleSystemdCgroupName(baseSlice, newSlice string) (string, error) {
 
 // LabelVolumePath takes a mount path for a volume and gives it an
 // selinux label of either shared or not
-func LabelVolumePath(path string, shared bool) error {
+func LabelVolumePath(path string) error {
 	return define.ErrNotImplemented
 }
 

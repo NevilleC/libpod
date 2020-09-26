@@ -1,11 +1,9 @@
-// +build !remoteclient
-
 package integration
 
 import (
 	"os"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -35,6 +33,7 @@ var _ = Describe("Podman run exit", func() {
 	})
 
 	It("podman run -d mount cleanup test", func() {
+		SkipIfRemote("podman-remote does not support mount")
 		SkipIfRootless()
 
 		result := podmanTest.Podman([]string{"run", "-dt", ALPINE, "top"})

@@ -39,9 +39,9 @@ type PodmanTest struct {
 	TempDir            string
 	RemoteTest         bool
 	RemotePodmanBinary string
-	VarlinkSession     *os.Process
-	VarlinkEndpoint    string
-	VarlinkCommand     *exec.Cmd
+	RemoteSession      *os.Process
+	RemoteSocket       string
+	RemoteCommand      *exec.Cmd
 	ImageCacheDir      string
 	ImageCacheFS       string
 }
@@ -65,15 +65,16 @@ func (p *PodmanTest) MakeOptions(args []string, noEvents, noCache bool) []string
 
 // PodmanAsUserBase exec podman as user. uid and gid is set for credentials usage. env is used
 // to record the env for debugging
-func (p *PodmanTest) PodmanAsUserBase(args []string, uid, gid uint32, cwd string, env []string, noEvents, noCache bool) *PodmanSession {
+func (p *PodmanTest) PodmanAsUserBase(args []string, uid, gid uint32, cwd string, env []string, noEvents, noCache bool, extraFiles []*os.File) *PodmanSession {
 	var command *exec.Cmd
 	podmanOptions := p.MakeOptions(args, noEvents, noCache)
 	podmanBinary := p.PodmanBinary
 	if p.RemoteTest {
 		podmanBinary = p.RemotePodmanBinary
-		env = append(env, fmt.Sprintf("PODMAN_VARLINK_ADDRESS=%s", p.VarlinkEndpoint))
 	}
-
+	if p.RemoteTest {
+		podmanOptions = append([]string{"--remote", "--url", p.RemoteSocket}, podmanOptions...)
+	}
 	if env == nil {
 		fmt.Printf("Running: %s %s\n", podmanBinary, strings.Join(podmanOptions, " "))
 	} else {
@@ -93,6 +94,8 @@ func (p *PodmanTest) PodmanAsUserBase(args []string, uid, gid uint32, cwd string
 		command.Dir = cwd
 	}
 
+	command.ExtraFiles = extraFiles
+
 	session, err := gexec.Start(command, GinkgoWriter, GinkgoWriter)
 	if err != nil {
 		Fail(fmt.Sprintf("unable to run podman command: %s\n%v", strings.Join(podmanOptions, " "), err))
@@ -102,7 +105,7 @@ func (p *PodmanTest) PodmanAsUserBase(args []string, uid, gid uint32, cwd string
 
 // PodmanBase exec podman with default env.
 func (p *PodmanTest) PodmanBase(args []string, noEvents, noCache bool) *PodmanSession {
-	return p.PodmanAsUserBase(args, 0, 0, "", nil, noEvents, noCache)
+	return p.PodmanAsUserBase(args, 0, 0, "", nil, noEvents, noCache, nil)
 }
 
 // WaitForContainer waits on a started container
@@ -204,7 +207,11 @@ func WaitContainerReady(p PodmanTestCommon, id string, expStr string, timeout in
 
 // OutputToString formats session output to string
 func (s *PodmanSession) OutputToString() string {
-	fields := strings.Fields(fmt.Sprintf("%s", s.Out.Contents()))
+	if s == nil || s.Out == nil || s.Out.Contents() == nil {
+		return ""
+	}
+
+	fields := strings.Fields(string(s.Out.Contents()))
 	return strings.Join(fields, " ")
 }
 
@@ -212,7 +219,7 @@ func (s *PodmanSession) OutputToString() string {
 // where each array item is a line split by newline
 func (s *PodmanSession) OutputToStringArray() []string {
 	var results []string
-	output := fmt.Sprintf("%s", s.Out.Contents())
+	output := string(s.Out.Contents())
 	for _, line := range strings.Split(output, "\n") {
 		if line != "" {
 			results = append(results, line)
@@ -223,14 +230,14 @@ func (s *PodmanSession) OutputToStringArray() []string {
 
 // ErrorToString formats session stderr to string
 func (s *PodmanSession) ErrorToString() string {
-	fields := strings.Fields(fmt.Sprintf("%s", s.Err.Contents()))
+	fields := strings.Fields(string(s.Err.Contents()))
 	return strings.Join(fields, " ")
 }
 
 // ErrorToStringArray returns the stderr output as a []string
 // where each array item is a line split by newline
 func (s *PodmanSession) ErrorToStringArray() []string {
-	output := fmt.Sprintf("%s", s.Err.Contents())
+	output := string(s.Err.Contents())
 	return strings.Split(output, "\n")
 }
 
@@ -335,6 +342,16 @@ func SystemExec(command string, args []string) *PodmanSession {
 		Fail(fmt.Sprintf("unable to run command: %s %s", command, strings.Join(args, " ")))
 	}
 	session.Wait(defaultWaitTimeout)
+	return &PodmanSession{session}
+}
+
+// StartSystemExec is used to start exec a system command
+func StartSystemExec(command string, args []string) *PodmanSession {
+	c := exec.Command(command, args...)
+	session, err := gexec.Start(c, GinkgoWriter, GinkgoWriter)
+	if err != nil {
+		Fail(fmt.Sprintf("unable to run command: %s %s", command, strings.Join(args, " ")))
+	}
 	return &PodmanSession{session}
 }
 

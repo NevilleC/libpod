@@ -1,9 +1,9 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -xeo pipefail
 
 export GOPATH=/var/tmp/go
 export PATH=$HOME/gopath/bin:$PATH:$GOPATH/bin
-export GOSRC=$GOPATH/src/github.com/containers/libpod
+export GOSRC=$GOPATH/src/github.com/containers/podman
 
 DIST=${DIST:=""}
 CONTAINER_RUNTIME=${DIST:=""}
@@ -17,6 +17,8 @@ INTEGRATION_TEST_ENVS=""
 if [ "${ID}" != "fedora" ] || [ "${CONTAINER_RUNTIME}" != "" ]; then
     INTEGRATION_TEST_ENVS="SKIP_USERNS=1"
 fi
+
+echo "$(date --rfc-3339=seconds) $(basename $0) started with '$*' and RCLI='${RCLI}'"
 
 pwd
 
@@ -55,9 +57,9 @@ while getopts "bituv" opt; do
     esac
 done
 
-# The TEST_REMOTE_CLIENT environment variable decides whether
+# The RCLI environment variable decides whether
 # to test varlinke
-if [[ "$TEST_REMOTE_CLIENT" == "true" ]]; then
+if [[ "$RCLI" == "true" ]]; then
     remote=1
 fi
 
@@ -126,7 +128,6 @@ if [ $install -eq 1 ]; then
     make TAGS="${TAGS}" install.bin PREFIX=/usr ETCDIR=/etc
     make TAGS="${TAGS}" install.man PREFIX=/usr ETCDIR=/etc
     make TAGS="${TAGS}" install.cni PREFIX=/usr ETCDIR=/etc
-    make TAGS="${TAGS}" install.config PREFIX=/usr ETCDIR=/etc
     make TAGS="${TAGS}" install.systemd PREFIX=/usr ETCDIR=/etc
 fi
 

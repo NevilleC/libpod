@@ -1,9 +1,11 @@
 package integration
 
 import (
+	"io/ioutil"
 	"os"
+	"path/filepath"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -45,6 +47,21 @@ var _ = Describe("Podman commit", func() {
 		check.WaitWithDefaultTimeout()
 		data := check.InspectImageJSON()
 		Expect(StringInSlice("foobar.com/test1-image:latest", data[0].RepoTags)).To(BeTrue())
+	})
+
+	It("podman commit single letter container", func() {
+		_, ec, _ := podmanTest.RunLsContainer("test1")
+		Expect(ec).To(Equal(0))
+		Expect(podmanTest.NumberOfContainers()).To(Equal(1))
+
+		session := podmanTest.Podman([]string{"commit", "test1", "a"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+
+		check := podmanTest.Podman([]string{"inspect", "localhost/a:latest"})
+		check.WaitWithDefaultTimeout()
+		data := check.InspectImageJSON()
+		Expect(StringInSlice("localhost/a:latest", data[0].RepoTags)).To(BeTrue())
 	})
 
 	It("podman container commit container", func() {
@@ -115,6 +132,25 @@ var _ = Describe("Podman commit", func() {
 		Expect(foundBlue).To(Equal(true))
 	})
 
+	It("podman commit container with change flag and JSON entrypoint with =", func() {
+		test := podmanTest.Podman([]string{"run", "--name", "test1", "-d", ALPINE, "ls"})
+		test.WaitWithDefaultTimeout()
+		Expect(test.ExitCode()).To(Equal(0))
+		Expect(podmanTest.NumberOfContainers()).To(Equal(1))
+
+		session := podmanTest.Podman([]string{"commit", "--change", `ENTRYPOINT ["foo", "bar=baz"]`, "test1", "foobar.com/test1-image:latest"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+
+		check := podmanTest.Podman([]string{"inspect", "foobar.com/test1-image:latest"})
+		check.WaitWithDefaultTimeout()
+		data := check.InspectImageJSON()
+		Expect(len(data)).To(Equal(1))
+		Expect(len(data[0].Config.Entrypoint)).To(Equal(2))
+		Expect(data[0].Config.Entrypoint[0]).To(Equal("foo"))
+		Expect(data[0].Config.Entrypoint[1]).To(Equal("bar=baz"))
+	})
+
 	It("podman commit container with change CMD flag", func() {
 		test := podmanTest.Podman([]string{"run", "--name", "test1", "-d", ALPINE, "ls"})
 		test.WaitWithDefaultTimeout()
@@ -174,7 +210,7 @@ var _ = Describe("Podman commit", func() {
 	It("podman commit with volume mounts and --include-volumes", func() {
 		// We need to figure out how volumes are going to work correctly with the remote
 		// client.  This does not currently work.
-		SkipIfRemote()
+		SkipIfRemote("--testing Remote Volumes")
 		s := podmanTest.Podman([]string{"run", "--name", "test1", "-v", "/tmp:/foo", "alpine", "date"})
 		s.WaitWithDefaultTimeout()
 		Expect(s.ExitCode()).To(Equal(0))
@@ -214,5 +250,33 @@ var _ = Describe("Podman commit", func() {
 			envMap[v] = true
 		}
 		Expect(envMap["TEST=1=1-01=9.01"]).To(BeTrue())
+	})
+
+	It("podman commit container and print id to external file", func() {
+		// Switch to temp dir and restore it afterwards
+		cwd, err := os.Getwd()
+		Expect(err).To(BeNil())
+		Expect(os.Chdir(os.TempDir())).To(BeNil())
+		targetPath, err := CreateTempDirInTempDir()
+		if err != nil {
+			os.Exit(1)
+		}
+		targetFile := filepath.Join(targetPath, "idFile")
+		defer Expect(os.RemoveAll(targetFile)).To(BeNil())
+		defer Expect(os.Chdir(cwd)).To(BeNil())
+
+		_, ec, _ := podmanTest.RunLsContainer("test1")
+		Expect(ec).To(Equal(0))
+		Expect(podmanTest.NumberOfContainers()).To(Equal(1))
+
+		session := podmanTest.Podman([]string{"commit", "test1", "foobar.com/test1-image:latest", "--iidfile", targetFile})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+
+		id, _ := ioutil.ReadFile(targetFile)
+		check := podmanTest.Podman([]string{"inspect", "foobar.com/test1-image:latest"})
+		check.WaitWithDefaultTimeout()
+		data := check.InspectImageJSON()
+		Expect(data[0].ID).To(Equal(string(id)))
 	})
 })

@@ -23,7 +23,7 @@ created by the other.
 
 **--cgroup-manager**=*manager*
 
-CGroup manager to use for container cgroups. Supported values are cgroupfs or systemd. Default is systemd unless overridden in the libpod.conf file.
+The CGroup manager to use for container cgroups. Supported values are cgroupfs or systemd. Default is systemd unless overridden in the containers.conf file.
 
 Note: Setting this flag can cause certain commands to break when called on containers previously created by the other CGroup manager type.
 Note: CGroup manager is not supported in rootless mode when using CGroups Version V1.
@@ -31,17 +31,11 @@ Note: CGroup manager is not supported in rootless mode when using CGroups Versio
 **--cni-config-dir**
 Path of the configuration directory for CNI networks.  (Default: `/etc/cni/net.d`)
 
-**--config**
-Path of a libpod config file detailing container server configuration options
-
-Default libpod config file is /usr/share/containers/libpod.conf.  Override file is in /etc/containers/libpod.conf.  In rootless mode the config file will be read from $HOME/.config/containers/libpod.conf.
+**--connection**, **-c**
+Connection to use for remote podman (Default connection is configured in `containers.conf`)
 
 **--conmon**
-Path of the conmon binary (Default path is configured in `libpod.conf`)
-
-**--cpu-profile**=*path*
-
-Path to where the cpu performance results should be written
+Path of the conmon binary (Default path is configured in `containers.conf`)
 
 **--events-backend**=*type*
 
@@ -67,6 +61,17 @@ Podman and libpod currently support an additional `precreate` state which is cal
 
 **WARNING**: the `precreate` hook lets you do powerful things, such as adding additional mounts to the runtime configuration.  That power also makes it easy to break things.  Before reporting libpod errors, try running your container with `precreate` hooks disabled to see if the problem is due to one of your hooks.
 
+**--identity**=*path*
+
+Path to ssh identity file. If the identity file has been encrypted, podman prompts the user for the passphrase.
+If no identity file is provided and no user is given, podman defaults to the user running the podman command.
+Podman prompts for the login password on the remote server.
+
+Identity value resolution precedence:
+ - command line value
+ - environment variable `CONTAINER_SSHKEY`, if `CONTAINER_HOST` is found
+ - `containers.conf`
+
 **--log-level**=*level*
 
 Log messages above specified level: debug, info, warn, error (default), fatal or panic (default: "error")
@@ -79,19 +84,50 @@ When namespace is set, created containers and pods will join the given namespace
 **--network-cmd-path**=*path*
 Path to the command binary to use for setting up a network.  It is currently only used for setting up a slirp4netns network.  If "" is used then the binary is looked up using the $PATH environment variable.
 
-**--root=***value*
+**--remote**, **-r**
+Access Podman service will be remote
+
+**--url**=*value*
+URL to access Podman service (default from `containers.conf`, rootless `unix://run/user/$UID/podman/podman.sock` or as root `unix://run/podman/podman.sock`).
+
+ - `CONTAINER_HOST` is of the format `<schema>://[<user[:<password>]@]<host>[:<port>][<path>]`
+
+Details:
+ - `user` will default to either `root` or current running user
+ - `password` has no default
+ - `host` must be provided and is either the IP or name of the machine hosting the Podman service
+ - `port` defaults to 22
+ - `path` defaults to either `/run/podman/podman.sock`, or `/run/user/<uid>/podman/podman.sock` if running rootless.
+
+URL value resolution precedence:
+ - command line value
+ - environment variable `CONTAINER_HOST`
+ - `containers.conf`
+ - `unix://run/podman/podman.sock`
+
+**--root**=*value*
 
 Storage root dir in which data, including images, is stored (default: "/var/lib/containers/storage" for UID 0, "$HOME/.local/share/containers/storage" for other users).
-Default root dir is configured in `/etc/containers/storage.conf`.
+Default root dir configured in `/etc/containers/storage.conf`.
 
 **--runroot**=*value*
 
 Storage state directory where all state information is stored (default: "/var/run/containers/storage" for UID 0, "/var/run/user/$UID/run" for other users).
-Default state dir is configured in `/etc/containers/storage.conf`.
+Default state dir configured in `/etc/containers/storage.conf`.
 
 **--runtime**=*value*
 
-Name of the OCI runtime as specified in libpod.conf or absolute path to the OCI compatible binary used to run containers.
+Name of the OCI runtime as specified in containers.conf or absolute path to the OCI compatible binary used to run containers.
+
+**--runtime-flag**=*flag*
+
+Adds global flags for the container runtime. To list the supported flags, please
+consult the manpages of the selected container runtime (`runc` is the default
+runtime, the manpage to consult is `runc(8)`.  When the machine is configured
+for cgroup V2, the default runtime is `crun`, the manpage to consult is `crun(8)`.).
+
+Note: Do not pass the leading `--` to the flag. To pass the runc flag `--log-format json`
+to podman build, the option given would be `--runtime-flag log-format=json`.
 
 **--storage-driver**=*value*
 
@@ -104,11 +140,11 @@ specify additional options via the `--storage-opt` flag.
 
 Storage driver option, Default storage driver options are configured in /etc/containers/storage.conf (`$HOME/.config/containers/storage.conf` in rootless mode). The `STORAGE_OPTS` environment variable overrides the default. The --storage-opt specified options overrides all.
 
-**--syslog**
+**--syslog**=*true|false*
 
-Output logging information to syslog as well as the console.
+Output logging information to syslog as well as the console (default *false*).
 
-On remote clients, logging is directed to the file ~/.config/containers/podman.log
+On remote clients, logging is directed to the file $HOME/.config/containers/podman.log.
 
 **--tmpdir**
 
@@ -120,33 +156,37 @@ NOTE --tmpdir is not used for the temporary storage of downloaded images.  Use t
 
 Print the version
 
+## Environment Variables
+
+Podman can set up environment variables from env of [engine] table in containers.conf. These variables can be overridden by passing  environment variables before the `podman` commands.
+
 ## Exit Status
 
 The exit code from `podman` gives information about why the container
 failed to run or why it exited.  When `podman` commands exit with a non-zero code,
 the exit codes follow the `chroot` standard, see below:
 
-**_125_** if the error is with podman **_itself_**
+  **125** The error is with podman **_itself_**
 
     $ podman run --foo busybox; echo $?
     Error: unknown flag: --foo
-      125
+    125
 
-**_126_** if executing a **_contained command_** and the **_command_** cannot be invoked
+  **126** Executing a _contained command_ and the _command_ cannot be invoked
 
     $ podman run busybox /etc; echo $?
     Error: container_linux.go:346: starting container process caused "exec: \"/etc\": permission denied": OCI runtime error
-      126
+    126
 
-**_127_** if executing a **_contained command_** and the **_command_** cannot be found
+  **127** Executing a _contained command_ and the _command_ cannot be found
     $ podman run busybox foo; echo $?
     Error: container_linux.go:346: starting container process caused "exec: \"foo\": executable file not found in $PATH": OCI runtime error
-      127
+    127
 
-**_Exit code_** of **_contained command_** otherwise
+  **Exit code** _contained command_ exit code
 
-    $ podman run busybox /bin/sh -c 'exit 3'
-    # 3
+    $ podman run busybox /bin/sh -c 'exit 3'; echo $?
+    3
 
 
 ## COMMANDS
@@ -154,6 +194,7 @@ the exit codes follow the `chroot` standard, see below:
 | Command                                          | Description                                                                 |
 | ------------------------------------------------ | --------------------------------------------------------------------------- |
 | [podman-attach(1)](podman-attach.1.md)           | Attach to a running container.                                              |
+| [podman-auto-update(1)](podman-auto-update.1.md) | Auto update containers according to their auto-update policy                |
 | [podman-build(1)](podman-build.1.md)             | Build a container image using a Containerfile.                              |
 | [podman-commit(1)](podman-commit.1.md)           | Create new image based on the changed container.                            |
 | [podman-container(1)](podman-container.1.md)     | Manage containers.                                                          |
@@ -177,6 +218,7 @@ the exit codes follow the `chroot` standard, see below:
 | [podman-login(1)](podman-login.1.md)             | Login to a container registry.                                              |
 | [podman-logout(1)](podman-logout.1.md)           | Logout of a container registry.                                             |
 | [podman-logs(1)](podman-logs.1.md)               | Display the logs of one or more containers.                                 |
+| [podman-manifest(1)](podman-manifest.1.md)       | Create and manipulate manifest lists and image indexes.                     |
 | [podman-mount(1)](podman-mount.1.md)             | Mount a working container's root filesystem.                                |
 | [podman-network(1)](podman-network.1.md)         | Manage Podman CNI networks.                                                 |
 | [podman-pause(1)](podman-pause.1.md)             | Pause one or more containers.                                               |
@@ -198,21 +240,23 @@ the exit codes follow the `chroot` standard, see below:
 | [podman-system(1)](podman-system.1.md)           | Manage podman.                                                              |
 | [podman-tag(1)](podman-tag.1.md)                 | Add an additional name to a local image.                                    |
 | [podman-top(1)](podman-top.1.md)                 | Display the running processes of a container.                               |
-| [podman-umount(1)](podman-umount.1.md)           | Unmount a working container's root filesystem.                              |
+| [podman-unmount(1)](podman-unmount.1.md)           | Unmount a working container's root filesystem.                              |
 | [podman-unpause(1)](podman-unpause.1.md)         | Unpause one or more containers.                                             |
 | [podman-unshare(1)](podman-unshare.1.md)         | Run a command inside of a modified user namespace.                          |
-| [podman-varlink(1)](podman-varlink.1.md)         | Runs the varlink backend interface.                                         |
+| [podman-untag(1)](podman-untag.1.md)             | Removes one or more names from a locally-stored image.                      |
 | [podman-version(1)](podman-version.1.md)         | Display the Podman version information.                                     |
 | [podman-volume(1)](podman-volume.1.md)           | Simple management tool for volumes.                                         |
 | [podman-wait(1)](podman-wait.1.md)               | Wait on one or more containers to stop and print their exit codes.          |
 
 ## FILES
 
-**libpod.conf** (`/usr/share/containers/libpod.conf`)
+**containers.conf** (`/usr/share/containers/containers.conf`, `/etc/containers/containers.conf`, `$HOME/.config/containers/containers.conf`)
 
-    libpod.conf is the configuration file for all tools using libpod to manage containers, when run as root.  Administrators can override the defaults file by creating `/etc/containers/libpod.conf`.  When Podman runs in rootless mode, the file `$HOME/.config/containers/libpod.conf` is created and replaces some fields in the system configuration file.
+    Podman has builtin defaults for command line options. These defaults can be overridden using the containers.conf configuration files.
 
-    Podman uses builtin defaults if no libpod.conf file is found.
+Distributions ship the `/usr/share/containers/containers.conf` file with their default settings. Administrators can override fields in this file by creating the `/etc/containers/containers.conf` file.  Users can further modify defaults by creating the `$HOME/.config/containers/containers.conf` file. Podman merges its builtin defaults with the specified fields from these files, if they exist. Fields specified in the users file override the administrator's file, which overrides the distribution's file, which override the built-in defaults.
+
+Podman uses builtin defaults if no containers.conf file is found.
 
 **mounts.conf** (`/usr/share/containers/mounts.conf`)
 
@@ -224,13 +268,13 @@ When Podman runs in rootless mode, the file `$HOME/.config/containers/mounts.con
 
     Signature verification policy files are used to specify policy, e.g. trusted keys, applicable when deciding whether to accept an image, or individual signatures of that image, as valid.
 
-**registries.conf** (`/etc/containers/registries.conf`)
+**registries.conf** (`/etc/containers/registries.conf`, `$HOME/.config/containers/registries.conf`)
 
     registries.conf is the configuration file which specifies which container registries should be consulted when completing image names which do not include a registry or domain portion.
 
     Non root users of Podman can create the `$HOME/.config/containers/registries.conf` file to be used instead of the system defaults.
 
-**storage.conf** (`/etc/containers/storage.conf`)
+**storage.conf** (`/etc/containers/storage.conf`, `$HOME/.config/contaners/storage.conf`)
 
     storage.conf is the storage configuration file for all tools using containers/storage
 
@@ -264,14 +308,14 @@ Currently the slirp4netns package is required to be installed to create a networ
 
 ### **NOTE:** Unsupported file systems in rootless mode
 
-The Overlay file system (OverlayFS) is not supported in rootless mode.  The fuse-overlayfs package is a tool that provides the functionality of OverlayFS in user namespace that allows mounting file systems in rootless environments.  It is recommended to install the fuse-overlayfs package and to enable it by adding `mount_program = "/usr/bin/fuse-overlayfs"` under `[storage.options]` in the `~/.config/containers/storage.conf` file.
+The Overlay file system (OverlayFS) is not supported in rootless mode.  The fuse-overlayfs package is a tool that provides the functionality of OverlayFS in user namespace that allows mounting file systems in rootless environments.  It is recommended to install the fuse-overlayfs package and to enable it by adding `mount_program = "/usr/bin/fuse-overlayfs"` under `[storage.options]` in the `$HOME/.config/containers/storage.conf` file.
 
-The Network File System (NFS) and other distributed file systems (for example: Lustre, Spectrum Scale, the General Parallel File System (GPFS)) are not supported when running in rootless mode as these file systems do not understand user namespace.  However, rootless Podman can make use of an NFS Homedir by modifying the `~/.config/containers/storage.conf` to have the `graphroot` option point to a directory stored on local (Non NFS) storage.
+The Network File System (NFS) and other distributed file systems (for example: Lustre, Spectrum Scale, the General Parallel File System (GPFS)) are not supported when running in rootless mode as these file systems do not understand user namespace.  However, rootless Podman can make use of an NFS Homedir by modifying the `$HOME/.config/containers/storage.conf` to have the `graphroot` option point to a directory stored on local (Non NFS) storage.
 
-For more information, please refer to the [Podman Troubleshooting Page](https://github.com/containers/libpod/blob/master/troubleshooting.md).
+For more information, please refer to the [Podman Troubleshooting Page](https://github.com/containers/podman/blob/master/troubleshooting.md).
 
 ## SEE ALSO
-`containers-mounts.conf(5)`, `containers-registries.conf(5)`, `containers-storage.conf(5)`, `buildah(1)`, `libpod.conf(5)`, `oci-hooks(5)`, `containers-policy.json(5)`, `subuid(5)`, `subgid(5)`, `slirp4netns(1)`
+`containers-mounts.conf(5)`, `containers-registries.conf(5)`, `containers-storage.conf(5)`, `buildah(1)`, `containers.conf(5)`, `oci-hooks(5)`, `containers-policy.json(5)`, `crun(8)`, `runc(8)`, `subuid(5)`, `subgid(5)`, `slirp4netns(1)`
 
 ## HISTORY
 Dec 2016, Originally compiled by Dan Walsh <dwalsh@redhat.com>

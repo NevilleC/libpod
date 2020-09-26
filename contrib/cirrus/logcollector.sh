@@ -1,10 +1,10 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -e
 
 source $(dirname $0)/lib.sh
 
-req_env_var CIRRUS_WORKING_DIR OS_RELEASE_ID TEST_REMOTE_CLIENT
+req_env_var CIRRUS_WORKING_DIR OS_RELEASE_ID RCLI
 
 # Assume there are other log collection commands to follow - Don't
 # let one break another that may be useful, but also keep any
@@ -32,13 +32,14 @@ case $1 in
     df) showrun df -lhTx tmpfs ;;
     ginkgo) showrun cat $CIRRUS_WORKING_DIR/test/e2e/ginkgo-node-*.log ;;
     journal) showrun journalctl -b ;;
+    podman) showrun ./bin/podman system info ;;
     varlink)
-       if [[ "$TEST_REMOTE_CLIENT" == "true" ]]
+       if [[ "$RCLI" == "true" ]]
        then
           echo "(Trailing 100 lines of $VARLINK_LOG)"
           showrun tail -100 $VARLINK_LOG
        else
-          die 0 "\$TEST_REMOTE_CLIENT is not 'true': $TEST_REMOTE_CLIENT"
+          die 0 "\$RCLI is not 'true': $RCLI"
        fi
        ;;
     packages)
@@ -55,21 +56,27 @@ case $1 in
         )
         case $OS_RELEASE_ID in
             fedora*)
+                cat /etc/fedora-release
                 PKG_LST_CMD='rpm -q --qf=%{N}-%{V}-%{R}-%{ARCH}\n'
                 PKG_NAMES+=(\
                     container-selinux \
                     crun \
+                    libseccomp \
                     runc \
                 )
                 ;;
             ubuntu*)
+                cat /etc/issue
                 PKG_LST_CMD='dpkg-query --show --showformat=${Package}-${Version}-${Architecture}\n'
                 PKG_NAMES+=(\
                     cri-o-runc \
+                    libseccomp2 \
                 )
                 ;;
             *) bad_os_id_ver ;;
         esac
+        echo "Kernel: " $(uname -r)
+        echo "Cgroups: " $(stat -f -c %T /sys/fs/cgroup)
         # Any not-present packages will be listed as such
         $PKG_LST_CMD ${PKG_NAMES[@]} | sort -u
         ;;

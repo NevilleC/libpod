@@ -4,7 +4,7 @@ import (
 	"io/ioutil"
 	"os"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -127,10 +127,14 @@ var _ = Describe("Podman rm", func() {
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 
-		_, ec, cid := podmanTest.RunLsContainer("")
+		_, ec, cid := podmanTest.RunLsContainer("test1")
 		Expect(ec).To(Equal(0))
 
-		result := podmanTest.Podman([]string{"rm", "-l"})
+		latest := "-l"
+		if IsRemote() {
+			latest = "test1"
+		}
+		result := podmanTest.Podman([]string{"rm", latest})
 		result.WaitWithDefaultTimeout()
 		Expect(result.ExitCode()).To(Equal(0))
 		output := result.OutputToString()
@@ -140,7 +144,6 @@ var _ = Describe("Podman rm", func() {
 	})
 
 	It("podman rm --cidfile", func() {
-		SkipIfRemote()
 
 		tmpDir, err := ioutil.TempDir("", "")
 		Expect(err).To(BeNil())
@@ -163,7 +166,6 @@ var _ = Describe("Podman rm", func() {
 	})
 
 	It("podman rm multiple --cidfile", func() {
-		SkipIfRemote()
 
 		tmpDir, err := ioutil.TempDir("", "")
 		Expect(err).To(BeNil())
@@ -194,7 +196,7 @@ var _ = Describe("Podman rm", func() {
 	})
 
 	It("podman rm invalid --latest and --cidfile and --all", func() {
-		SkipIfRemote()
+		SkipIfRemote("Verifying --latest flag")
 
 		result := podmanTest.Podman([]string{"rm", "--cidfile", "foobar", "--latest"})
 		result.WaitWithDefaultTimeout()
@@ -234,7 +236,6 @@ var _ = Describe("Podman rm", func() {
 	})
 
 	It("podman rm --ignore bogus container and a running container", func() {
-		SkipIfRemote()
 
 		session := podmanTest.RunTopContainer("test1")
 		session.WaitWithDefaultTimeout()

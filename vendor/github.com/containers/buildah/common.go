@@ -1,14 +1,20 @@
 package buildah
 
 import (
+	"context"
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
-	"github.com/containers/common/pkg/unshare"
+	"github.com/containers/common/pkg/retry"
 	cp "github.com/containers/image/v5/copy"
+	"github.com/containers/image/v5/docker"
+	"github.com/containers/image/v5/signature"
 	"github.com/containers/image/v5/types"
+	encconfig "github.com/containers/ocicrypt/config"
 	"github.com/containers/storage"
+	"github.com/containers/storage/pkg/unshare"
 )
 
 const (
@@ -18,7 +24,7 @@ const (
 	DOCKER = "docker"
 )
 
-func getCopyOptions(store storage.Store, reportWriter io.Writer, sourceSystemContext *types.SystemContext, destinationSystemContext *types.SystemContext, manifestType string) *cp.Options {
+func getCopyOptions(store storage.Store, reportWriter io.Writer, sourceSystemContext *types.SystemContext, destinationSystemContext *types.SystemContext, manifestType string, removeSignatures bool, addSigner string, ociEncryptLayers *[]int, ociEncryptConfig *encconfig.EncryptConfig, ociDecryptConfig *encconfig.DecryptConfig) *cp.Options {
 	sourceCtx := getSystemContext(store, nil, "")
 	if sourceSystemContext != nil {
 		*sourceCtx = *sourceSystemContext
@@ -33,6 +39,11 @@ func getCopyOptions(store storage.Store, reportWriter io.Writer, sourceSystemCon
 		SourceCtx:             sourceCtx,
 		DestinationCtx:        destinationCtx,
 		ForceManifestMIMEType: manifestType,
+		RemoveSignatures:      removeSignatures,
+		SignBy:                addSigner,
+		OciEncryptConfig:      ociEncryptConfig,
+		OciDecryptConfig:      ociDecryptConfig,
+		OciEncryptLayers:      ociEncryptLayers,
 	}
 }
 
@@ -56,4 +67,24 @@ func getSystemContext(store storage.Store, defaults *types.SystemContext, signat
 		}
 	}
 	return sc
+}
+
+func retryCopyImage(ctx context.Context, policyContext *signature.PolicyContext, dest, src, registry types.ImageReference, copyOptions *cp.Options, maxRetries int, retryDelay time.Duration) ([]byte, error) {
+	var (
+		manifestBytes []byte
+		err           error
+		lastErr       error
+	)
+	err = retry.RetryIfNecessary(ctx, func() error {
+		manifestBytes, err = cp.Image(ctx, policyContext, dest, src, copyOptions)
+		if registry != nil && registry.Transport().Name() != docker.Transport.Name() {
+			lastErr = err
+			return nil
+		}
+		return err
+	}, &retry.RetryOptions{MaxRetry: maxRetries, Delay: retryDelay})
+	if lastErr != nil {
+		err = lastErr
+	}
+	return manifestBytes, err
 }

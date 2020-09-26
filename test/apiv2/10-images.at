@@ -1,0 +1,67 @@
+# -*- sh -*-
+#
+# Tests for image-related endpoints
+#
+
+# FIXME: API doesn't support pull yet, so use podman
+podman pull -q $IMAGE
+
+t GET libpod/images/json 200 \
+  .[0].Id~[0-9a-f]\\{64\\}
+iid=$(jq -r '.[0].Id' <<<"$output")
+
+t GET libpod/images/$iid/exists                     204
+t GET libpod/images/$PODMAN_TEST_IMAGE_NAME/exists  204
+
+# FIXME: compare to actual podman info
+t GET libpod/images/json 200  \
+  .[0].Id=${iid}
+
+t GET libpod/images/$iid/json 200 \
+  .Id=$iid \
+  .RepoTags[0]=$IMAGE
+
+# Same thing, but with abbreviated image id
+t GET libpod/images/${iid:0:12}/json 200 \
+  .Id=$iid \
+  .RepoTags[0]=$IMAGE
+
+# Docker API V1.24 filter parameter compatibility
+t GET images/json?filter=$IMAGE 200 \
+  length=1 \
+  .[0].Names[0]=$IMAGE
+
+# Negative test case
+t GET images/json?filter=nonesuch 200 length=0
+
+# FIXME: docker API incompatibility: libpod returns 'id', docker 'sha256:id'
+t GET images/$iid/json 200 \
+  .Id=sha256:$iid \
+  .RepoTags[0]=$IMAGE
+
+#t POST images/create fromImage=alpine 201 foo
+
+# Display the image history
+t GET libpod/images/nonesuch/history 404
+
+for i in $iid ${iid:0:12} $PODMAN_TEST_IMAGE_NAME; do
+  t GET libpod/images/$i/history 200 \
+    .[0].Id=$iid \
+    .[0].Created~[0-9]\\{10\\} \
+    .[0].Tags=null \
+    .[0].Size=0 \
+    .[0].Comment=
+done
+
+# Export an image on the local
+t GET libpod/images/nonesuch/get 404
+t GET libpod/images/$iid/get?format=foo 500
+t GET libpod/images/$PODMAN_TEST_IMAGE_NAME/get?compress=bar 400
+
+for i in $iid ${iid:0:12} $PODMAN_TEST_IMAGE_NAME; do
+  t GET "libpod/images/$i/get"                200 '[POSIX tar archive]'
+  t GET "libpod/images/$i/get?compress=true"  200 '[POSIX tar archive]'
+  t GET "libpod/images/$i/get?compress=false" 200 '[POSIX tar archive]'
+done
+
+# vim: filetype=sh

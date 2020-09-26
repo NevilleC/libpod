@@ -4,7 +4,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containers/libpod/pkg/util"
+	"github.com/containers/podman/v2/pkg/util"
 	"github.com/pkg/errors"
 )
 
@@ -81,7 +81,7 @@ func parseFilter(filter string) (string, string, error) {
 }
 
 func generateEventOptions(filters []string, since, until string) ([]EventFilter, error) {
-	var options []EventFilter
+	options := make([]EventFilter, 0, len(filters))
 	for _, filter := range filters {
 		key, val, err := parseFilter(filter)
 		if err != nil {

@@ -2,11 +2,12 @@ package integration
 
 import (
 	"fmt"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -29,7 +30,7 @@ var _ = Describe("Podman pod rm", func() {
 	})
 
 	AfterEach(func() {
-		podmanTest.CleanupPod()
+		podmanTest.Cleanup()
 		f := CurrentGinkgoTestDescription()
 		processTestResult(f)
 
@@ -63,10 +64,14 @@ var _ = Describe("Podman pod rm", func() {
 		_, ec, podid := podmanTest.CreatePod("")
 		Expect(ec).To(Equal(0))
 
-		_, ec2, podid2 := podmanTest.CreatePod("")
+		_, ec2, podid2 := podmanTest.CreatePod("pod2")
 		Expect(ec2).To(Equal(0))
 
-		result := podmanTest.Podman([]string{"pod", "rm", "--latest"})
+		latest := "--latest"
+		if IsRemote() {
+			latest = "pod2"
+		}
+		result := podmanTest.Podman([]string{"pod", "rm", latest})
 		result.WaitWithDefaultTimeout()
 		Expect(result.ExitCode()).To(Equal(0))
 
@@ -212,7 +217,6 @@ var _ = Describe("Podman pod rm", func() {
 	})
 
 	It("podman rm --ignore bogus pod and a running pod", func() {
-		SkipIfRemote()
 
 		_, ec, podid1 := podmanTest.CreatePod("")
 		Expect(ec).To(Equal(0))
@@ -228,5 +232,73 @@ var _ = Describe("Podman pod rm", func() {
 		session = podmanTest.Podman([]string{"pod", "rm", "--ignore", "test1", "bogus"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
+	})
+
+	It("podman pod start/remove single pod via --pod-id-file", func() {
+		tmpDir, err := ioutil.TempDir("", "")
+		Expect(err).To(BeNil())
+		tmpFile := tmpDir + "podID"
+		defer os.RemoveAll(tmpDir)
+
+		podName := "rudolph"
+
+		// Create a pod with --pod-id-file.
+		session := podmanTest.Podman([]string{"pod", "create", "--name", podName, "--pod-id-file", tmpFile})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+
+		// Create container inside the pod.
+		session = podmanTest.Podman([]string{"create", "--pod", podName, ALPINE, "top"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+
+		session = podmanTest.Podman([]string{"pod", "start", "--pod-id-file", tmpFile})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		Expect(podmanTest.NumberOfContainersRunning()).To(Equal(2)) // infra+top
+
+		session = podmanTest.Podman([]string{"pod", "rm", "--pod-id-file", tmpFile, "--force"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		Expect(podmanTest.NumberOfContainersRunning()).To(Equal(0))
+	})
+
+	It("podman pod start/remove multiple pods via --pod-id-file", func() {
+		tmpDir, err := ioutil.TempDir("", "")
+		Expect(err).To(BeNil())
+		defer os.RemoveAll(tmpDir)
+
+		podIDFiles := []string{}
+		for _, i := range "0123456789" {
+			tmpFile := tmpDir + "cid" + string(i)
+			podName := "rudolph" + string(i)
+			// Create a pod with --pod-id-file.
+			session := podmanTest.Podman([]string{"pod", "create", "--name", podName, "--pod-id-file", tmpFile})
+			session.WaitWithDefaultTimeout()
+			Expect(session.ExitCode()).To(Equal(0))
+
+			// Create container inside the pod.
+			session = podmanTest.Podman([]string{"create", "--pod", podName, ALPINE, "top"})
+			session.WaitWithDefaultTimeout()
+			Expect(session.ExitCode()).To(Equal(0))
+
+			// Append the id files along with the command.
+			podIDFiles = append(podIDFiles, "--pod-id-file")
+			podIDFiles = append(podIDFiles, tmpFile)
+		}
+
+		cmd := []string{"pod", "start"}
+		cmd = append(cmd, podIDFiles...)
+		session := podmanTest.Podman(cmd)
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		Expect(podmanTest.NumberOfContainersRunning()).To(Equal(20)) // 10*(infra+top)
+
+		cmd = []string{"pod", "rm", "--force"}
+		cmd = append(cmd, podIDFiles...)
+		session = podmanTest.Podman(cmd)
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		Expect(podmanTest.NumberOfContainersRunning()).To(Equal(0))
 	})
 })

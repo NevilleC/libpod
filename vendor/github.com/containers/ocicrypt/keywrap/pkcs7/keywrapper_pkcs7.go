@@ -23,8 +23,8 @@ import (
 	"github.com/containers/ocicrypt/config"
 	"github.com/containers/ocicrypt/keywrap"
 	"github.com/containers/ocicrypt/utils"
-	"github.com/fullsailor/pkcs7"
 	"github.com/pkg/errors"
+	"go.mozilla.org/pkcs7"
 )
 
 type pkcs7KeyWrapper struct {
@@ -68,6 +68,10 @@ func collectX509s(x509s [][]byte) ([]*x509.Certificate, error) {
 		x509Certs = append(x509Certs, x509Cert)
 	}
 	return x509Certs, nil
+}
+
+func (kw *pkcs7KeyWrapper) NoPossibleKeys(dcparameters map[string][][]byte) bool {
+	return len(kw.GetPrivateKeys(dcparameters)) == 0
 }
 
 func (kw *pkcs7KeyWrapper) GetPrivateKeys(dcparameters map[string][][]byte) [][]byte {

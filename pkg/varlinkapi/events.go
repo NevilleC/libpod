@@ -3,15 +3,15 @@
 package varlinkapi
 
 import (
-	"fmt"
+	"context"
 	"time"
 
-	"github.com/containers/libpod/cmd/podman/varlink"
-	"github.com/containers/libpod/libpod/events"
+	"github.com/containers/podman/v2/libpod/events"
+	iopodman "github.com/containers/podman/v2/pkg/varlink"
 )
 
 // GetEvents is a remote endpoint to get events from the event log
-func (i *LibpodAPI) GetEvents(call iopodman.VarlinkCall, filter []string, since string, until string) error {
+func (i *VarlinkAPI) GetEvents(call iopodman.VarlinkCall, filter []string, since string, until string) error {
 	var (
 		fromStart   bool
 		eventsError error
@@ -28,7 +28,7 @@ func (i *LibpodAPI) GetEvents(call iopodman.VarlinkCall, filter []string, since 
 	eventChannel := make(chan *events.Event)
 	go func() {
 		readOpts := events.ReadOptions{FromStart: fromStart, Stream: stream, Filters: filter, EventChannel: eventChannel}
-		eventsError = i.Runtime.Events(readOpts)
+		eventsError = i.Runtime.Events(context.Background(), readOpts)
 	}()
 	if eventsError != nil {
 		return call.ReplyErrorOccurred(eventsError.Error())
@@ -43,9 +43,9 @@ func (i *LibpodAPI) GetEvents(call iopodman.VarlinkCall, filter []string, since 
 			Id:     event.ID,
 			Image:  event.Image,
 			Name:   event.Name,
-			Status: fmt.Sprintf("%s", event.Status),
+			Status: string(event.Status),
 			Time:   event.Time.Format(time.RFC3339Nano),
-			Type:   fmt.Sprintf("%s", event.Type),
+			Type:   string(event.Type),
 		})
 		if !call.Continues {
 			// For a one-shot on events, we break out here

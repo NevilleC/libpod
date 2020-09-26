@@ -6,9 +6,10 @@ import (
 
 	istorage "github.com/containers/image/v5/storage"
 	"github.com/containers/image/v5/types"
-	"github.com/containers/libpod/libpod/define"
+	"github.com/containers/podman/v2/libpod/define"
 	"github.com/containers/storage"
-	"github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/containers/storage/pkg/idtools"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -20,8 +21,8 @@ type storageService struct {
 
 // getStorageService returns a storageService which can create container root
 // filesystems from images
-func getStorageService(store storage.Store) (*storageService, error) {
-	return &storageService{store: store}, nil
+func getStorageService(store storage.Store) *storageService {
+	return &storageService{store: store}
 }
 
 // ContainerInfo wraps a subset of information about a container: the locations
@@ -35,6 +36,8 @@ type ContainerInfo struct {
 	Config       *v1.Image
 	ProcessLabel string
 	MountLabel   string
+	UIDMap       []idtools.IDMap
+	GIDMap       []idtools.IDMap
 }
 
 // RuntimeContainerMetadata is the structure that we encode as JSON and store
@@ -63,7 +66,7 @@ func (metadata *RuntimeContainerMetadata) SetMountLabel(mountLabel string) {
 
 // CreateContainerStorage creates the storage end of things.  We already have the container spec created
 // TO-DO We should be passing in an Image object in the future.
-func (r *storageService) CreateContainerStorage(ctx context.Context, systemContext *types.SystemContext, imageName, imageID, containerName, containerID string, options storage.ContainerOptions) (cinfo ContainerInfo, err error) {
+func (r *storageService) CreateContainerStorage(ctx context.Context, systemContext *types.SystemContext, imageName, imageID, containerName, containerID string, options storage.ContainerOptions) (_ ContainerInfo, retErr error) {
 	span, _ := opentracing.StartSpanFromContext(ctx, "createContainerStorage")
 	span.SetTag("type", "storageService")
 	defer span.Finish()
@@ -129,9 +132,9 @@ func (r *storageService) CreateContainerStorage(ctx context.Context, systemConte
 	// If anything fails after this point, we need to delete the incomplete
 	// container before returning.
 	defer func() {
-		if err != nil {
-			if err2 := r.store.DeleteContainer(container.ID); err2 != nil {
-				logrus.Infof("%v deleting partially-created container %q", err2, container.ID)
+		if retErr != nil {
+			if err := r.store.DeleteContainer(container.ID); err != nil {
+				logrus.Infof("%v deleting partially-created container %q", err, container.ID)
 
 				return
 			}
@@ -166,6 +169,8 @@ func (r *storageService) CreateContainerStorage(ctx context.Context, systemConte
 	logrus.Debugf("container %q has run directory %q", container.ID, containerRunDir)
 
 	return ContainerInfo{
+		UIDMap:       options.UIDMap,
+		GIDMap:       options.GIDMap,
 		Dir:          containerDir,
 		RunDir:       containerRunDir,
 		Config:       imageConfig,

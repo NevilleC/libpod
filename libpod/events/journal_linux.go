@@ -3,12 +3,12 @@
 package events
 
 import (
-	"fmt"
+	"context"
 	"strconv"
 	"time"
 
-	"github.com/coreos/go-systemd/journal"
-	"github.com/coreos/go-systemd/sdjournal"
+	"github.com/coreos/go-systemd/v22/journal"
+	"github.com/coreos/go-systemd/v22/sdjournal"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -49,11 +49,11 @@ func (e EventJournalD) Write(ee Event) error {
 	case Volume:
 		m["PODMAN_NAME"] = ee.Name
 	}
-	return journal.Send(fmt.Sprintf("%s", ee.ToHumanReadable()), journal.PriInfo, m)
+	return journal.Send(string(ee.ToHumanReadable()), journal.PriInfo, m)
 }
 
 // Read reads events from the journal and sends qualified events to the event channel
-func (e EventJournalD) Read(options ReadOptions) error {
+func (e EventJournalD) Read(ctx context.Context, options ReadOptions) error {
 	defer close(options.EventChannel)
 	eventOptions, err := generateEventOptions(options.Filters, options.Since, options.Until)
 	if err != nil {
@@ -89,6 +89,13 @@ func (e EventJournalD) Read(options ReadOptions) error {
 		return err
 	}
 	for {
+		select {
+		case <-ctx.Done():
+			// the consumer has cancelled
+			return nil
+		default:
+			// fallthrough
+		}
 		if _, err := j.Next(); err != nil {
 			return err
 		}

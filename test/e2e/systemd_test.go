@@ -1,5 +1,3 @@
-// +build !remoteclient
-
 package integration
 
 import (
@@ -8,8 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containers/libpod/pkg/cgroups"
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -23,7 +20,6 @@ var _ = Describe("Podman systemd", func() {
 	)
 
 	BeforeEach(func() {
-		SkipIfRootless()
 		tempdir, err = CreateTempDirInTempDir()
 		if err != nil {
 			os.Exit(1)
@@ -51,6 +47,7 @@ WantedBy=multi-user.target
 	})
 
 	It("podman start container by systemd", func() {
+		SkipIfRootless()
 		if os.Getenv("SKIP_USERNS") != "" {
 			Skip("Skip userns tests.")
 		}
@@ -82,19 +79,8 @@ WantedBy=multi-user.target
 	})
 
 	It("podman run container with systemd PID1", func() {
-		cgroupsv2, err := cgroups.IsCgroup2UnifiedMode()
-		Expect(err).To(BeNil())
-		if cgroupsv2 {
-			Skip("systemd test does not work in cgroups V2 mode yet")
-		}
-
-		systemdImage := "fedora"
-		pull := podmanTest.Podman([]string{"pull", systemdImage})
-		pull.WaitWithDefaultTimeout()
-		Expect(pull.ExitCode()).To(Equal(0))
-
 		ctrName := "testSystemd"
-		run := podmanTest.Podman([]string{"run", "--name", ctrName, "-t", "-i", "-d", systemdImage, "/usr/sbin/init"})
+		run := podmanTest.Podman([]string{"run", "--name", ctrName, "-t", "-i", "-d", ubi_init, "/sbin/init"})
 		run.WaitWithDefaultTimeout()
 		Expect(run.ExitCode()).To(Equal(0))
 		ctrID := run.OutputToString()
@@ -124,5 +110,48 @@ WantedBy=multi-user.target
 		systemctl.WaitWithDefaultTimeout()
 		Expect(systemctl.ExitCode()).To(Equal(0))
 		Expect(strings.Contains(systemctl.OutputToString(), "State:")).To(BeTrue())
+
+		result := podmanTest.Podman([]string{"inspect", ctrName})
+		result.WaitWithDefaultTimeout()
+		Expect(result.ExitCode()).To(Equal(0))
+		conData := result.InspectContainerToJSON()
+		Expect(len(conData)).To(Equal(1))
+		Expect(conData[0].Config.SystemdMode).To(BeTrue())
+	})
+
+	It("podman create container with systemd entrypoint triggers systemd mode", func() {
+		ctrName := "testCtr"
+		run := podmanTest.Podman([]string{"create", "--name", ctrName, "--entrypoint", "/sbin/init", ubi_init})
+		run.WaitWithDefaultTimeout()
+		Expect(run.ExitCode()).To(Equal(0))
+
+		result := podmanTest.Podman([]string{"inspect", ctrName})
+		result.WaitWithDefaultTimeout()
+		Expect(result.ExitCode()).To(Equal(0))
+		conData := result.InspectContainerToJSON()
+		Expect(len(conData)).To(Equal(1))
+		Expect(conData[0].Config.SystemdMode).To(BeTrue())
+	})
+
+	It("podman create container with systemd=always triggers systemd mode", func() {
+		ctrName := "testCtr"
+		run := podmanTest.Podman([]string{"create", "--name", ctrName, "--systemd", "always", ALPINE})
+		run.WaitWithDefaultTimeout()
+		Expect(run.ExitCode()).To(Equal(0))
+
+		result := podmanTest.Podman([]string{"inspect", ctrName})
+		result.WaitWithDefaultTimeout()
+		Expect(result.ExitCode()).To(Equal(0))
+		conData := result.InspectContainerToJSON()
+		Expect(len(conData)).To(Equal(1))
+		Expect(conData[0].Config.SystemdMode).To(BeTrue())
+	})
+
+	It("podman run --systemd container should NOT mount /run noexec", func() {
+		session := podmanTest.Podman([]string{"run", "--systemd", "always", ALPINE, "sh", "-c", "mount  | grep \"/run \""})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+
+		Expect(session.OutputToString()).To(Not(ContainSubstring("noexec")))
 	})
 })

@@ -3,7 +3,7 @@ package integration
 import (
 	"os"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -48,7 +48,6 @@ var _ = Describe("Podman volume rm", func() {
 	})
 
 	It("podman volume rm with --force flag", func() {
-		SkipIfRemote()
 		session := podmanTest.Podman([]string{"create", "-v", "myvol:/myvol", ALPINE, "ls"})
 		cid := session.OutputToString()
 		session.WaitWithDefaultTimeout()

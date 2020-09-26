@@ -1,11 +1,9 @@
-// +build !remoteclient
-
 package integration
 
 import (
 	"os"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -31,6 +29,7 @@ var _ = Describe("podman container runlabel", func() {
 	)
 
 	BeforeEach(func() {
+		SkipIfRemote("runlabel is not supported for remote connections")
 		tempdir, err = CreateTempDirInTempDir()
 		if err != nil {
 			os.Exit(1)
@@ -72,6 +71,19 @@ var _ = Describe("podman container runlabel", func() {
 		result.WaitWithDefaultTimeout()
 		Expect(result.ExitCode()).To(Equal(0))
 	})
+	It("podman container runlabel --display", func() {
+		image := "podman-runlabel-test:ls"
+		podmanTest.BuildImage(LsDockerfile, image, "false")
+
+		result := podmanTest.Podman([]string{"container", "runlabel", "--display", "RUN", image})
+		result.WaitWithDefaultTimeout()
+		Expect(result.ExitCode()).To(Equal(0))
+		Expect(result.OutputToString()).To(ContainSubstring(podmanTest.PodmanBinary + " -la"))
+
+		result = podmanTest.Podman([]string{"rmi", image})
+		result.WaitWithDefaultTimeout()
+		Expect(result.ExitCode()).To(Equal(0))
+	})
 	It("podman container runlabel bogus label should result in non-zero exit code", func() {
 		result := podmanTest.Podman([]string{"container", "runlabel", "RUN", ALPINE})
 		result.WaitWithDefaultTimeout()
@@ -100,7 +112,6 @@ var _ = Describe("podman container runlabel", func() {
 	})
 
 	It("runlabel should fail with nonexist authfile", func() {
-		SkipIfRemote()
 		image := "podman-runlabel-test:podman"
 		podmanTest.BuildImage(PodmanDockerfile, image, "false")
 

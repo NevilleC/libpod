@@ -32,11 +32,17 @@ all the containers information.  By default it lists:
 
 **--all**, **-a**
 
-Show all the containers, default is only running containers
+Show all the containers created by Podman, default is only running containers.
+
+Note: Podman shares containers storage with other tools such as Buildah and CRI-O. In some cases these `external` containers might also exist in the same storage. Use the `--storage` option to see these external containers. External containers show the 'storage' status.
 
 **--pod**, **-p**
 
 Display the pods the containers are associated with
+
+**--storage**
+
+Display external containers that are not controlled by Podman but are stored in containers storage.  These external containers are generally created via other container technology such as Buildah or CRI-O and may depend on the same container images that Podman is also using.  External containers are denoted with either a 'buildah' or 'storage' in the COMMAND and STATUS column of the ps output. Only used with the --all option.
 
 **--no-trunc**
 
@@ -55,7 +61,8 @@ Valid placeholders for the Go template are listed below:
 | **Placeholder** | **Description**                                  |
 | --------------- | ------------------------------------------------ |
 | .ID             | Container ID                                     |
-| .Image          | Image ID/Name                                    |
+| .Image          | Image Name/ID                                    |
+| .ImageID        | Image ID                                         |
 | .Command        | Quoted command used                              |
 | .CreatedAt      | Creation time for container                      |
 | .RunningFor     | Time elapsed since container was started         |
@@ -96,6 +103,7 @@ Display namespace information
 Filter what containers are shown in the output.
 Multiple filters can be given with multiple uses of the --filter flag.
 If multiple filters are given, only containers which match all of the given filters will be shown.
+Results will be drawn from all containers, regardless of whether --all was given.
 
 Valid filters are listed below:
 
@@ -172,11 +180,20 @@ CONTAINER ID  IMAGE                            COMMAND    CREATED        STATUS 
 
 ```
 
+```
+$ podman ps --storage -a
+CONTAINER ID  IMAGE                             COMMAND  CREATED      STATUS  PORTS  NAMES
+69ed779d8ef9f  redis:alpine  "redis-server"  25 hours ago  Created                   6379/tcp  k8s_container1_podsandbox1_redhat.test.crio_redhat-test-crio_1
+38a8a78596f9  docker.io/library/busybox:latest  buildah  2 hours ago  storage        busybox-working-container
+fd7b786b5c32  docker.io/library/alpine:latest   buildah  2 hours ago  storage        alpine-working-container
+f78620804e00  scratch                           buildah  2 hours ago  storage        working-container
+```
+
 ## ps
 Print a list of containers
 
 ## SEE ALSO
-podman(1)
+podman(1), buildah(1), crio(8)
 
 ## HISTORY
 August 2017, Originally compiled by Urvashi Mohnani <umohnani@redhat.com>

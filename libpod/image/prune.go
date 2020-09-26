@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containers/libpod/libpod/events"
-	"github.com/containers/libpod/pkg/timetype"
+	"github.com/containers/podman/v2/libpod/events"
+	"github.com/containers/podman/v2/pkg/timetype"
 	"github.com/containers/storage"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -57,7 +57,7 @@ func generatePruneFilterFuncs(filter, filterValue string) (ImageFilter, error) {
 }
 
 // GetPruneImages returns a slice of images that have no names/unused
-func (ir *Runtime) GetPruneImages(all bool, filterFuncs []ImageFilter) ([]*Image, error) {
+func (ir *Runtime) GetPruneImages(ctx context.Context, all bool, filterFuncs []ImageFilter) ([]*Image, error) {
 	var (
 		pruneImages []*Image
 	)
@@ -66,6 +66,12 @@ func (ir *Runtime) GetPruneImages(all bool, filterFuncs []ImageFilter) ([]*Image
 	if err != nil {
 		return nil, err
 	}
+
+	tree, err := ir.layerTree()
+	if err != nil {
+		return nil, err
+	}
+
 	for _, i := range allImages {
 		// filter the images based on this.
 		for _, filterFunc := range filterFuncs {
@@ -74,10 +80,6 @@ func (ir *Runtime) GetPruneImages(all bool, filterFuncs []ImageFilter) ([]*Image
 			}
 		}
 
-		if len(i.Names()) == 0 {
-			pruneImages = append(pruneImages, i)
-			continue
-		}
 		if all {
 			containers, err := i.Containers()
 			if err != nil {
@@ -85,7 +87,22 @@ func (ir *Runtime) GetPruneImages(all bool, filterFuncs []ImageFilter) ([]*Image
 			}
 			if len(containers) < 1 {
 				pruneImages = append(pruneImages, i)
+				continue
 			}
+		}
+
+		// skip the cache (i.e., with parent) and intermediate (i.e.,
+		// with children) images
+		intermediate, err := tree.hasChildrenAndParent(ctx, i)
+		if err != nil {
+			return nil, err
+		}
+		if intermediate {
+			continue
+		}
+
+		if i.Dangling() {
+			pruneImages = append(pruneImages, i)
 		}
 	}
 	return pruneImages, nil
@@ -94,10 +111,7 @@ func (ir *Runtime) GetPruneImages(all bool, filterFuncs []ImageFilter) ([]*Image
 // PruneImages prunes dangling and optionally all unused images from the local
 // image store
 func (ir *Runtime) PruneImages(ctx context.Context, all bool, filter []string) ([]string, error) {
-	var (
-		prunedCids  []string
-		filterFuncs []ImageFilter
-	)
+	filterFuncs := make([]ImageFilter, 0, len(filter))
 	for _, f := range filter {
 		filterSplit := strings.SplitN(f, "=", 2)
 		if len(filterSplit) < 2 {
@@ -111,20 +125,29 @@ func (ir *Runtime) PruneImages(ctx context.Context, all bool, filter []string) (
 		filterFuncs = append(filterFuncs, generatedFunc)
 	}
 
-	pruneImages, err := ir.GetPruneImages(all, filterFuncs)
+	pruneImages, err := ir.GetPruneImages(ctx, all, filterFuncs)
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to get images to prune")
 	}
+	prunedCids := make([]string, 0, len(pruneImages))
 	for _, p := range pruneImages {
+		repotags, err := p.RepoTags()
+		if err != nil {
+			return nil, err
+		}
 		if err := p.Remove(ctx, true); err != nil {
 			if errors.Cause(err) == storage.ErrImageUsedByContainer {
-				logrus.Warnf("Failed to prune image %s as it is in use: %v", p.ID(), err)
+				logrus.Warnf("Failed to prune image %s as it is in use: %v.\nA container associated with containers/storage i.e. Buildah, CRI-O, etc., maybe associated with this image.\nUsing the rmi command with the --force option will remove the container and image, but may cause failures for other dependent systems.", p.ID(), err)
 				continue
 			}
 			return nil, errors.Wrap(err, "failed to prune image")
 		}
 		defer p.newImageEvent(events.Prune)
-		prunedCids = append(prunedCids, p.ID())
+		nameOrID := p.ID()
+		if len(repotags) > 0 {
+			nameOrID = repotags[0]
+		}
+		prunedCids = append(prunedCids, nameOrID)
 	}
 	return prunedCids, nil
 }

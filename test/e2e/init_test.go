@@ -3,7 +3,7 @@ package integration
 import (
 	"os"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -75,6 +75,7 @@ var _ = Describe("Podman init", func() {
 	})
 
 	It("podman init latest container", func() {
+		SkipIfRemote("--latest flag n/a")
 		session := podmanTest.Podman([]string{"create", "-d", ALPINE, "ls"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
@@ -119,10 +120,10 @@ var _ = Describe("Podman init", func() {
 	})
 
 	It("podman init running container errors", func() {
-		session := podmanTest.Podman([]string{"run", "-d", ALPINE, "top"})
+		session := podmanTest.Podman([]string{"run", "--name", "init_test", "-d", ALPINE, "top"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
-		init := podmanTest.Podman([]string{"init", "--latest"})
+		init := podmanTest.Podman([]string{"init", "init_test"})
 		init.WaitWithDefaultTimeout()
 		Expect(init.ExitCode()).To(Equal(125))
 	})

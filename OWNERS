@@ -1,20 +1,20 @@
 approvers:
-  - mheon
   - baude
-  - mrunalp
+  - edsantiago
+  - giuseppe
+  - jwhonce
+  - mheon
   - rhatdan
   - TomSweeneyRedHat
-  - umohnani8
-  - giuseppe
   - vrothberg
-  - jwhonce
 reviewers:
-  - mheon
   - baude
-  - mrunalp
+  - edsantiago
+  - giuseppe
+  - jwhonce
+  - mheon
   - rhatdan
   - TomSweeneyRedHat
-  - umohnani8
-  - giuseppe
   - vrothberg
-  - jwhonce
+  - ashley-cui
+  - QiWang19

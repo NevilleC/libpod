@@ -1,5 +1,3 @@
-// +build !remoteclient
-
 package integration
 
 import (
@@ -7,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -125,6 +123,7 @@ var _ = Describe("Podman load", func() {
 	})
 
 	It("podman load directory", func() {
+		SkipIfRemote("Remote does not support loading directories")
 		outdir := filepath.Join(podmanTest.TempDir, "alpine")
 
 		save := podmanTest.PodmanNoCache([]string{"save", "--format", "oci-dir", "-o", outdir, ALPINE})
@@ -138,6 +137,22 @@ var _ = Describe("Podman load", func() {
 		result := podmanTest.Podman([]string{"load", "-i", outdir})
 		result.WaitWithDefaultTimeout()
 		Expect(result.ExitCode()).To(Equal(0))
+	})
+
+	It("podman-remote load directory", func() {
+		// Remote-only test looking for the specific remote error
+		// message when trying to load a directory.
+		if !IsRemote() {
+			Skip("Remote only test")
+		}
+
+		result := podmanTest.Podman([]string{"load", "-i", podmanTest.TempDir})
+		result.WaitWithDefaultTimeout()
+		Expect(result.ExitCode()).To(Equal(125))
+
+		errMsg := fmt.Sprintf("remote client supports archives only but %q is a directory", podmanTest.TempDir)
+		found, _ := result.ErrorGrepString(errMsg)
+		Expect(found).Should(BeTrue())
 	})
 
 	It("podman load bogus file", func() {
@@ -205,7 +220,7 @@ var _ = Describe("Podman load", func() {
 		podmanTest.RestoreArtifact(fedoraMinimal)
 		outfile := filepath.Join(podmanTest.TempDir, "load_test.tar.gz")
 
-		setup := podmanTest.PodmanNoCache([]string{"tag", "fedora-minimal", "hello"})
+		setup := podmanTest.PodmanNoCache([]string{"tag", fedoraMinimal, "hello"})
 		setup.WaitWithDefaultTimeout()
 		Expect(setup.ExitCode()).To(Equal(0))
 
@@ -228,6 +243,7 @@ var _ = Describe("Podman load", func() {
 	})
 
 	It("podman load localhost registry from dir", func() {
+		SkipIfRemote("FIXME: podman-remote load is currently broken.")
 		outfile := filepath.Join(podmanTest.TempDir, "load")
 
 		setup := podmanTest.PodmanNoCache([]string{"tag", BB, "hello:world"})
@@ -268,5 +284,13 @@ var _ = Describe("Podman load", func() {
 		result := podmanTest.PodmanNoCache([]string{"load", "-i", outfile + ".xz"})
 		result.WaitWithDefaultTimeout()
 		Expect(result.ExitCode()).To(Equal(0))
+	})
+
+	It("podman load multi-image archive", func() {
+		result := podmanTest.PodmanNoCache([]string{"load", "-i", "./testdata/image/docker-two-images.tar.xz"})
+		result.WaitWithDefaultTimeout()
+		Expect(result.ExitCode()).To(Equal(0))
+		Expect(result.LineInOutputContains("example.com/empty:latest")).To(BeTrue())
+		Expect(result.LineInOutputContains("example.com/empty/but:different")).To(BeTrue())
 	})
 })

@@ -8,7 +8,7 @@ import (
 
 	"github.com/containers/image/v5/docker"
 	"github.com/containers/image/v5/types"
-	sysreg "github.com/containers/libpod/pkg/registries"
+	sysreg "github.com/containers/podman/v2/pkg/registries"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/semaphore"
@@ -64,13 +64,16 @@ type SearchFilter struct {
 // SearchImages searches images based on term and the specified SearchOptions
 // in all registries.
 func SearchImages(term string, options SearchOptions) ([]SearchResult, error) {
-	// Check if search term has a registry in it
-	registry, err := sysreg.GetRegistry(term)
-	if err != nil {
-		return nil, errors.Wrapf(err, "error getting registry from %q", term)
-	}
-	if registry != "" {
-		term = term[len(registry)+1:]
+	registry := ""
+
+	// Try to extract a registry from the specified search term.  We
+	// consider everything before the first slash to be the registry.  Note
+	// that we cannot use the reference parser from the containers/image
+	// library as the search term may container arbitrary input such as
+	// wildcards.  See bugzilla.redhat.com/show_bug.cgi?id=1846629.
+	if spl := strings.SplitN(term, "/", 2); len(spl) > 1 {
+		registry = spl[0]
+		term = spl[1]
 	}
 
 	registries, err := getRegistries(registry)
@@ -93,8 +96,8 @@ func SearchImages(term string, options SearchOptions) ([]SearchResult, error) {
 	searchImageInRegistryHelper := func(index int, registry string) {
 		defer sem.Release(1)
 		defer wg.Done()
-		searchOutput, err := searchImageInRegistry(term, registry, options)
-		data[index] = searchOutputData{data: searchOutput, err: err}
+		searchOutput := searchImageInRegistry(term, registry, options)
+		data[index] = searchOutputData{data: searchOutput}
 	}
 
 	ctx := context.Background()
@@ -131,7 +134,7 @@ func getRegistries(registry string) ([]string, error) {
 	return registries, nil
 }
 
-func searchImageInRegistry(term string, registry string, options SearchOptions) ([]SearchResult, error) {
+func searchImageInRegistry(term string, registry string, options SearchOptions) []SearchResult {
 	// Max number of queries by default is 25
 	limit := maxQueries
 	if options.Limit > 0 {
@@ -147,7 +150,7 @@ func searchImageInRegistry(term string, registry string, options SearchOptions) 
 	results, err := docker.SearchRegistry(context.TODO(), sc, registry, term, limit)
 	if err != nil {
 		logrus.Errorf("error searching registry %q: %v", registry, err)
-		return []SearchResult{}, nil
+		return []SearchResult{}
 	}
 	index := registry
 	arr := strings.Split(registry, ".")
@@ -201,7 +204,7 @@ func searchImageInRegistry(term string, registry string, options SearchOptions) 
 		}
 		paramsArr = append(paramsArr, params)
 	}
-	return paramsArr, nil
+	return paramsArr
 }
 
 // ParseSearchFilter turns the filter into a SearchFilter that can be used for

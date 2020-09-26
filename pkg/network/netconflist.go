@@ -6,6 +6,11 @@ import (
 	"path/filepath"
 )
 
+const (
+	defaultIPv4Route = "0.0.0.0/0"
+	defaultIPv6Route = "::/0"
+)
+
 // NcList describes a generic map
 type NcList map[string]interface{}
 
@@ -21,10 +26,11 @@ func NewNcList(name, version string) NcList {
 // NewHostLocalBridge creates a new LocalBridge for host-local
 func NewHostLocalBridge(name string, isGateWay, isDefaultGW, ipMasq bool, ipamConf IPAMHostLocalConf) *HostLocalBridge {
 	hostLocalBridge := HostLocalBridge{
-		PluginType: "bridge",
-		BrName:     name,
-		IPMasq:     ipMasq,
-		IPAM:       ipamConf,
+		PluginType:  "bridge",
+		BrName:      name,
+		IPMasq:      ipMasq,
+		HairpinMode: true,
+		IPAM:        ipamConf,
 	}
 	if isGateWay {
 		hostLocalBridge.IsGW = true
@@ -85,9 +91,13 @@ func NewIPAMRoute(r *net.IPNet) IPAMRoute { //nolint:interfacer
 }
 
 // NewIPAMDefaultRoute creates a new IPAMDefault route of
-// 0.0.0.0/0
-func NewIPAMDefaultRoute() (IPAMRoute, error) {
-	_, n, err := net.ParseCIDR("0.0.0.0/0")
+// 0.0.0.0/0 for IPv4 or ::/0 for IPv6
+func NewIPAMDefaultRoute(isIPv6 bool) (IPAMRoute, error) {
+	route := defaultIPv4Route
+	if isIPv6 {
+		route = defaultIPv6Route
+	}
+	_, n, err := net.ParseCIDR(route)
 	if err != nil {
 		return IPAMRoute{}, err
 	}
@@ -110,7 +120,6 @@ func NewPortMapPlugin() PortMapConfig {
 func NewFirewallPlugin() FirewallConfig {
 	return FirewallConfig{
 		PluginType: "firewall",
-		Backend:    "iptables",
 	}
 }
 

@@ -1,5 +1,3 @@
-// +build !remoteclient
-
 package integration
 
 import (
@@ -9,11 +7,16 @@ import (
 	"path/filepath"
 	"strings"
 
-	. "github.com/containers/libpod/test/utils"
+	"github.com/containers/podman/v2/pkg/rootless"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/gexec"
 )
+
+// in-container mount point: using a path that is definitely not present
+// on the host system might help to uncover some issues.
+const dest = "/unique/path"
 
 var _ = Describe("Podman run with volumes", func() {
 	var (
@@ -41,46 +44,44 @@ var _ = Describe("Podman run with volumes", func() {
 	It("podman run with volume flag", func() {
 		mountPath := filepath.Join(podmanTest.TempDir, "secrets")
 		os.Mkdir(mountPath, 0755)
-		session := podmanTest.Podman([]string{"run", "--rm", "-v", fmt.Sprintf("%s:/run/test", mountPath), ALPINE, "grep", "/run/test", "/proc/self/mountinfo"})
+		vol := mountPath + ":" + dest
+
+		session := podmanTest.Podman([]string{"run", "--rm", "-v", vol, ALPINE, "grep", dest, "/proc/self/mountinfo"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
-		found, matches := session.GrepString("/run/test")
+		found, matches := session.GrepString(dest)
 		Expect(found).Should(BeTrue())
 		Expect(matches[0]).To(ContainSubstring("rw"))
 
-		mountPath = filepath.Join(podmanTest.TempDir, "secrets")
-		os.Mkdir(mountPath, 0755)
-		session = podmanTest.Podman([]string{"run", "--rm", "-v", fmt.Sprintf("%s:/run/test:ro", mountPath), ALPINE, "grep", "/run/test", "/proc/self/mountinfo"})
+		session = podmanTest.Podman([]string{"run", "--rm", "-v", vol + ":ro", ALPINE, "grep", dest, "/proc/self/mountinfo"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
-		found, matches = session.GrepString("/run/test")
+		found, matches = session.GrepString(dest)
 		Expect(found).Should(BeTrue())
 		Expect(matches[0]).To(ContainSubstring("ro"))
 
-		mountPath = filepath.Join(podmanTest.TempDir, "secrets")
-		os.Mkdir(mountPath, 0755)
-		session = podmanTest.Podman([]string{"run", "--rm", "-v", fmt.Sprintf("%s:/run/test:shared", mountPath), ALPINE, "grep", "/run/test", "/proc/self/mountinfo"})
+		session = podmanTest.Podman([]string{"run", "--rm", "-v", vol + ":shared", ALPINE, "grep", dest, "/proc/self/mountinfo"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
-		found, matches = session.GrepString("/run/test")
+		found, matches = session.GrepString(dest)
 		Expect(found).Should(BeTrue())
 		Expect(matches[0]).To(ContainSubstring("rw"))
 		Expect(matches[0]).To(ContainSubstring("shared"))
 
 		// Cached is ignored
-		session = podmanTest.Podman([]string{"run", "--rm", "-v", fmt.Sprintf("%s:/run/test:cached", mountPath), ALPINE, "grep", "/run/test", "/proc/self/mountinfo"})
+		session = podmanTest.Podman([]string{"run", "--rm", "-v", vol + ":cached", ALPINE, "grep", dest, "/proc/self/mountinfo"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
-		found, matches = session.GrepString("/run/test")
+		found, matches = session.GrepString(dest)
 		Expect(found).Should(BeTrue())
 		Expect(matches[0]).To(ContainSubstring("rw"))
 		Expect(matches[0]).To(Not(ContainSubstring("cached")))
 
 		// Delegated is ignored
-		session = podmanTest.Podman([]string{"run", "--rm", "-v", fmt.Sprintf("%s:/run/test:delegated", mountPath), ALPINE, "grep", "/run/test", "/proc/self/mountinfo"})
+		session = podmanTest.Podman([]string{"run", "--rm", "-v", vol + ":delegated", ALPINE, "grep", dest, "/proc/self/mountinfo"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
-		found, matches = session.GrepString("/run/test")
+		found, matches = session.GrepString(dest)
 		Expect(found).Should(BeTrue())
 		Expect(matches[0]).To(ContainSubstring("rw"))
 		Expect(matches[0]).To(Not(ContainSubstring("delegated")))
@@ -92,30 +93,35 @@ var _ = Describe("Podman run with volumes", func() {
 		}
 		mountPath := filepath.Join(podmanTest.TempDir, "secrets")
 		os.Mkdir(mountPath, 0755)
-		session := podmanTest.Podman([]string{"run", "--rm", "--mount", fmt.Sprintf("type=bind,src=%s,target=/run/test", mountPath), ALPINE, "grep", "/run/test", "/proc/self/mountinfo"})
-		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
-		Expect(session.OutputToString()).To(ContainSubstring("/run/test rw"))
+		mount := "type=bind,src=" + mountPath + ",target=" + dest
 
-		session = podmanTest.Podman([]string{"run", "--rm", "--mount", fmt.Sprintf("type=bind,src=%s,target=/run/test,ro", mountPath), ALPINE, "grep", "/run/test", "/proc/self/mountinfo"})
+		session := podmanTest.Podman([]string{"run", "--rm", "--mount", mount, ALPINE, "grep", dest, "/proc/self/mountinfo"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
-		Expect(session.OutputToString()).To(ContainSubstring("/run/test ro"))
+		Expect(session.OutputToString()).To(ContainSubstring(dest + " rw"))
 
-		session = podmanTest.Podman([]string{"run", "--rm", "--mount", fmt.Sprintf("type=bind,src=%s,target=/run/test,shared", mountPath), ALPINE, "grep", "/run/test", "/proc/self/mountinfo"})
+		session = podmanTest.Podman([]string{"run", "--rm", "--mount", mount + ",ro", ALPINE, "grep", dest, "/proc/self/mountinfo"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
-		found, matches := session.GrepString("/run/test")
+		Expect(session.OutputToString()).To(ContainSubstring(dest + " ro"))
+
+		session = podmanTest.Podman([]string{"run", "--rm", "--mount", mount + ",readonly", ALPINE, "grep", dest, "/proc/self/mountinfo"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session.OutputToString()).To(ContainSubstring(dest + " ro"))
+
+		session = podmanTest.Podman([]string{"run", "--rm", "--mount", mount + ",shared", ALPINE, "grep", dest, "/proc/self/mountinfo"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		found, matches := session.GrepString(dest)
 		Expect(found).Should(BeTrue())
 		Expect(matches[0]).To(ContainSubstring("rw"))
 		Expect(matches[0]).To(ContainSubstring("shared"))
 
-		mountPath = filepath.Join(podmanTest.TempDir, "scratchpad")
-		os.Mkdir(mountPath, 0755)
-		session = podmanTest.Podman([]string{"run", "--rm", "--mount", "type=tmpfs,target=/run/test", ALPINE, "grep", "/run/test", "/proc/self/mountinfo"})
+		session = podmanTest.Podman([]string{"run", "--rm", "--mount", "type=tmpfs,target=" + dest, ALPINE, "grep", dest, "/proc/self/mountinfo"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
-		Expect(session.OutputToString()).To(ContainSubstring("/run/test rw,nosuid,nodev,noexec,relatime - tmpfs"))
+		Expect(session.OutputToString()).To(ContainSubstring(dest + " rw,nosuid,nodev,relatime - tmpfs"))
 
 		session = podmanTest.Podman([]string{"run", "--rm", "--mount", "type=tmpfs,target=/etc/ssl,tmpcopyup", ALPINE, "ls", "/etc/ssl"})
 		session.WaitWithDefaultTimeout()
@@ -143,7 +149,7 @@ var _ = Describe("Podman run with volumes", func() {
 	It("podman run with conflicting volumes errors", func() {
 		mountPath := filepath.Join(podmanTest.TmpDir, "secrets")
 		os.Mkdir(mountPath, 0755)
-		session := podmanTest.Podman([]string{"run", "-v", fmt.Sprintf("%s:/run/test", mountPath), "-v", "/tmp:/run/test", ALPINE, "ls"})
+		session := podmanTest.Podman([]string{"run", "-v", mountPath + ":" + dest, "-v", "/tmp" + ":" + dest, ALPINE, "ls"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(125))
 	})
@@ -165,17 +171,19 @@ var _ = Describe("Podman run with volumes", func() {
 	It("podman run with mount flag and boolean options", func() {
 		mountPath := filepath.Join(podmanTest.TempDir, "secrets")
 		os.Mkdir(mountPath, 0755)
-		session := podmanTest.Podman([]string{"run", "--rm", "--mount", fmt.Sprintf("type=bind,src=%s,target=/run/test,ro=false", mountPath), ALPINE, "grep", "/run/test", "/proc/self/mountinfo"})
+		mount := "type=bind,src=" + mountPath + ",target=" + dest
+
+		session := podmanTest.Podman([]string{"run", "--rm", "--mount", mount + ",ro=false", ALPINE, "grep", dest, "/proc/self/mountinfo"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
-		Expect(session.OutputToString()).To(ContainSubstring("/run/test rw"))
+		Expect(session.OutputToString()).To(ContainSubstring(dest + " rw"))
 
-		session = podmanTest.Podman([]string{"run", "--rm", "--mount", fmt.Sprintf("type=bind,src=%s,target=/run/test,ro=true", mountPath), ALPINE, "grep", "/run/test", "/proc/self/mountinfo"})
+		session = podmanTest.Podman([]string{"run", "--rm", "--mount", mount + ",ro=true", ALPINE, "grep", dest, "/proc/self/mountinfo"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
-		Expect(session.OutputToString()).To(ContainSubstring("/run/test ro"))
+		Expect(session.OutputToString()).To(ContainSubstring(dest + " ro"))
 
-		session = podmanTest.Podman([]string{"run", "--rm", "--mount", fmt.Sprintf("type=bind,src=%s,target=/run/test,ro=true,rw=false", mountPath), ALPINE, "grep", "/run/test", "/proc/self/mountinfo"})
+		session = podmanTest.Podman([]string{"run", "--rm", "--mount", mount + ",ro=true,rw=false", ALPINE, "grep", dest, "/proc/self/mountinfo"})
 		session.WaitWithDefaultTimeout()
 		Expect(session).To(ExitWithError())
 	})
@@ -189,21 +197,23 @@ var _ = Describe("Podman run with volumes", func() {
 	})
 
 	It("podman run with volumes and suid/dev/exec options", func() {
+		SkipIfRemote("podman-remote does not support --volumes")
 		mountPath := filepath.Join(podmanTest.TempDir, "secrets")
 		os.Mkdir(mountPath, 0755)
-		session := podmanTest.Podman([]string{"run", "--rm", "-v", fmt.Sprintf("%s:/run/test:suid,dev,exec", mountPath), ALPINE, "grep", "/run/test", "/proc/self/mountinfo"})
+
+		session := podmanTest.Podman([]string{"run", "--rm", "-v", mountPath + ":" + dest + ":suid,dev,exec", ALPINE, "grep", dest, "/proc/self/mountinfo"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
-		found, matches := session.GrepString("/run/test")
+		found, matches := session.GrepString(dest)
 		Expect(found).Should(BeTrue())
 		Expect(matches[0]).To(Not(ContainSubstring("noexec")))
 		Expect(matches[0]).To(Not(ContainSubstring("nodev")))
 		Expect(matches[0]).To(Not(ContainSubstring("nosuid")))
 
-		session = podmanTest.Podman([]string{"run", "--rm", "--tmpfs", "/run/test:suid,dev,exec", ALPINE, "grep", "/run/test", "/proc/self/mountinfo"})
+		session = podmanTest.Podman([]string{"run", "--rm", "--tmpfs", dest + ":suid,dev,exec", ALPINE, "grep", dest, "/proc/self/mountinfo"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
-		found, matches = session.GrepString("/run/test")
+		found, matches = session.GrepString(dest)
 		Expect(found).Should(BeTrue())
 		Expect(matches[0]).To(Not(ContainSubstring("noexec")))
 		Expect(matches[0]).To(Not(ContainSubstring("nodev")))
@@ -217,6 +227,7 @@ var _ = Describe("Podman run with volumes", func() {
 	})
 
 	It("podman run with tmpfs named volume mounts and unmounts", func() {
+		SkipIfRemote("podman-remote does not support --volumes this test could be simplified to be tested on Remote.")
 		SkipIfRootless()
 		volName := "testvol"
 		mkVolume := podmanTest.Podman([]string{"volume", "create", "--opt", "type=tmpfs", "--opt", "device=tmpfs", "--opt", "o=nodev", "testvol"})
@@ -230,7 +241,7 @@ var _ = Describe("Podman run with volumes", func() {
 		Expect(mountCmd1.ExitCode()).To(Equal(0))
 		os.Stdout.Sync()
 		os.Stderr.Sync()
-		mountOut1 := strings.Join(strings.Fields(fmt.Sprintf("%s", mountCmd1.Out.Contents())), " ")
+		mountOut1 := strings.Join(strings.Fields(string(mountCmd1.Out.Contents())), " ")
 		fmt.Printf("Output: %s", mountOut1)
 		Expect(strings.Contains(mountOut1, volName)).To(BeFalse())
 
@@ -246,12 +257,12 @@ var _ = Describe("Podman run with volumes", func() {
 		Expect(mountCmd2.ExitCode()).To(Equal(0))
 		os.Stdout.Sync()
 		os.Stderr.Sync()
-		mountOut2 := strings.Join(strings.Fields(fmt.Sprintf("%s", mountCmd2.Out.Contents())), " ")
+		mountOut2 := strings.Join(strings.Fields(string(mountCmd2.Out.Contents())), " ")
 		fmt.Printf("Output: %s", mountOut2)
 		Expect(strings.Contains(mountOut2, volName)).To(BeTrue())
 
 		// Stop the container to unmount
-		podmanStopSession := podmanTest.Podman([]string{"stop", "--timeout", "0", ctrName})
+		podmanStopSession := podmanTest.Podman([]string{"stop", "--time", "0", ctrName})
 		podmanStopSession.WaitWithDefaultTimeout()
 		Expect(podmanStopSession.ExitCode()).To(Equal(0))
 
@@ -267,7 +278,7 @@ var _ = Describe("Podman run with volumes", func() {
 		Expect(mountCmd3.ExitCode()).To(Equal(0))
 		os.Stdout.Sync()
 		os.Stderr.Sync()
-		mountOut3 := strings.Join(strings.Fields(fmt.Sprintf("%s", mountCmd3.Out.Contents())), " ")
+		mountOut3 := strings.Join(strings.Fields(string(mountCmd3.Out.Contents())), " ")
 		fmt.Printf("Output: %s", mountOut3)
 		Expect(strings.Contains(mountOut3, volName)).To(BeFalse())
 	})
@@ -294,11 +305,11 @@ var _ = Describe("Podman run with volumes", func() {
 	})
 
 	It("podman read-only tmpfs conflict with volume", func() {
-		session := podmanTest.Podman([]string{"run", "--rm", "-t", "-i", "--read-only", "-v", "tmp_volume:/run", ALPINE, "touch", "/run/a"})
+		session := podmanTest.Podman([]string{"run", "--rm", "-t", "-i", "--read-only", "-v", "tmp_volume:" + dest, ALPINE, "touch", dest + "/a"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 
-		session2 := podmanTest.Podman([]string{"run", "--rm", "-t", "-i", "--read-only", "--tmpfs", "/run", ALPINE, "touch", "/run/a"})
+		session2 := podmanTest.Podman([]string{"run", "--rm", "-t", "-i", "--read-only", "--tmpfs", dest, ALPINE, "touch", dest + "/a"})
 		session2.WaitWithDefaultTimeout()
 		Expect(session2.ExitCode()).To(Equal(0))
 	})
@@ -396,5 +407,137 @@ var _ = Describe("Podman run with volumes", func() {
 		volMount := podmanTest.Podman([]string{"run", "--rm", "-v", fmt.Sprintf("%s:/tmp", volName), ALPINE, "ls"})
 		volMount.WaitWithDefaultTimeout()
 		Expect(volMount.ExitCode()).To(Not(Equal(0)))
+	})
+
+	It("Podman fix for CVE-2020-1726", func() {
+		volName := "testVol"
+		volCreate := podmanTest.Podman([]string{"volume", "create", volName})
+		volCreate.WaitWithDefaultTimeout()
+		Expect(volCreate.ExitCode()).To(Equal(0))
+
+		volPath := podmanTest.Podman([]string{"volume", "inspect", "--format", "{{.Mountpoint}}", volName})
+		volPath.WaitWithDefaultTimeout()
+		Expect(volPath.ExitCode()).To(Equal(0))
+		path := volPath.OutputToString()
+
+		fileName := "thisIsATestFile"
+		file, err := os.Create(filepath.Join(path, fileName))
+		Expect(err).To(BeNil())
+		defer file.Close()
+
+		runLs := podmanTest.Podman([]string{"run", "-t", "-i", "--rm", "-v", fmt.Sprintf("%v:/etc/ssl", volName), ALPINE, "ls", "-1", "/etc/ssl"})
+		runLs.WaitWithDefaultTimeout()
+		Expect(runLs.ExitCode()).To(Equal(0))
+		outputArr := runLs.OutputToStringArray()
+		Expect(len(outputArr)).To(Equal(1))
+		Expect(strings.Contains(outputArr[0], fileName)).To(BeTrue())
+	})
+
+	It("Podman mount over image volume with trailing /", func() {
+		image := "podman-volume-test:trailing"
+		dockerfile := `
+FROM alpine:latest
+VOLUME /test/`
+		podmanTest.BuildImage(dockerfile, image, "false")
+
+		ctrName := "testCtr"
+		create := podmanTest.Podman([]string{"create", "-v", "/tmp:/test", "--name", ctrName, image, "ls"})
+		create.WaitWithDefaultTimeout()
+		Expect(create.ExitCode()).To(Equal(0))
+
+		data := podmanTest.InspectContainer(ctrName)
+		Expect(len(data)).To(Equal(1))
+		Expect(len(data[0].Mounts)).To(Equal(1))
+		Expect(data[0].Mounts[0].Source).To(Equal("/tmp"))
+		Expect(data[0].Mounts[0].Destination).To(Equal("/test"))
+	})
+
+	It("podman run with overlay volume flag", func() {
+		SkipIfRemote("Overlay volumes only work locally")
+		if os.Getenv("container") != "" {
+			Skip("Overlay mounts not supported when running in a container")
+		}
+		if rootless.IsRootless() {
+			if _, err := exec.LookPath("fuse_overlay"); err != nil {
+				Skip("Fuse-Overlayfs required for rootless overlay mount test")
+			}
+		}
+		mountPath := filepath.Join(podmanTest.TempDir, "secrets")
+		os.Mkdir(mountPath, 0755)
+		testFile := filepath.Join(mountPath, "test1")
+		f, err := os.Create(testFile)
+		f.Close()
+
+		// Make sure host directory gets mounted in to container as overlay
+		session := podmanTest.Podman([]string{"run", "--rm", "-v", fmt.Sprintf("%s:/run/test:O", mountPath), ALPINE, "grep", "/run/test", "/proc/self/mountinfo"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		found, matches := session.GrepString("/run/test")
+		Expect(found).Should(BeTrue())
+		Expect(matches[0]).To(ContainSubstring("overlay"))
+
+		// Make sure host files show up in the container
+		session = podmanTest.Podman([]string{"run", "--rm", "-v", fmt.Sprintf("%s:/run/test:O", mountPath), ALPINE, "ls", "/run/test/test1"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+
+		// Make sure modifications in container do not show up on host
+		session = podmanTest.Podman([]string{"run", "--rm", "-v", fmt.Sprintf("%s:/run/test:O", mountPath), ALPINE, "touch", "/run/test/container"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		_, err = os.Stat(filepath.Join(mountPath, "container"))
+		Expect(err).To(Not(BeNil()))
+
+		// Make sure modifications in container disappear when container is stopped
+		session = podmanTest.Podman([]string{"create", "-d", "-v", fmt.Sprintf("%s:/run/test:O", mountPath), ALPINE, "top"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		session = podmanTest.Podman([]string{"start", "-l"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		session = podmanTest.Podman([]string{"exec", "-l", "touch", "/run/test/container"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		session = podmanTest.Podman([]string{"exec", "-l", "ls", "/run/test/container"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		session = podmanTest.Podman([]string{"stop", "-l"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		session = podmanTest.Podman([]string{"start", "-l"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		session = podmanTest.Podman([]string{"exec", "-l", "ls", "/run/test/container"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Not(Equal(0)))
+	})
+
+	It("overlay volume conflicts with named volume and mounts", func() {
+		mountPath := filepath.Join(podmanTest.TempDir, "secrets")
+		os.Mkdir(mountPath, 0755)
+		testFile := filepath.Join(mountPath, "test1")
+		f, err := os.Create(testFile)
+		Expect(err).To(BeNil())
+		f.Close()
+		mountSrc := filepath.Join(podmanTest.TempDir, "vol-test1")
+		err = os.MkdirAll(mountSrc, 0755)
+		Expect(err).To(BeNil())
+		mountDest := "/run/test"
+		volName := "myvol"
+
+		session := podmanTest.Podman([]string{"volume", "create", volName})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+
+		// overlay and named volume destinations conflict
+		session = podmanTest.Podman([]string{"run", "--rm", "-v", fmt.Sprintf("%s:%s:O", mountPath, mountDest), "-v", fmt.Sprintf("%s:%s", volName, mountDest), ALPINE})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Not(Equal(0)))
+		// overlay and bind mount destinations conflict
+		session = podmanTest.Podman([]string{"run", "--rm", "-v", fmt.Sprintf("%s:%s:O", mountPath, mountDest), "--mount", fmt.Sprintf("type=bind,src=%s,target=%s", mountSrc, mountDest), ALPINE})
+		Expect(session.ExitCode()).To(Not(Equal(0)))
+		// overlay and tmpfs mount destinations conflict
+		session = podmanTest.Podman([]string{"run", "--rm", "-v", fmt.Sprintf("%s:%s:O", mountPath, mountDest), "--mount", fmt.Sprintf("type=tmpfs,target=%s", mountDest), ALPINE})
+		Expect(session.ExitCode()).To(Not(Equal(0)))
 	})
 })

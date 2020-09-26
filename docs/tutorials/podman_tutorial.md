@@ -5,7 +5,7 @@ Podman is a utility provided as part of the libpod library.  It can be used to c
 containers. The following tutorial will teach you how to set up Podman and perform some basic
 commands with Podman.
 
-If you are running on a Mac, you should instead follow the [Mac tutorial](https://github.com/containers/libpod/blob/master/docs/tutorials/mac_client.md)
+If you are running on a Mac or Windows PC, you should instead follow the [Mac and Windows tutorial](https://github.com/containers/podman/blob/master/docs/tutorials/mac_win_client.md)
 to set up the remote Podman client.
 
 **NOTE**: the code samples are intended to be run as a non-root user, and use `sudo` where
@@ -13,7 +13,7 @@ root escalation is required.
 
 ## Installing Podman
 
-For installing or building Podman, please see the [installation instructions](https://github.com/containers/libpod/blob/master/install.md).
+For installing or building Podman, please see the [installation instructions](https://github.com/containers/podman/blob/master/install.md).
 
 ## Familiarizing yourself with Podman
 
@@ -24,7 +24,7 @@ page.
 podman run -dt -p 8080:8080/tcp -e HTTPD_VAR_RUN=/var/run/httpd -e HTTPD_MAIN_CONF_D_PATH=/etc/httpd/conf.d \
                   -e HTTPD_MAIN_CONF_PATH=/etc/httpd/conf \
                   -e HTTPD_CONTAINER_SCRIPTS_PATH=/usr/share/container-scripts/httpd/ \
-                  registry.fedoraproject.org/f27/httpd /usr/bin/run-httpd
+                  registry.fedoraproject.org/f29/httpd /usr/bin/run-httpd
 ```
 Because the container is being run in detached mode, represented by the *-d* in the `podman run` command, Podman
 will print the container ID after it has run. Note that we use port forwarding to be able to

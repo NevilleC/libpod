@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -eo pipefail
 
@@ -9,6 +9,8 @@ req_env_var CI UPLDREL_IMAGE CIRRUS_BUILD_ID GOSRC RELEASE_GCPJSON RELEASE_GCPNA
 [[ "$CI" == "true" ]] || \
     die 56 "$0 must be run under Cirrus-CI to function"
 
+SWAGGER_FILEPATH="pkg/api/swagger.yaml"
+
 # We store "releases" for each PR, mostly to validate the process is functional
 unset PR_OR_BRANCH BUCKET
 if [[ -n "$CIRRUS_PR" ]]
@@ -17,35 +19,18 @@ then
     BUCKET="libpod-pr-releases"
 elif [[ -n "$CIRRUS_BRANCH" ]]
 then
-    # Only release non-development tagged commit ranges
-    if is_release
+    # Only release binaries for docs
+    if [[ $CIRRUS_TASK_NAME =~ "docs" ]]
     then
         PR_OR_BRANCH="$CIRRUS_BRANCH"
         BUCKET="libpod-$CIRRUS_BRANCH-releases"
     else
-        warn "" "Skipping release processing: Commit range|CIRRUS_TAG is development tagged."
+        warn "" "Skipping release processing for non-docs task."
         exit 0
     fi
 else
     die 1 "Expecting either \$CIRRUS_PR or \$CIRRUS_BRANCH to be non-empty."
 fi
-
-echo "Parsing actual_release.txt contents: $(< actual_release.txt)"
-cd $GOSRC
-RELEASETXT=$(<actual_release.txt)  # see build_release.sh
-[[ -n "$RELEASETXT" ]] || \
-    die 3 "Could not obtain metadata from actual_release.txt"
-RELEASE_INFO=$(echo "$RELEASETXT" | grep -m 1 'X-RELEASE-INFO:' | sed -r -e 's/X-RELEASE-INFO:\s*(.+)/\1/')
-if [[ "$?" -ne "0" ]] || [[ -z "$RELEASE_INFO" ]]
-then
-    die 4 "Metadata is empty or invalid: '$RELEASETXT'"
-fi
-# Format specified in Makefile
-# e.g. libpod v1.3.1-166-g60df124e fedora 29 amd64
-# or   libpod-remote v1.3.1-166-g60df124e windows - amd64
-FIELDS="RELEASE_BASENAME RELEASE_VERSION RELEASE_DIST RELEASE_DIST_VER RELEASE_ARCH"
-read $FIELDS <<< $RELEASE_INFO
-req_env_var $FIELDS
 
 # Functional local podman required for uploading
 echo "Verifying a local, functional podman, building one if necessary."
@@ -62,7 +47,7 @@ echo "$RELEASE_GCPJSON" > "$TMPF"
 unset RELEASE_GCPJSON
 
 cd $GOSRC
-for filename in $(ls -1 *.tar.gz *.zip *.msi)
+for filename in $(ls -1 $SWAGGER_FILEPATH)
 do
     unset EXT
     EXT=$(echo "$filename" | sed -r -e 's/.+\.(.+$)/\1/g')
@@ -76,24 +61,20 @@ do
         EXT="tar.gz"
     fi
 
-    [[ "$OS_RELEASE_ID" == "ubuntu" ]] || \
-        chcon -t container_file_t "$filename"
-    # Form the generic "latest" file for this branch or pr
-    TO_PREFIX="${RELEASE_BASENAME}-latest-${PR_OR_BRANCH}-${RELEASE_DIST}"
-    # Form the fully-versioned filename for historical sake
-    ALSO_PREFIX="${RELEASE_BASENAME}-${RELEASE_VERSION}-${PR_OR_BRANCH}-${RELEASE_DIST}"
-    TO_SUFFIX="${RELEASE_ARCH}.${EXT}"
-    if [[ "$RELEASE_DIST" == "windows" ]] || [[ "$RELEASE_DIST" == "darwin" ]]
+    if [[ $filename == $SWAGGER_FILEPATH ]]
     then
-        TO_FILENAME="${TO_PREFIX}-${TO_SUFFIX}"
-        ALSO_FILENAME="${ALSO_PREFIX}-${TO_SUFFIX}"
+        # Support other tools referencing branch and/or version-specific refs.
+        TO_FILENAME="swagger-${RELEASE_VERSION}-${PR_OR_BRANCH}.yaml"
+        # For doc. ref. this must always be a static filename, e.g. swagger-latest-master.yaml
+        ALSO_FILENAME="swagger-latest-${PR_OR_BRANCH}.yaml"
     else
-        TO_FILENAME="${TO_PREFIX}-${RELEASE_DIST_VER}-${TO_SUFFIX}"
-        ALSO_FILENAME="${ALSO_PREFIX}-${TO_SUFFIX}"
+        die "Uploading non-docs files has been disabled"
     fi
 
+    [[ "$OS_RELEASE_ID" == "ubuntu" ]] || \
+        chcon -t container_file_t "$filename"
+
     echo "Running podman ... $UPLDREL_IMAGE for $filename -> $TO_FILENAME"
-    echo "Warning: upload failures are completely ignored, avoiding any needless holdup of PRs."
     podman run -i --rm \
         -e "GCPNAME=$RELEASE_GCPNAME" \
         -e "GCPPROJECT=$RELEASE_GCPROJECT" \
@@ -105,5 +86,5 @@ do
         -e "BUCKET=$BUCKET" \
         -v "$TMPF:$TMPF:ro" \
         -v "$(realpath $GOSRC/$filename):/tmp/$filename:ro" \
-        $UPLDREL_IMAGE || true
+        $UPLDREL_IMAGE
 done

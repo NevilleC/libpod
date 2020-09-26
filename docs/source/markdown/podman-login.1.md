@@ -4,20 +4,27 @@
 podman\-login - Login to a container registry
 
 ## SYNOPSIS
-**podman login** [*options*] *registry*
+**podman login** [*options*] [*registry*]
 
 ## DESCRIPTION
 **podman login** logs into a specified registry server with the correct username
-and password. **podman login** reads in the username and password from STDIN.
+and password. If the registry is not specified, the first registry under [registries.search]
+from registries.conf will be used. **podman login** reads in the username and password from STDIN.
 The username and password can also be set using the **username** and **password** flags.
 The path of the authentication file can be specified by the user by setting the **authfile**
-flag. The default path used is **${XDG\_RUNTIME\_DIR}/containers/auth.json**.
+flag. The default path for reading and writing credentials is **${XDG\_RUNTIME\_DIR}/containers/auth.json**.
+Podman will use existing credentials if the user does not pass in a username.
+Podman will first search for the username and password in the **${XDG\_RUNTIME\_DIR}/containers/auth.json**, if they are not valid,
+Podman will then use any existing credentials found in **$HOME/.docker/config.json**.
+If those credentials are not present, Podman will create **${XDG\_RUNTIME\_DIR}/containers/auth.json** (if the file does not exist) and
+will then store the username and password from STDIN as a base64 encoded string in it.
+For more details about format and configurations of the auth.json file, please refer to containers-auth.json(5)
 
 **podman [GLOBAL OPTIONS]**
 
 **podman login [GLOBAL OPTIONS]**
 
-**podman login [OPTIONS] REGISTRY [GLOBAL OPTIONS]**
+**podman login [OPTIONS] [REGISTRY] [GLOBAL OPTIONS]**
 
 ## OPTIONS
 
@@ -29,7 +36,7 @@ Password for registry
 
 Take the password from stdin
 
-**--username**, **-u=***username*
+**--username**, **-u**=*username*
 
 Username for registry
 
@@ -101,7 +108,7 @@ Login Succeeded!
 ```
 
 ## SEE ALSO
-podman(1), podman-logout(1)
+podman(1), podman-logout(1), containers-auth.json(5), containers-registries.conf(5)
 
 ## HISTORY
 August 2017, Originally compiled by Urvashi Mohnani <umohnani@redhat.com>

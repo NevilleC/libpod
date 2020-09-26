@@ -5,7 +5,7 @@ import (
 	"os"
 	"sort"
 
-	. "github.com/containers/libpod/test/utils"
+	. "github.com/containers/podman/v2/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -28,7 +28,7 @@ var _ = Describe("Podman ps", func() {
 	})
 
 	AfterEach(func() {
-		podmanTest.CleanupPod()
+		podmanTest.Cleanup()
 		f := CurrentGinkgoTestDescription()
 		processTestResult(f)
 
@@ -83,6 +83,7 @@ var _ = Describe("Podman ps", func() {
 	})
 
 	It("podman pod ps latest", func() {
+		SkipIfRemote("--latest flag n/a")
 		_, ec, podid1 := podmanTest.CreatePod("")
 		Expect(ec).To(Equal(0))
 
@@ -95,6 +96,7 @@ var _ = Describe("Podman ps", func() {
 		Expect(result.OutputToString()).To(ContainSubstring(podid2))
 		Expect(result.OutputToString()).To(Not(ContainSubstring(podid1)))
 	})
+
 	It("podman pod ps id filter flag", func() {
 		_, ec, podid := podmanTest.CreatePod("")
 		Expect(ec).To(Equal(0))
@@ -142,7 +144,7 @@ var _ = Describe("Podman ps", func() {
 		_, ec, _ = podmanTest.RunLsContainerInPod("test2", podid)
 		Expect(ec).To(Equal(0))
 
-		session = podmanTest.Podman([]string{"pod", "ps", "--format={{.ContainerInfo}}", "--ctr-names"})
+		session = podmanTest.Podman([]string{"pod", "ps", "--format={{.ContainerNames}}", "--ctr-names"})
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 		Expect(session.OutputToString()).To(ContainSubstring("test1"))
@@ -203,5 +205,58 @@ var _ = Describe("Podman ps", func() {
 		session.WaitWithDefaultTimeout()
 		Expect(session.ExitCode()).To(Equal(0))
 		Expect(session.OutputToString()).To(BeEmpty())
+	})
+
+	It("podman pod ps filter labels", func() {
+		_, ec, podid1 := podmanTest.CreatePod("")
+		Expect(ec).To(Equal(0))
+
+		_, ec, podid2 := podmanTest.CreatePodWithLabels("", map[string]string{
+			"app":                "myapp",
+			"io.podman.test.key": "irrelevant-value",
+		})
+		Expect(ec).To(Equal(0))
+
+		_, ec, podid3 := podmanTest.CreatePodWithLabels("", map[string]string{
+			"app": "test",
+		})
+		Expect(ec).To(Equal(0))
+
+		session := podmanTest.Podman([]string{"pod", "ps", "--no-trunc", "--filter", "label=app", "--filter", "label=app=myapp"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session.OutputToString()).To(Not(ContainSubstring(podid1)))
+		Expect(session.OutputToString()).To(ContainSubstring(podid2))
+		Expect(session.OutputToString()).To(Not(ContainSubstring(podid3)))
+	})
+
+	It("pod no infra should ps", func() {
+		session := podmanTest.Podman([]string{"pod", "create", "--infra=false"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+
+		ps := podmanTest.Podman([]string{"pod", "ps"})
+		ps.WaitWithDefaultTimeout()
+		Expect(ps.ExitCode()).To(Equal(0))
+
+		infra := podmanTest.Podman([]string{"pod", "ps", "--format", "{{.InfraId}}"})
+		infra.WaitWithDefaultTimeout()
+		Expect(len(infra.OutputToString())).To(BeZero())
+	})
+
+	It("podman pod ps format with labels", func() {
+		_, ec, _ := podmanTest.CreatePod("")
+		Expect(ec).To(Equal(0))
+
+		_, ec1, _ := podmanTest.CreatePodWithLabels("", map[string]string{
+			"io.podman.test.label": "value1",
+			"io.podman.test.key":   "irrelevant-value",
+		})
+		Expect(ec1).To(Equal(0))
+
+		session := podmanTest.Podman([]string{"pod", "ps", "--format", "{{.Labels}}"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session.OutputToString()).To(ContainSubstring("value1"))
 	})
 })

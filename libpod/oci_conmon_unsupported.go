@@ -3,8 +3,9 @@
 package libpod
 
 import (
-	"github.com/containers/libpod/libpod/config"
-	"github.com/containers/libpod/libpod/define"
+	"github.com/containers/common/pkg/config"
+
+	"github.com/containers/podman/v2/libpod/define"
 )
 
 const (
@@ -16,7 +17,7 @@ type ConmonOCIRuntime struct {
 }
 
 // newConmonOCIRuntime is not supported on this OS.
-func newConmonOCIRuntime(name string, paths []string, conmonPath string, runtimeCfg *config.Config, supportsJSON, supportsNoCgroups bool) (OCIRuntime, error) {
+func newConmonOCIRuntime(name string, paths []string, conmonPath string, runtimeFlags []string, runtimeCfg *config.Config) (OCIRuntime, error) {
 	return nil, define.ErrNotImplemented
 }
 
@@ -116,8 +117,8 @@ func (r *ConmonOCIRuntime) ExitFilePath(ctr *Container) (string, error) {
 }
 
 // RuntimeInfo is not supported on this OS.
-func (r *ConmonOCIRuntime) RuntimeInfo() (map[string]interface{}, error) {
-	return nil, define.ErrNotImplemented
+func (r *ConmonOCIRuntime) RuntimeInfo() (*define.ConmonInfo, *define.OCIRuntimeInfo, error) {
+	return nil, nil, define.ErrNotImplemented
 }
 
 // Package is not supported on this OS.

@@ -13,20 +13,30 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/containers/common/pkg/config"
 	"github.com/containers/image/v5/types"
-	"github.com/containers/libpod/cmd/podman/cliconfig"
-	"github.com/containers/libpod/pkg/errorhandling"
-	"github.com/containers/libpod/pkg/namespaces"
-	"github.com/containers/libpod/pkg/rootless"
+	"github.com/containers/podman/v2/pkg/errorhandling"
+	"github.com/containers/podman/v2/pkg/namespaces"
+	"github.com/containers/podman/v2/pkg/rootless"
+	"github.com/containers/podman/v2/pkg/signal"
 	"github.com/containers/storage"
 	"github.com/containers/storage/pkg/idtools"
-	"github.com/docker/docker/pkg/signal"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"github.com/spf13/pflag"
 	"golang.org/x/crypto/ssh/terminal"
 )
+
+var containerConfig *config.Config
+
+func init() {
+	var err error
+	containerConfig, err = config.Default()
+	if err != nil {
+		logrus.Error(err)
+		os.Exit(1)
+	}
+}
 
 // Helper function to determine the username/password passed
 // in the creds string.  It could be either or both.
@@ -304,66 +314,96 @@ func GetImageConfig(changes []string) (ImageConfig, error) {
 	return config, nil
 }
 
-// Parse and validate a signal name or number
+// ParseSignal parses and validates a signal name or number.
 func ParseSignal(rawSignal string) (syscall.Signal, error) {
 	// Strip off leading dash, to allow -1 or -HUP
 	basename := strings.TrimPrefix(rawSignal, "-")
 
-	signal, err := signal.ParseSignal(basename)
+	sig, err := signal.ParseSignal(basename)
 	if err != nil {
 		return -1, err
 	}
 	// 64 is SIGRTMAX; wish we could get this from a standard Go library
-	if signal < 1 || signal > 64 {
+	if sig < 1 || sig > 64 {
 		return -1, errors.Errorf("valid signals are 1 through 64")
 	}
-	return signal, nil
+	return sig, nil
+}
+
+// GetKeepIDMapping returns the mappings and the user to use when keep-id is used
+func GetKeepIDMapping() (*storage.IDMappingOptions, int, int, error) {
+	options := storage.IDMappingOptions{
+		HostUIDMapping: true,
+		HostGIDMapping: true,
+	}
+	uid, gid := 0, 0
+	if rootless.IsRootless() {
+		min := func(a, b int) int {
+			if a < b {
+				return a
+			}
+			return b
+		}
+
+		uid = rootless.GetRootlessUID()
+		gid = rootless.GetRootlessGID()
+
+		uids, gids, err := rootless.GetConfiguredMappings()
+		if err != nil {
+			return nil, -1, -1, errors.Wrapf(err, "cannot read mappings")
+		}
+		maxUID, maxGID := 0, 0
+		for _, u := range uids {
+			maxUID += u.Size
+		}
+		for _, g := range gids {
+			maxGID += g.Size
+		}
+
+		options.UIDMap, options.GIDMap = nil, nil
+
+		options.UIDMap = append(options.UIDMap, idtools.IDMap{ContainerID: 0, HostID: 1, Size: min(uid, maxUID)})
+		options.UIDMap = append(options.UIDMap, idtools.IDMap{ContainerID: uid, HostID: 0, Size: 1})
+		if maxUID > uid {
+			options.UIDMap = append(options.UIDMap, idtools.IDMap{ContainerID: uid + 1, HostID: uid + 1, Size: maxUID - uid})
+		}
+
+		options.GIDMap = append(options.GIDMap, idtools.IDMap{ContainerID: 0, HostID: 1, Size: min(gid, maxGID)})
+		options.GIDMap = append(options.GIDMap, idtools.IDMap{ContainerID: gid, HostID: 0, Size: 1})
+		if maxGID > gid {
+			options.GIDMap = append(options.GIDMap, idtools.IDMap{ContainerID: gid + 1, HostID: gid + 1, Size: maxGID - gid})
+		}
+
+		options.HostUIDMapping = false
+		options.HostGIDMapping = false
+
+	}
+	// Simply ignore the setting and do not setup an inner namespace for root as it is a no-op
+	return &options, uid, gid, nil
 }
 
 // ParseIDMapping takes idmappings and subuid and subgid maps and returns a storage mapping
-func ParseIDMapping(mode namespaces.UsernsMode, UIDMapSlice, GIDMapSlice []string, subUIDMap, subGIDMap string) (*storage.IDMappingOptions, error) {
+func ParseIDMapping(mode namespaces.UsernsMode, uidMapSlice, gidMapSlice []string, subUIDMap, subGIDMap string) (*storage.IDMappingOptions, error) {
 	options := storage.IDMappingOptions{
 		HostUIDMapping: true,
 		HostGIDMapping: true,
 	}
 
+	if mode.IsAuto() {
+		var err error
+		options.HostUIDMapping = false
+		options.HostGIDMapping = false
+		options.AutoUserNs = true
+		opts, err := mode.GetAutoOptions()
+		if err != nil {
+			return nil, err
+		}
+		options.AutoUserNsOpts = *opts
+		return &options, nil
+	}
 	if mode.IsKeepID() {
-		if len(UIDMapSlice) > 0 || len(GIDMapSlice) > 0 {
-			return nil, errors.New("cannot specify custom mappings with --userns=keep-id")
-		}
-		if len(subUIDMap) > 0 || len(subGIDMap) > 0 {
-			return nil, errors.New("cannot specify subuidmap or subgidmap with --userns=keep-id")
-		}
-		if rootless.IsRootless() {
-			uid := rootless.GetRootlessUID()
-			gid := rootless.GetRootlessGID()
-
-			uids, gids, err := rootless.GetConfiguredMappings()
-			if err != nil {
-				return nil, errors.Wrapf(err, "cannot read mappings")
-			}
-			maxUID, maxGID := 0, 0
-			for _, u := range uids {
-				maxUID += u.Size
-			}
-			for _, g := range gids {
-				maxGID += g.Size
-			}
-
-			options.UIDMap, options.GIDMap = nil, nil
-
-			options.UIDMap = append(options.UIDMap, idtools.IDMap{ContainerID: 0, HostID: 1, Size: uid})
-			options.UIDMap = append(options.UIDMap, idtools.IDMap{ContainerID: uid, HostID: 0, Size: 1})
-			options.UIDMap = append(options.UIDMap, idtools.IDMap{ContainerID: uid + 1, HostID: uid + 1, Size: maxUID - uid})
-
-			options.GIDMap = append(options.GIDMap, idtools.IDMap{ContainerID: 0, HostID: 1, Size: gid})
-			options.GIDMap = append(options.GIDMap, idtools.IDMap{ContainerID: gid, HostID: 0, Size: 1})
-			options.GIDMap = append(options.GIDMap, idtools.IDMap{ContainerID: gid + 1, HostID: gid + 1, Size: maxGID - gid})
-
-			options.HostUIDMapping = false
-			options.HostGIDMapping = false
-		}
-		// Simply ignore the setting and do not setup an inner namespace for root as it is a no-op
+		options.HostUIDMapping = false
+		options.HostGIDMapping = false
 		return &options, nil
 	}
 
@@ -373,17 +413,11 @@ func ParseIDMapping(mode namespaces.UsernsMode, UIDMapSlice, GIDMapSlice []strin
 	if subUIDMap == "" && subGIDMap != "" {
 		subUIDMap = subGIDMap
 	}
-	if len(GIDMapSlice) == 0 && len(UIDMapSlice) != 0 {
-		GIDMapSlice = UIDMapSlice
+	if len(gidMapSlice) == 0 && len(uidMapSlice) != 0 {
+		gidMapSlice = uidMapSlice
 	}
-	if len(UIDMapSlice) == 0 && len(GIDMapSlice) != 0 {
-		UIDMapSlice = GIDMapSlice
-	}
-	if len(UIDMapSlice) == 0 && subUIDMap == "" && os.Getuid() != 0 {
-		UIDMapSlice = []string{fmt.Sprintf("0:%d:1", os.Getuid())}
-	}
-	if len(GIDMapSlice) == 0 && subGIDMap == "" && os.Getuid() != 0 {
-		GIDMapSlice = []string{fmt.Sprintf("0:%d:1", os.Getgid())}
+	if len(uidMapSlice) == 0 && len(gidMapSlice) != 0 {
+		uidMapSlice = gidMapSlice
 	}
 
 	if subUIDMap != "" && subGIDMap != "" {
@@ -394,11 +428,11 @@ func ParseIDMapping(mode namespaces.UsernsMode, UIDMapSlice, GIDMapSlice []strin
 		options.UIDMap = mappings.UIDs()
 		options.GIDMap = mappings.GIDs()
 	}
-	parsedUIDMap, err := idtools.ParseIDMap(UIDMapSlice, "UID")
+	parsedUIDMap, err := idtools.ParseIDMap(uidMapSlice, "UID")
 	if err != nil {
 		return nil, err
 	}
-	parsedGIDMap, err := idtools.ParseIDMap(GIDMapSlice, "GID")
+	parsedGIDMap, err := idtools.ParseIDMap(gidMapSlice, "GID")
 	if err != nil {
 		return nil, err
 	}
@@ -492,35 +526,6 @@ func ParseInputTime(inputTime string) (time.Time, error) {
 	return time.Now().Add(-duration), nil
 }
 
-// GetGlobalOpts checks all global flags and generates the command string
-func GetGlobalOpts(c *cliconfig.RunlabelValues) string {
-	globalFlags := map[string]bool{
-		"cgroup-manager": true, "cni-config-dir": true, "conmon": true, "default-mounts-file": true,
-		"hooks-dir": true, "namespace": true, "root": true, "runroot": true,
-		"runtime": true, "storage-driver": true, "storage-opt": true, "syslog": true,
-		"trace": true, "network-cmd-path": true, "config": true, "cpu-profile": true,
-		"log-level": true, "tmpdir": true}
-	const stringSliceType string = "stringSlice"
-
-	var optsCommand []string
-	c.PodmanCommand.Command.Flags().VisitAll(func(f *pflag.Flag) {
-		if !f.Changed {
-			return
-		}
-		if _, exist := globalFlags[f.Name]; exist {
-			if f.Value.Type() == stringSliceType {
-				flagValue := strings.TrimSuffix(strings.TrimPrefix(f.Value.String(), "["), "]")
-				for _, value := range strings.Split(flagValue, ",") {
-					optsCommand = append(optsCommand, fmt.Sprintf("--%s %s", f.Name, value))
-				}
-			} else {
-				optsCommand = append(optsCommand, fmt.Sprintf("--%s %s", f.Name, f.Value.String()))
-			}
-		}
-	})
-	return strings.Join(optsCommand, " ")
-}
-
 // OpenExclusiveFile opens a file for writing and ensure it doesn't already exist
 func OpenExclusiveFile(path string) (*os.File, error) {
 	baseDir := filepath.Dir(path)
@@ -532,33 +537,21 @@ func OpenExclusiveFile(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0666)
 }
 
-// PullType whether to pull new image
-type PullType int
+type PullType = config.PullPolicy
 
-const (
+var (
 	// PullImageAlways always try to pull new image when create or run
-	PullImageAlways PullType = iota
+	PullImageAlways = config.PullImageAlways
 	// PullImageMissing pulls image if it is not locally
-	PullImageMissing
+	PullImageMissing = config.PullImageMissing
 	// PullImageNever will never pull new image
-	PullImageNever
+	PullImageNever = config.PullImageNever
 )
 
 // ValidatePullType check if the pullType from CLI is valid and returns the valid enum type
 // if the value from CLI is invalid returns the error
 func ValidatePullType(pullType string) (PullType, error) {
-	switch pullType {
-	case "always":
-		return PullImageAlways, nil
-	case "missing":
-		return PullImageMissing, nil
-	case "never":
-		return PullImageNever, nil
-	case "":
-		return PullImageMissing, nil
-	default:
-		return PullImageMissing, errors.Errorf("invalid pull type %q", pullType)
-	}
+	return config.ValidatePullPolicy(pullType)
 }
 
 // ExitCode reads the error message when failing to executing container process
@@ -588,4 +581,60 @@ func HomeDir() (string, error) {
 		home = usr.HomeDir
 	}
 	return home, nil
+}
+
+func Tmpdir() string {
+	tmpdir := os.Getenv("TMPDIR")
+	if tmpdir == "" {
+		tmpdir = "/var/tmp"
+	}
+
+	return tmpdir
+}
+
+// ValidateSysctls validates a list of sysctl and returns it.
+func ValidateSysctls(strSlice []string) (map[string]string, error) {
+	sysctl := make(map[string]string)
+	validSysctlMap := map[string]bool{
+		"kernel.msgmax":          true,
+		"kernel.msgmnb":          true,
+		"kernel.msgmni":          true,
+		"kernel.sem":             true,
+		"kernel.shmall":          true,
+		"kernel.shmmax":          true,
+		"kernel.shmmni":          true,
+		"kernel.shm_rmid_forced": true,
+	}
+	validSysctlPrefixes := []string{
+		"net.",
+		"fs.mqueue.",
+	}
+
+	for _, val := range strSlice {
+		foundMatch := false
+		arr := strings.Split(val, "=")
+		if len(arr) < 2 {
+			return nil, errors.Errorf("%s is invalid, sysctl values must be in the form of KEY=VALUE", val)
+		}
+		if validSysctlMap[arr[0]] {
+			sysctl[arr[0]] = arr[1]
+			continue
+		}
+
+		for _, prefix := range validSysctlPrefixes {
+			if strings.HasPrefix(arr[0], prefix) {
+				sysctl[arr[0]] = arr[1]
+				foundMatch = true
+				break
+			}
+		}
+		if !foundMatch {
+			return nil, errors.Errorf("sysctl '%s' is not allowed", arr[0])
+		}
+	}
+	return sysctl, nil
+}
+
+func DefaultContainerConfig() *config.Config {
+	return containerConfig
 }

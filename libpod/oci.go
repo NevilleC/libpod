@@ -1,6 +1,9 @@
 package libpod
 
 import (
+	"net/http"
+
+	"github.com/containers/podman/v2/libpod/define"
 	"k8s.io/client-go/tools/remotecommand"
 )
 
@@ -47,10 +50,43 @@ type OCIRuntime interface {
 	// UnpauseContainer unpauses the given container.
 	UnpauseContainer(ctr *Container) error
 
+	// HTTPAttach performs an attach intended to be transported over HTTP.
+	// For terminal attach, the container's output will be directly streamed
+	// to output; otherwise, STDOUT and STDERR will be multiplexed, with
+	// a header prepended as follows: 1-byte STREAM (0, 1, 2 for STDIN,
+	// STDOUT, STDERR), 3 null (0x00) bytes, 4-byte big endian length.
+	// If a cancel channel is provided, it can be used to asynchronously
+	// termninate the attach session. Detach keys, if given, will also cause
+	// the attach session to be terminated if provided via the STDIN
+	// channel. If they are not provided, the default detach keys will be
+	// used instead. Detach keys of "" will disable detaching via keyboard.
+	// The streams parameter will determine which streams to forward to the
+	// client.
+	HTTPAttach(ctr *Container, r *http.Request, w http.ResponseWriter, streams *HTTPAttachStreams, detachKeys *string, cancel <-chan bool, hijackDone chan<- bool, streamAttach, streamLogs bool) error
+	// AttachResize resizes the terminal in use by the given container.
+	AttachResize(ctr *Container, newSize remotecommand.TerminalSize) error
+
 	// ExecContainer executes a command in a running container.
-	// Returns an int (exit code), error channel (errors from attach), and
-	// error (errors that occurred attempting to start the exec session).
-	ExecContainer(ctr *Container, sessionID string, options *ExecOptions) (int, chan error, error)
+	// Returns an int (PID of exec session), error channel (errors from
+	// attach), and error (errors that occurred attempting to start the exec
+	// session). This returns once the exec session is running - not once it
+	// has completed, as one might expect. The attach session will remain
+	// running, in a goroutine that will return via the chan error in the
+	// return signature.
+	ExecContainer(ctr *Container, sessionID string, options *ExecOptions, streams *define.AttachStreams) (int, chan error, error)
+	// ExecContainerHTTP executes a command in a running container and
+	// attaches its standard streams to a provided hijacked HTTP session.
+	// Maintains the same invariants as ExecContainer (returns on session
+	// start, with a goroutine running in the background to handle attach).
+	// The HTTP attach itself maintains the same invariants as HTTPAttach.
+	ExecContainerHTTP(ctr *Container, sessionID string, options *ExecOptions, r *http.Request, w http.ResponseWriter, streams *HTTPAttachStreams, cancel <-chan bool, hijackDone chan<- bool, holdConnOpen <-chan bool) (int, chan error, error)
+	// ExecContainerDetached executes a command in a running container, but
+	// does not attach to it. Returns the PID of the exec session and an
+	// error (if starting the exec session failed)
+	ExecContainerDetached(ctr *Container, sessionID string, options *ExecOptions, stdin bool) (int, error)
+	// ExecAttachResize resizes the terminal of a running exec session. Only
+	// allowed with sessions that were created with a TTY.
+	ExecAttachResize(ctr *Container, sessionID string, newSize remotecommand.TerminalSize) error
 	// ExecStopContainer stops a given exec session in a running container.
 	// SIGTERM with be sent initially, then SIGKILL after the given timeout.
 	// If timeout is 0, SIGKILL will be sent immediately, and SIGTERM will
@@ -70,6 +106,13 @@ type OCIRuntime interface {
 	// error.
 	CheckpointContainer(ctr *Container, options ContainerCheckpointOptions) error
 
+	// CheckConmonRunning verifies that the given container's Conmon
+	// instance is still running. Runtimes without Conmon, or systems where
+	// the PID of conmon is not available, should mock this as True.
+	// True indicates that Conmon for the instance is running, False
+	// indicates it is not.
+	CheckConmonRunning(ctr *Container) (bool, error)
+
 	// SupportsCheckpoint returns whether this OCI runtime
 	// implementation supports the CheckpointContainer() operation.
 	SupportsCheckpoint() bool
@@ -79,6 +122,9 @@ type OCIRuntime interface {
 	// SupportsNoCgroups is whether the runtime supports running containers
 	// without cgroups.
 	SupportsNoCgroups() bool
+	// SupportsKVM os whether the OCI runtime supports running containers
+	// without KVM separation
+	SupportsKVM() bool
 
 	// AttachSocketPath is the path to the socket to attach to a given
 	// container.
@@ -97,7 +143,7 @@ type OCIRuntime interface {
 	ExitFilePath(ctr *Container) (string, error)
 
 	// RuntimeInfo returns verbose information about the runtime.
-	RuntimeInfo() (map[string]interface{}, error)
+	RuntimeInfo() (*define.ConmonInfo, *define.OCIRuntimeInfo, error)
 }
 
 // ExecOptions are options passed into ExecContainer. They control the command
@@ -118,15 +164,30 @@ type ExecOptions struct {
 	// the container was run as will be used.
 	User string
 	// Streams are the streams that will be attached to the container.
-	Streams *AttachStreams
+	Streams *define.AttachStreams
 	// PreserveFDs is a number of additional file descriptors (in addition
 	// to 0, 1, 2) that will be passed to the executed process. The total FDs
 	// passed will be 3 + PreserveFDs.
 	PreserveFDs uint
-	// Resize is a channel where terminal resize events are sent to be
-	// handled.
-	Resize chan remotecommand.TerminalSize
 	// DetachKeys is a set of keys that, when pressed in sequence, will
 	// detach from the container.
-	DetachKeys string
+	// If not provided, the default keys will be used.
+	// If provided but set to "", detaching from the container will be
+	// disabled.
+	DetachKeys *string
+	// ExitCommand is a command that will be run after the exec session
+	// exits.
+	ExitCommand []string
+	// ExitCommandDelay is a delay (in seconds) between the exec session
+	// exiting, and the exit command being invoked.
+	ExitCommandDelay uint
+}
+
+// HTTPAttachStreams informs the HTTPAttach endpoint which of the container's
+// standard streams should be streamed to the client. If this is passed, at
+// least one of the streams must be set to true.
+type HTTPAttachStreams struct {
+	Stdin  bool
+	Stdout bool
+	Stderr bool
 }

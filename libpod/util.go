@@ -1,21 +1,27 @@
 package libpod
 
 import (
+	"bufio"
+	"encoding/binary"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/containers/libpod/libpod/config"
-	"github.com/containers/libpod/libpod/define"
-	"github.com/containers/libpod/utils"
+	"github.com/containers/common/pkg/config"
+	"github.com/containers/podman/v2/libpod/define"
+	"github.com/containers/podman/v2/utils"
+	"github.com/cri-o/ocicni/pkg/ocicni"
 	"github.com/fsnotify/fsnotify"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 // Runtime API constants
@@ -29,24 +35,6 @@ const (
 func FuncTimer(funcName string) {
 	elapsed := time.Since(time.Now())
 	fmt.Printf("%s executed in %d ms\n", funcName, elapsed)
-}
-
-// RemoveScientificNotationFromFloat returns a float without any
-// scientific notation if the number has any.
-// golang does not handle conversion of float64s that have scientific
-// notation in them and otherwise stinks.  please replace this if you have
-// a better implementation.
-func RemoveScientificNotationFromFloat(x float64) (float64, error) {
-	bigNum := strconv.FormatFloat(x, 'g', -1, 64)
-	breakPoint := strings.IndexAny(bigNum, "Ee")
-	if breakPoint > 0 {
-		bigNum = bigNum[:breakPoint]
-	}
-	result, err := strconv.ParseFloat(bigNum, 64)
-	if err != nil {
-		return x, errors.Wrapf(err, "unable to remove scientific number from calculations")
-	}
-	return result, nil
 }
 
 // MountExists returns true if dest exists in the list of mounts
@@ -227,6 +215,108 @@ func checkDependencyContainer(depCtr, ctr *Container) error {
 
 	if ctr.config.Pod != "" && depCtr.PodID() != ctr.config.Pod {
 		return errors.Wrapf(define.ErrInvalidArg, "container has joined pod %s and dependency container %s is not a member of the pod", ctr.config.Pod, depCtr.ID())
+	}
+
+	return nil
+}
+
+// hijackWriteErrorAndClose writes an error to a hijacked HTTP session and
+// closes it. Intended to HTTPAttach function.
+// If error is nil, it will not be written; we'll only close the connection.
+func hijackWriteErrorAndClose(toWrite error, cid string, terminal bool, httpCon io.Closer, httpBuf *bufio.ReadWriter) {
+	if toWrite != nil {
+		errString := []byte(fmt.Sprintf("%v\n", toWrite))
+		if !terminal {
+			// We need a header.
+			header := makeHTTPAttachHeader(2, uint32(len(errString)))
+			if _, err := httpBuf.Write(header); err != nil {
+				logrus.Errorf("Error writing header for container %s attach connection error: %v", cid, err)
+			}
+			// TODO: May want to return immediately here to avoid
+			// writing garbage to the socket?
+		}
+		if _, err := httpBuf.Write(errString); err != nil {
+			logrus.Errorf("Error writing error to container %s HTTP attach connection: %v", cid, err)
+		}
+		if err := httpBuf.Flush(); err != nil {
+			logrus.Errorf("Error flushing HTTP buffer for container %s HTTP attach connection: %v", cid, err)
+		}
+	}
+
+	if err := httpCon.Close(); err != nil {
+		logrus.Errorf("Error closing container %s HTTP attach connection: %v", cid, err)
+	}
+}
+
+// makeHTTPAttachHeader makes an 8-byte HTTP header for a buffer of the given
+// length and stream. Accepts an integer indicating which stream we are sending
+// to (STDIN = 0, STDOUT = 1, STDERR = 2).
+func makeHTTPAttachHeader(stream byte, length uint32) []byte {
+	header := make([]byte, 8)
+	header[0] = stream
+	binary.BigEndian.PutUint32(header[4:], length)
+	return header
+}
+
+// writeHijackHeader writes a header appropriate for the type of HTTP Hijack
+// that occurred in a hijacked HTTP connection used for attach.
+func writeHijackHeader(r *http.Request, conn io.Writer) {
+	// AttachHeader is the literal header sent for upgraded/hijacked connections for
+	// attach, sourced from Docker at:
+	// https://raw.githubusercontent.com/moby/moby/b95fad8e51bd064be4f4e58a996924f343846c85/api/server/router/container/container_routes.go
+	// Using literally to ensure compatibility with existing clients.
+	c := r.Header.Get("Connection")
+	proto := r.Header.Get("Upgrade")
+	if len(proto) == 0 || !strings.EqualFold(c, "Upgrade") {
+		// OK - can't upgrade if not requested or protocol is not specified
+		fmt.Fprintf(conn,
+			"HTTP/1.1 200 OK\r\nContent-Type: application/vnd.docker.raw-stream\r\n\r\n")
+	} else {
+		// Upraded
+		fmt.Fprintf(conn,
+			"HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.raw-stream\r\nConnection: Upgrade\r\nUpgrade: %s\r\n\r\n",
+			proto)
+	}
+}
+
+// Convert OCICNI port bindings into Inspect-formatted port bindings.
+func makeInspectPortBindings(bindings []ocicni.PortMapping) map[string][]define.InspectHostPort {
+	portBindings := make(map[string][]define.InspectHostPort)
+	for _, port := range bindings {
+		key := fmt.Sprintf("%d/%s", port.ContainerPort, port.Protocol)
+		hostPorts := portBindings[key]
+		if hostPorts == nil {
+			hostPorts = []define.InspectHostPort{}
+		}
+		hostPorts = append(hostPorts, define.InspectHostPort{
+			HostIP:   port.HostIP,
+			HostPort: fmt.Sprintf("%d", port.HostPort),
+		})
+		portBindings[key] = hostPorts
+	}
+	return portBindings
+}
+
+// Write a given string to a new file at a given path.
+// Will error if a file with the given name already exists.
+// Will be chown'd to the UID/GID provided and have the provided SELinux label
+// set.
+func writeStringToPath(path, contents, mountLabel string, uid, gid int) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return errors.Wrapf(err, "unable to create %s", path)
+	}
+	defer f.Close()
+	if err := f.Chown(uid, gid); err != nil {
+		return err
+	}
+
+	if _, err := f.WriteString(contents); err != nil {
+		return errors.Wrapf(err, "unable to write %s", path)
+	}
+	// Relabel runDirResolv for the container
+	if err := label.Relabel(path, mountLabel, false); err != nil {
+		return err
 	}
 
 	return nil

@@ -2,13 +2,13 @@
 #
 # Build a Podman container image from the latest
 # upstream version of Podman on GitHub.
-# https://github.com/containers/libpod
+# https://github.com/containers/podman
 # This image can be used to create a secured container
 # that runs safely with privileges within the container.
 # The containers created by this image also come with a
 # Podman development environment in /root/podman.
 #
-FROM fedora:latest
+FROM registry.fedoraproject.org/fedora:latest
 ENV GOPATH=/root/podman
 
 # Install the software required to build Podman.
@@ -17,18 +17,18 @@ ENV GOPATH=/root/podman
 # to the container.
 # Finally remove the podman directory and a few other packages
 # that are needed for building but not running Podman
-RUN dnf -y install --exclude container-selinux \
+RUN useradd podman; yum -y update; yum -y reinstall shadow-utils; yum -y install --exclude container-selinux \
      --enablerepo=updates-testing \
-     atomic-registries \
      btrfs-progs-devel \
      containernetworking-cni \
+     conmon \
      device-mapper-devel \
      git \
      glib2-devel \
      glibc-devel \
      glibc-static \
      go \
-     golang-github-cpuguy83-go-md2man \
+     golang-github-cpuguy83-md2man \
      gpgme-devel \
      iptables \
      libassuan-devel \
@@ -37,13 +37,13 @@ RUN dnf -y install --exclude container-selinux \
      libselinux-devel \
      make \
      pkgconfig \
-     runc \
+     crun \
      fuse-overlayfs \
      fuse3 \
      containers-common; \
      mkdir /root/podman; \
-     git clone https://github.com/containers/libpod /root/podman/src/github.com/containers/libpod; \
-     cd /root/podman/src/github.com/containers/libpod; \
+     git clone https://github.com/containers/podman /root/podman/src/github.com/containers/podman; \
+     cd /root/podman/src/github.com/containers/podman; \
      make BUILDTAGS="selinux seccomp"; \
      make install PREFIX=/usr; \
      cd /root/podman; \
@@ -59,18 +59,14 @@ RUN dnf -y install --exclude container-selinux \
      mkdir -p /etc/cni/net.d; \
      curl -qsSL https://raw.githubusercontent.com/containers/libpod/master/cni/87-podman-bridge.conflist | tee /etc/cni/net.d/99-loopback.conf; \
      mkdir -p /usr/share/containers; \
-     cp $GOPATH/src/github.com/containers/libpod/libpod.conf /usr/share/containers; \
-     # Adjust libpod.conf to write logging to a file
-     sed -i 's/# events_logger = "journald"/events_logger = "file"/g' /usr/share/containers/libpod.conf; \
      rm -rf /root/podman/*; \
-     dnf -y remove git golang go-md2man make; \
-     dnf clean all;
+     yum -y remove git golang go-md2man make; \
+     yum clean all;
 
-# Adjust storage.conf to enable Fuse storage.
-RUN sed -i -e 's|^#mount_program|mount_program|g' -e '/additionalimage.*/a "/var/lib/shared",' /etc/containers/storage.conf
-RUN mkdir -p /var/lib/shared/overlay-images /var/lib/shared/overlay-layers; touch /var/lib/shared/overlay-images/images.lock; touch /var/lib/shared/overlay-layers/layers.lock
+ADD https://raw.githubusercontent.com/containers/libpod/master/contrib/podmanimage/stable/containers.conf /etc/containers/
 
-# Set up environment variables to note that this is
-# not starting with usernamespace and default to
-# isolate the filesystem with chroot.
-ENV _BUILDAH_STARTED_IN_USERNS="" BUILDAH_ISOLATION=chroot
+# chmod containers.conf and adjust storage.conf to enable Fuse storage.
+RUN chmod 644 /etc/containers/containers.conf; sed -i -e 's|^#mount_program|mount_program|g' -e '/additionalimage.*/a "/var/lib/shared",' -e 's|^mountopt[[:space:]]*=.*$|mountopt = "nodev,fsync=0"|g' /etc/containers/storage.conf
+RUN mkdir -p /var/lib/shared/overlay-images /var/lib/shared/overlay-layers /var/lib/shared/vfs-images /var/lib/shared/vfs-layers; touch /var/lib/shared/overlay-images/images.lock; touch /var/lib/shared/overlay-layers/layers.lock; touch /var/lib/shared/vfs-images/images.lock; touch /var/lib/shared/vfs-layers/layers.lock
+
+ENV _CONTAINERS_USERNS_CONFIGURED=""

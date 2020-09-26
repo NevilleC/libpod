@@ -3,8 +3,9 @@ package define
 import (
 	"runtime"
 	"strconv"
+	"time"
 
-	podmanVersion "github.com/containers/libpod/version"
+	podmanVersion "github.com/containers/podman/v2/version"
 )
 
 // Overwritten at build time
@@ -17,17 +18,18 @@ var (
 	buildInfo string
 )
 
-//Version is an output struct for varlink
+// Version is an output struct for API
 type Version struct {
-	RemoteAPIVersion int64
-	Version          string
-	GoVersion        string
-	GitCommit        string
-	Built            int64
-	OsArch           string
+	APIVersion string
+	Version    string
+	GoVersion  string
+	GitCommit  string
+	BuiltTime  string
+	Built      int64
+	OsArch     string
 }
 
-// GetVersion returns a VersionOutput struct for varlink and podman
+// GetVersion returns a VersionOutput struct for API and podman
 func GetVersion() (Version, error) {
 	var err error
 	var buildTime int64
@@ -40,11 +42,12 @@ func GetVersion() (Version, error) {
 		}
 	}
 	return Version{
-		RemoteAPIVersion: podmanVersion.RemoteAPIVersion,
-		Version:          podmanVersion.Version,
-		GoVersion:        runtime.Version(),
-		GitCommit:        gitCommit,
-		Built:            buildTime,
-		OsArch:           runtime.GOOS + "/" + runtime.GOARCH,
+		APIVersion: podmanVersion.APIVersion.String(),
+		Version:    podmanVersion.Version.String(),
+		GoVersion:  runtime.Version(),
+		GitCommit:  gitCommit,
+		BuiltTime:  time.Unix(buildTime, 0).Format(time.ANSIC),
+		Built:      buildTime,
+		OsArch:     runtime.GOOS + "/" + runtime.GOARCH,
 	}, nil
 }

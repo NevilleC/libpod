@@ -1,7 +1,11 @@
 package namespaces
 
 import (
+	"fmt"
+	"strconv"
 	"strings"
+
+	"github.com/containers/storage"
 )
 
 const (
@@ -27,7 +31,7 @@ func (n CgroupMode) IsHost() bool {
 
 // IsDefaultValue indicates whether the cgroup namespace has the default value.
 func (n CgroupMode) IsDefaultValue() bool {
-	return n == ""
+	return n == "" || n == defaultType
 }
 
 // IsNS indicates a cgroup namespace passed in by path (ns:<path>)
@@ -87,9 +91,62 @@ func (n UsernsMode) IsHost() bool {
 	return n == hostType
 }
 
-// IsKeepID indicates whether container uses a mapping where the (uid, gid) on the host is lept inside of the namespace.
+// IsKeepID indicates whether container uses a mapping where the (uid, gid) on the host is kept inside of the namespace.
 func (n UsernsMode) IsKeepID() bool {
 	return n == "keep-id"
+}
+
+// IsAuto indicates whether container uses the "auto" userns mode.
+func (n UsernsMode) IsAuto() bool {
+	parts := strings.Split(string(n), ":")
+	return parts[0] == "auto"
+}
+
+// IsDefaultValue indicates whether the user namespace has the default value.
+func (n UsernsMode) IsDefaultValue() bool {
+	return n == "" || n == defaultType
+}
+
+// GetAutoOptions returns a AutoUserNsOptions with the settings to setup automatically
+// a user namespace.
+func (n UsernsMode) GetAutoOptions() (*storage.AutoUserNsOptions, error) {
+	parts := strings.SplitN(string(n), ":", 2)
+	if parts[0] != "auto" {
+		return nil, fmt.Errorf("wrong user namespace mode")
+	}
+	options := storage.AutoUserNsOptions{}
+	if len(parts) == 1 {
+		return &options, nil
+	}
+	for _, o := range strings.Split(parts[1], ",") {
+		v := strings.SplitN(o, "=", 2)
+		if len(v) != 2 {
+			return nil, fmt.Errorf("invalid option specified: %q", o)
+		}
+		switch v[0] {
+		case "size":
+			s, err := strconv.ParseUint(v[1], 10, 32)
+			if err != nil {
+				return nil, err
+			}
+			options.Size = uint32(s)
+		case "uidmapping":
+			mapping, err := storage.ParseIDMapping([]string{v[1]}, nil, "", "")
+			if err != nil {
+				return nil, err
+			}
+			options.AdditionalUIDMappings = append(options.AdditionalUIDMappings, mapping.UIDMap...)
+		case "gidmapping":
+			mapping, err := storage.ParseIDMapping(nil, []string{v[1]}, "", "")
+			if err != nil {
+				return nil, err
+			}
+			options.AdditionalGIDMappings = append(options.AdditionalGIDMappings, mapping.GIDMap...)
+		default:
+			return nil, fmt.Errorf("unknown option specified: %q", v[0])
+		}
+	}
+	return &options, nil
 }
 
 // IsPrivate indicates whether the container uses the a private userns.
@@ -101,7 +158,7 @@ func (n UsernsMode) IsPrivate() bool {
 func (n UsernsMode) Valid() bool {
 	parts := strings.Split(string(n), ":")
 	switch mode := parts[0]; mode {
-	case "", hostType, "keep-id", nsType:
+	case "", privateType, hostType, "keep-id", nsType, "auto":
 	case containerType:
 		if len(parts) != 2 || parts[1] == "" {
 			return false
@@ -173,7 +230,7 @@ func (n UTSMode) Container() string {
 func (n UTSMode) Valid() bool {
 	parts := strings.Split(string(n), ":")
 	switch mode := parts[0]; mode {
-	case "", hostType:
+	case "", privateType, hostType:
 	case containerType:
 		if len(parts) != 2 || parts[1] == "" {
 			return false
@@ -255,7 +312,7 @@ func (n PidMode) IsContainer() bool {
 func (n PidMode) Valid() bool {
 	parts := strings.Split(string(n), ":")
 	switch mode := parts[0]; mode {
-	case "", hostType:
+	case "", privateType, hostType:
 	case containerType:
 		if len(parts) != 2 || parts[1] == "" {
 			return false
@@ -328,7 +385,7 @@ func (n NetworkMode) IsBridge() bool {
 
 // IsSlirp4netns indicates if we are running a rootless network stack
 func (n NetworkMode) IsSlirp4netns() bool {
-	return n == slirpType
+	return n == slirpType || strings.HasPrefix(string(n), slirpType+":")
 }
 
 // IsNS indicates a network namespace passed in by path (ns:<path>)

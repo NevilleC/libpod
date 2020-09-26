@@ -3,7 +3,9 @@
 # [Buildah](https://www.youtube.com/embed/YVk5NgSiUw8) - a tool that facilitates building [Open Container Initiative (OCI)](https://www.opencontainers.org/) container images
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/containers/buildah)](https://goreportcard.com/report/github.com/containers/buildah)
-[![Travis](https://travis-ci.org/containers/buildah.svg?branch=master)](https://travis-ci.org/containers/buildah)
+
+[![Bors enabled](https://bors.tech/images/badge_small.svg)](https://app.bors.tech/repositories/22803)
+
 
 The Buildah package provides a command line tool that can be used to
 * create a working container, either from scratch or using an image as a starting point
@@ -39,7 +41,7 @@ Buildah and Podman are two complementary open-source projects that are
 available on most Linux platforms and both projects reside at
 [GitHub.com](https://github.com) with Buildah
 [here](https://github.com/containers/buildah) and Podman
-[here](https://github.com/containers/libpod).  Both, Buildah and Podman are
+[here](https://github.com/containers/podman).  Both, Buildah and Podman are
 command line tools that work on Open Container Initiative (OCI) images and
 containers.  The two projects differentiate in their specialization.
 
