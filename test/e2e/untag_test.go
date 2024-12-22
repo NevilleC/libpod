@@ -1,75 +1,47 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
-	"os"
-
-	. "github.com/containers/podman/v2/test/utils"
-	. "github.com/onsi/ginkgo"
+	. "github.com/containers/podman/v5/test/utils"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
 var _ = Describe("Podman untag", func() {
-	var (
-		tempdir    string
-		err        error
-		podmanTest *PodmanTestIntegration
-	)
-
-	BeforeEach(func() {
-		tempdir, err = CreateTempDirInTempDir()
-		if err != nil {
-			os.Exit(1)
-		}
-		podmanTest = PodmanTestCreate(tempdir)
-		podmanTest.Setup()
-		podmanTest.RestoreAllArtifacts()
-	})
-
-	AfterEach(func() {
-		podmanTest.Cleanup()
-		f := CurrentGinkgoTestDescription()
-		processTestResult(f)
-
-	})
 
 	It("podman untag all", func() {
-		SkipIfRemote("FIXME This should work on podman-remote")
-		setup := podmanTest.PodmanNoCache([]string{"pull", ALPINE})
-		setup.WaitWithDefaultTimeout()
-		Expect(setup.ExitCode()).To(Equal(0))
-
-		tags := []string{ALPINE, "registry.com/foo:bar", "localhost/foo:bar"}
+		podmanTest.AddImageToRWStore(CIRROS_IMAGE)
+		tags := []string{CIRROS_IMAGE, "registry.com/foo:bar", "localhost/foo:bar"}
 
 		cmd := []string{"tag"}
 		cmd = append(cmd, tags...)
-		session := podmanTest.PodmanNoCache(cmd)
+		session := podmanTest.Podman(cmd)
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
 		// Make sure that all tags exists.
 		for _, t := range tags {
-			session = podmanTest.PodmanNoCache([]string{"image", "exists", t})
+			session = podmanTest.Podman([]string{"image", "exists", t})
 			session.WaitWithDefaultTimeout()
-			Expect(session.ExitCode()).To(Equal(0))
+			Expect(session).Should(ExitCleanly())
 		}
 
 		// No arguments -> remove all tags.
-		session = podmanTest.PodmanNoCache([]string{"untag", ALPINE})
+		session = podmanTest.Podman([]string{"untag", CIRROS_IMAGE})
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
 		// Make sure that none of tags exists anymore.
 		for _, t := range tags {
-			session = podmanTest.PodmanNoCache([]string{"image", "exists", t})
+			session = podmanTest.Podman([]string{"image", "exists", t})
 			session.WaitWithDefaultTimeout()
-			Expect(session.ExitCode()).To(Equal(1))
+			Expect(session).Should(ExitWithError(1, ""))
 		}
 	})
 
 	It("podman tag/untag - tag normalization", func() {
-		setup := podmanTest.PodmanNoCache([]string{"pull", ALPINE})
-		setup.WaitWithDefaultTimeout()
-		Expect(setup.ExitCode()).To(Equal(0))
+		podmanTest.AddImageToRWStore(CIRROS_IMAGE)
 
 		tests := []struct {
 			tag, normalized string
@@ -83,21 +55,21 @@ var _ = Describe("Podman untag", func() {
 		// Make sure that the user input is normalized correctly for
 		// `podman tag` and `podman untag`.
 		for _, tt := range tests {
-			session := podmanTest.PodmanNoCache([]string{"tag", ALPINE, tt.tag})
+			session := podmanTest.Podman([]string{"tag", CIRROS_IMAGE, tt.tag})
 			session.WaitWithDefaultTimeout()
-			Expect(session.ExitCode()).To(Equal(0))
+			Expect(session).Should(ExitCleanly())
 
-			session = podmanTest.PodmanNoCache([]string{"image", "exists", tt.normalized})
+			session = podmanTest.Podman([]string{"image", "exists", tt.normalized})
 			session.WaitWithDefaultTimeout()
-			Expect(session.ExitCode()).To(Equal(0))
+			Expect(session).Should(ExitCleanly())
 
-			session = podmanTest.PodmanNoCache([]string{"untag", ALPINE, tt.tag})
+			session = podmanTest.Podman([]string{"untag", CIRROS_IMAGE, tt.tag})
 			session.WaitWithDefaultTimeout()
-			Expect(session.ExitCode()).To(Equal(0))
+			Expect(session).Should(ExitCleanly())
 
-			session = podmanTest.PodmanNoCache([]string{"image", "exists", tt.normalized})
+			session = podmanTest.Podman([]string{"image", "exists", tt.normalized})
 			session.WaitWithDefaultTimeout()
-			Expect(session.ExitCode()).To(Equal(1))
+			Expect(session).Should(ExitWithError(1, ""))
 		}
 	})
 

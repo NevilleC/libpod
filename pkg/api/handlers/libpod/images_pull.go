@@ -1,24 +1,25 @@
+//go:build !remote
+
 package libpod
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
-	"strings"
+	"time"
 
-	"github.com/containers/image/v5/docker"
-	"github.com/containers/image/v5/docker/reference"
+	"github.com/containers/common/libimage"
+	"github.com/containers/common/pkg/config"
 	"github.com/containers/image/v5/types"
-	"github.com/containers/podman/v2/libpod"
-	"github.com/containers/podman/v2/libpod/image"
-	"github.com/containers/podman/v2/pkg/api/handlers/utils"
-	"github.com/containers/podman/v2/pkg/auth"
-	"github.com/containers/podman/v2/pkg/channel"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/containers/podman/v2/pkg/util"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/auth"
+	"github.com/containers/podman/v5/pkg/channel"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/gorilla/schema"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -27,22 +28,33 @@ import (
 // transport or be normalized to one).  Other transports are rejected as they
 // do not make sense in a remote context.
 func ImagesPull(w http.ResponseWriter, r *http.Request) {
-	runtime := r.Context().Value("runtime").(*libpod.Runtime)
-	decoder := r.Context().Value("decoder").(*schema.Decoder)
+	runtime := r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
+	decoder := r.Context().Value(api.DecoderKey).(*schema.Decoder)
 	query := struct {
-		Reference       string `schema:"reference"`
-		OverrideOS      string `schema:"overrideOS"`
-		OverrideArch    string `schema:"overrideArch"`
-		OverrideVariant string `schema:"overrideVariant"`
-		TLSVerify       bool   `schema:"tlsVerify"`
-		AllTags         bool   `schema:"allTags"`
+		AllTags    bool   `schema:"allTags"`
+		CompatMode bool   `schema:"compatMode"`
+		PullPolicy string `schema:"policy"`
+		Quiet      bool   `schema:"quiet"`
+		Reference  string `schema:"reference"`
+		Retry      uint   `schema:"retry"`
+		RetryDelay string `schema:"retrydelay"`
+		TLSVerify  bool   `schema:"tlsVerify"`
+		// Platform fields below:
+		Arch    string `schema:"Arch"`
+		OS      string `schema:"OS"`
+		Variant string `schema:"Variant"`
 	}{
-		TLSVerify: true,
+		TLSVerify:  true,
+		PullPolicy: "always",
 	}
 
 	if err := decoder.Decode(&query, r.URL.Query()); err != nil {
-		utils.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest,
-			errors.Wrapf(err, "failed to parse parameters for %s", r.URL.String()))
+		utils.Error(w, http.StatusBadRequest, fmt.Errorf("failed to parse parameters for %s: %w", r.URL.String(), err))
+		return
+	}
+
+	if query.Quiet && query.CompatMode {
+		utils.InternalServerError(w, errors.New("'quiet' and 'compatMode' cannot be used simultaneously"))
 		return
 	}
 
@@ -51,100 +63,88 @@ func ImagesPull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	imageRef, err := utils.ParseDockerReference(query.Reference)
-	if err != nil {
-		utils.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest,
-			errors.Wrapf(err, "image destination %q is not a docker-transport reference", query.Reference))
+	// Make sure that the reference has no transport or the docker one.
+	if err := utils.IsRegistryReference(query.Reference); err != nil {
+		utils.Error(w, http.StatusBadRequest, err)
 		return
 	}
 
-	// Trim the docker-transport prefix.
-	rawImage := strings.TrimPrefix(query.Reference, fmt.Sprintf("%s://", docker.Transport.Name()))
+	pullOptions := &libimage.PullOptions{}
+	pullOptions.AllTags = query.AllTags
+	pullOptions.Architecture = query.Arch
+	pullOptions.OS = query.OS
+	pullOptions.Variant = query.Variant
 
-	// all-tags doesn't work with a tagged reference, so let's check early
-	namedRef, err := reference.Parse(rawImage)
-	if err != nil {
-		utils.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest,
-			errors.Wrapf(err, "error parsing reference %q", rawImage))
-		return
-	}
-	if _, isTagged := namedRef.(reference.Tagged); isTagged && query.AllTags {
-		utils.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest,
-			errors.Errorf("reference %q must not have a tag for all-tags", rawImage))
-		return
+	if _, found := r.URL.Query()["tlsVerify"]; found {
+		pullOptions.InsecureSkipTLSVerify = types.NewOptionalBool(!query.TLSVerify)
 	}
 
+	// Do the auth dance.
 	authConf, authfile, err := auth.GetCredentials(r)
 	if err != nil {
-		utils.Error(w, "Something went wrong.", http.StatusBadRequest, errors.Wrapf(err, "Failed to parse %q header for %s", auth.XRegistryAuthHeader, r.URL.String()))
+		utils.Error(w, http.StatusBadRequest, err)
 		return
 	}
 	defer auth.RemoveAuthfile(authfile)
 
-	// Setup the registry options
-	dockerRegistryOptions := image.DockerRegistryOptions{
-		DockerRegistryCreds: authConf,
-		OSChoice:            query.OverrideOS,
-		ArchitectureChoice:  query.OverrideArch,
-		VariantChoice:       query.OverrideVariant,
-	}
-	if _, found := r.URL.Query()["tlsVerify"]; found {
-		dockerRegistryOptions.DockerInsecureSkipTLSVerify = types.NewOptionalBool(!query.TLSVerify)
+	pullOptions.AuthFilePath = authfile
+	if authConf != nil {
+		pullOptions.Username = authConf.Username
+		pullOptions.Password = authConf.Password
+		pullOptions.IdentityToken = authConf.IdentityToken
 	}
 
-	sys := runtime.SystemContext()
-	if sys == nil {
-		sys = image.GetSystemContext("", authfile, false)
+	pullPolicy, err := config.ParsePullPolicy(query.PullPolicy)
+	if err != nil {
+		utils.Error(w, http.StatusBadRequest, err)
+		return
 	}
-	dockerRegistryOptions.DockerCertPath = sys.DockerCertPath
-	sys.DockerAuthConfig = authConf
 
-	// Prepare the images we want to pull
-	imagesToPull := []string{}
-	imageName := namedRef.String()
+	if _, found := r.URL.Query()["retry"]; found {
+		pullOptions.MaxRetries = &query.Retry
+	}
 
-	if !query.AllTags {
-		imagesToPull = append(imagesToPull, imageName)
-	} else {
-		tags, err := docker.GetRepositoryTags(context.Background(), sys, imageRef)
+	if _, found := r.URL.Query()["retrydelay"]; found {
+		duration, err := time.ParseDuration(query.RetryDelay)
 		if err != nil {
-			utils.InternalServerError(w, errors.Wrap(err, "error getting repository tags"))
+			utils.Error(w, http.StatusBadRequest, err)
 			return
 		}
-		for _, tag := range tags {
-			imagesToPull = append(imagesToPull, fmt.Sprintf("%s:%s", imageName, tag))
-		}
+		pullOptions.RetryDelay = &duration
 	}
 
-	writer := channel.NewWriter(make(chan []byte, 1))
-	defer writer.Close()
-
-	stderr := channel.NewWriter(make(chan []byte, 1))
-	defer stderr.Close()
-
-	images := make([]string, 0, len(imagesToPull))
-	runCtx, cancel := context.WithCancel(context.Background())
-	go func(imgs []string) {
-		defer cancel()
-		// Finally pull the images
-		for _, img := range imgs {
-			newImage, err := runtime.ImageRuntime().New(
-				runCtx,
-				img,
-				"",
-				authfile,
-				writer,
-				&dockerRegistryOptions,
-				image.SigningOptions{},
-				nil,
-				util.PullImageAlways)
-			if err != nil {
-				stderr.Write([]byte(err.Error() + "\n"))
-			} else {
-				images = append(images, newImage.ID())
-			}
+	// Let's keep thing simple when running in quiet mode and pull directly.
+	if query.Quiet {
+		images, err := runtime.LibimageRuntime().Pull(r.Context(), query.Reference, pullPolicy, pullOptions)
+		var report entities.ImagePullReport
+		if err != nil {
+			report.Error = err.Error()
 		}
-	}(imagesToPull)
+		for _, image := range images {
+			report.Images = append(report.Images, image.ID())
+			// Pull last ID from list and publish in 'id' stanza.  This maintains previous API contract
+			report.ID = image.ID()
+		}
+		utils.WriteResponse(w, http.StatusOK, report)
+		return
+	}
+
+	if query.CompatMode {
+		utils.CompatPull(r.Context(), w, runtime, query.Reference, pullPolicy, pullOptions)
+		return
+	}
+
+	writer := channel.NewWriter(make(chan []byte))
+	defer writer.Close()
+	pullOptions.Writer = writer
+
+	var pulledImages []*libimage.Image
+	var pullError error
+	runCtx, cancel := context.WithCancel(r.Context())
+	go func() {
+		defer cancel()
+		pulledImages, pullError = runtime.LibimageRuntime().Pull(runCtx, query.Reference, pullPolicy, pullOptions)
+	}()
 
 	flush := func() {
 		if flusher, ok := w.(http.Flusher); ok {
@@ -153,50 +153,37 @@ func ImagesPull(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
-	w.Header().Add("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json")
 	flush()
 
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(true)
-	var failed bool
-loop: // break out of for/select infinite loop
 	for {
 		var report entities.ImagePullReport
 		select {
-		case e := <-writer.Chan():
-			report.Stream = string(e)
+		case s := <-writer.Chan():
+			report.Stream = string(s)
 			if err := enc.Encode(report); err != nil {
-				stderr.Write([]byte(err.Error()))
-			}
-			flush()
-		case e := <-stderr.Chan():
-			failed = true
-			report.Error = string(e)
-			if err := enc.Encode(report); err != nil {
-				logrus.Warnf("Failed to json encode error %q", err.Error())
+				logrus.Warnf("Failed to encode json: %v", err)
 			}
 			flush()
 		case <-runCtx.Done():
-			if !failed {
-				// Send all image id's pulled in 'images' stanza
-				report.Images = images
-				if err := enc.Encode(report); err != nil {
-					logrus.Warnf("Failed to json encode error %q", err.Error())
-				}
-
-				report.Images = nil
+			for _, image := range pulledImages {
+				report.Images = append(report.Images, image.ID())
 				// Pull last ID from list and publish in 'id' stanza.  This maintains previous API contract
-				report.ID = images[len(images)-1]
-				if err := enc.Encode(report); err != nil {
-					logrus.Warnf("Failed to json encode error %q", err.Error())
-				}
-
-				flush()
+				report.ID = image.ID()
 			}
-			break loop // break out of for/select infinite loop
+			if pullError != nil {
+				report.Error = pullError.Error()
+			}
+			if err := enc.Encode(report); err != nil {
+				logrus.Warnf("Failed to encode json: %v", err)
+			}
+			flush()
+			return
 		case <-r.Context().Done():
 			// Client has closed connection
-			break loop // break out of for/select infinite loop
+			return
 		}
 	}
 }

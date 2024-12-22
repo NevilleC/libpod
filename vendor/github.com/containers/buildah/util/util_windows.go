@@ -1,4 +1,4 @@
-// +build !linux,!darwin
+//go:build !linux && !darwin
 
 package util
 
@@ -6,11 +6,10 @@ import (
 	"os"
 )
 
-type HardlinkChecker struct {
+func UID(st os.FileInfo) int {
+	return 0
 }
 
-func (h *HardlinkChecker) Check(fi os.FileInfo) string {
-	return ""
-}
-func (h *HardlinkChecker) Add(fi os.FileInfo, name string) {
+func GID(st os.FileInfo) int {
+	return 0
 }

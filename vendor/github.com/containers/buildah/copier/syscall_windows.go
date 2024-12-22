@@ -1,4 +1,4 @@
-// +build windows
+//go:build windows
 
 package copier
 
@@ -77,7 +77,12 @@ func lutimes(isSymlink bool, path string, atime, mtime time.Time) error {
 	return windows.UtimesNano(path, []windows.Timespec{windows.NsecToTimespec(atime.UnixNano()), windows.NsecToTimespec(mtime.UnixNano())})
 }
 
+// sameDevice returns true since we can't be sure that they're not on the same device
+func sameDevice(a, b os.FileInfo) bool {
+	return true
+}
+
 const (
-	testModeMask           = int64(0600)
+	testModeMask           = int64(0o600)
 	testIgnoreSymlinkDates = true
 )

@@ -1,11 +1,11 @@
 package events
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
-	"github.com/containers/podman/v2/pkg/util"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/pkg/util"
 )
 
 func generateEventFilter(filter, filterValue string) (func(e *Event) bool, error) {
@@ -21,6 +21,9 @@ func generateEventFilter(filter, filterValue string) (func(e *Event) bool, error
 			return strings.HasPrefix(e.ID, filterValue)
 		}, nil
 	case "EVENT", "STATUS":
+		if filterValue == "die" { // Docker compat
+			filterValue = "died"
+		}
 		return func(e *Event) bool {
 			return string(e.Status) == filterValue
 		}, nil
@@ -49,14 +52,33 @@ func generateEventFilter(filter, filterValue string) (func(e *Event) bool, error
 			if e.Type != Volume {
 				return false
 			}
-			return strings.HasPrefix(e.ID, filterValue)
+			// Prefix match with name for consistency with docker
+			return strings.HasPrefix(e.Name, filterValue)
 		}, nil
 	case "TYPE":
 		return func(e *Event) bool {
 			return string(e.Type) == filterValue
 		}, nil
+
+	case "LABEL":
+		return func(e *Event) bool {
+			var found bool
+			// iterate labels and see if we match a key and value
+			for eventKey, eventValue := range e.Attributes {
+				filterValueSplit := strings.SplitN(filterValue, "=", 2)
+				// if the filter isn't right, just return false
+				if len(filterValueSplit) < 2 {
+					return false
+				}
+				if eventKey == filterValueSplit[0] && eventValue == filterValueSplit[1] {
+					found = true
+					break
+				}
+			}
+			return found
+		}, nil
 	}
-	return nil, errors.Errorf("%s is an invalid filter", filter)
+	return nil, fmt.Errorf("%s is an invalid filter", filter)
 }
 
 func generateEventSinceOption(timeSince time.Time) func(e *Event) bool {
@@ -68,46 +90,70 @@ func generateEventSinceOption(timeSince time.Time) func(e *Event) bool {
 func generateEventUntilOption(timeUntil time.Time) func(e *Event) bool {
 	return func(e *Event) bool {
 		return e.Time.Before(timeUntil)
-
 	}
 }
 
 func parseFilter(filter string) (string, string, error) {
-	filterSplit := strings.Split(filter, "=")
+	filterSplit := strings.SplitN(filter, "=", 2)
 	if len(filterSplit) != 2 {
-		return "", "", errors.Errorf("%s is an invalid filter", filter)
+		return "", "", fmt.Errorf("%s is an invalid filter", filter)
 	}
 	return filterSplit[0], filterSplit[1], nil
 }
 
-func generateEventOptions(filters []string, since, until string) ([]EventFilter, error) {
-	options := make([]EventFilter, 0, len(filters))
+// applyFilters applies the EventFilter slices in sequence.  Filters under the
+// same key are disjunctive while each key must match (conjuctive).
+func applyFilters(event *Event, filterMap map[string][]EventFilter) bool {
+	for _, filters := range filterMap {
+		success := false
+		for _, filter := range filters {
+			if filter(event) {
+				success = true
+				break
+			}
+		}
+		if !success {
+			return false
+		}
+	}
+	return true
+}
+
+// generateEventFilter parses the specified filters into a filter map that can
+// later on be used to filter events.  Keys are conjunctive, values are
+// disjunctive.
+func generateEventFilters(filters []string, since, until string) (map[string][]EventFilter, error) {
+	filterMap := make(map[string][]EventFilter)
 	for _, filter := range filters {
 		key, val, err := parseFilter(filter)
 		if err != nil {
 			return nil, err
 		}
-		funcFilter, err := generateEventFilter(key, val)
+		filterFunc, err := generateEventFilter(key, val)
 		if err != nil {
 			return nil, err
 		}
-		options = append(options, funcFilter)
+		filterSlice := filterMap[key]
+		filterSlice = append(filterSlice, filterFunc)
+		filterMap[key] = filterSlice
 	}
 
 	if len(since) > 0 {
-		timeSince, err := util.ParseInputTime(since)
+		timeSince, err := util.ParseInputTime(since, true)
 		if err != nil {
-			return nil, errors.Wrapf(err, "unable to convert since time of %s", since)
+			return nil, fmt.Errorf("unable to convert since time of %s: %w", since, err)
 		}
-		options = append(options, generateEventSinceOption(timeSince))
+		filterFunc := generateEventSinceOption(timeSince)
+		filterMap["since"] = []EventFilter{filterFunc}
 	}
 
 	if len(until) > 0 {
-		timeUntil, err := util.ParseInputTime(until)
+		timeUntil, err := util.ParseInputTime(until, false)
 		if err != nil {
-			return nil, errors.Wrapf(err, "unable to convert until time of %s", until)
+			return nil, fmt.Errorf("unable to convert until time of %s: %w", until, err)
 		}
-		options = append(options, generateEventUntilOption(timeUntil))
+		filterFunc := generateEventUntilOption(timeUntil)
+		filterMap["until"] = []EventFilter{filterFunc}
 	}
-	return options, nil
+	return filterMap, nil
 }

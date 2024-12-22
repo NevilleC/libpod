@@ -1,67 +1,83 @@
+//go:build !remote
+
 package compat
 
 import (
+	"fmt"
 	"net/http"
-	"strconv"
 
 	"github.com/containers/image/v5/types"
-	"github.com/containers/podman/v2/libpod/image"
-	"github.com/containers/podman/v2/pkg/api/handlers/utils"
-	"github.com/gorilla/schema"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/auth"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/infra/abi"
+	"github.com/containers/storage"
 )
 
 func SearchImages(w http.ResponseWriter, r *http.Request) {
-	decoder := r.Context().Value("decoder").(*schema.Decoder)
+	runtime := r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
+	decoder := utils.GetDecoder(r)
 	query := struct {
-		Term    string              `json:"term"`
-		Limit   int                 `json:"limit"`
-		Filters map[string][]string `json:"filters"`
+		Term      string              `json:"term"`
+		Limit     int                 `json:"limit"`
+		Filters   map[string][]string `json:"filters"`
+		TLSVerify bool                `json:"tlsVerify"`
+		ListTags  bool                `json:"listTags"`
 	}{
 		// This is where you can override the golang default value for one of fields
+		TLSVerify: true,
 	}
 
 	if err := decoder.Decode(&query, r.URL.Query()); err != nil {
-		utils.Error(w, "Something went wrong.", http.StatusBadRequest, errors.Wrapf(err, "Failed to parse parameters for %s", r.URL.String()))
+		utils.Error(w, http.StatusBadRequest, fmt.Errorf("failed to parse parameters for %s: %w", r.URL.String(), err))
 		return
 	}
 
-	filter := image.SearchFilter{}
-	if len(query.Filters) > 0 {
-		if len(query.Filters["stars"]) > 0 {
-			stars, err := strconv.Atoi(query.Filters["stars"][0])
-			if err != nil {
-				utils.InternalServerError(w, err)
-				return
-			}
-			filter.Stars = stars
-		}
-		if len(query.Filters["is-official"]) > 0 {
-			isOfficial, err := strconv.ParseBool(query.Filters["is-official"][0])
-			if err != nil {
-				utils.InternalServerError(w, err)
-				return
-			}
-			filter.IsOfficial = types.NewOptionalBool(isOfficial)
-		}
-		if len(query.Filters["is-automated"]) > 0 {
-			isAutomated, err := strconv.ParseBool(query.Filters["is-automated"][0])
-			if err != nil {
-				utils.InternalServerError(w, err)
-				return
-			}
-			filter.IsAutomated = types.NewOptionalBool(isAutomated)
-		}
-	}
-	options := image.SearchOptions{
-		Filter: filter,
-		Limit:  query.Limit,
-	}
-
-	results, err := image.SearchImages(query.Term, options)
+	authconf, authfile, err := auth.GetCredentials(r)
 	if err != nil {
-		utils.BadRequest(w, "term", query.Term, err)
+		utils.Error(w, http.StatusBadRequest, err)
 		return
 	}
-	utils.WriteResponse(w, http.StatusOK, results)
+	defer auth.RemoveAuthfile(authfile)
+
+	var username, password, idToken string
+	if authconf != nil {
+		username = authconf.Username
+		password = authconf.Password
+		idToken = authconf.IdentityToken
+	}
+
+	filters := []string{}
+	for key, val := range query.Filters {
+		filters = append(filters, fmt.Sprintf("%s=%s", key, val[0]))
+	}
+
+	options := entities.ImageSearchOptions{
+		Authfile:      authfile,
+		Limit:         query.Limit,
+		ListTags:      query.ListTags,
+		Password:      password,
+		Username:      username,
+		IdentityToken: idToken,
+		Filters:       filters,
+	}
+	if _, found := r.URL.Query()["tlsVerify"]; found {
+		options.SkipTLSVerify = types.NewOptionalBool(!query.TLSVerify)
+	}
+	ir := abi.ImageEngine{Libpod: runtime}
+	reports, err := ir.Search(r.Context(), query.Term, options)
+	if err != nil {
+		utils.Error(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !utils.IsLibpodRequest(r) {
+		if len(reports) == 0 {
+			utils.ImageNotFound(w, query.Term, storage.ErrImageUnknown)
+			return
+		}
+	}
+
+	utils.WriteResponse(w, http.StatusOK, reports)
 }

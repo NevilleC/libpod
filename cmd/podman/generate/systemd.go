@@ -1,33 +1,64 @@
-package pods
+package generate
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/utils"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/pkg/errors"
+	"github.com/containers/common/pkg/completion"
+	"github.com/containers/common/pkg/report"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	envLib "github.com/containers/podman/v5/pkg/env"
+	systemDefine "github.com/containers/podman/v5/pkg/systemd/define"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
 
+const (
+	startTimeoutFlagName      = "start-timeout"
+	stopTimeoutFlagName       = "stop-timeout"
+	stopTimeoutCompatFlagName = "time"
+	restartPolicyFlagName     = "restart-policy"
+	restartSecFlagName        = "restart-sec"
+	newFlagName               = "new"
+	wantsFlagName             = "wants"
+	afterFlagName             = "after"
+	requiresFlagName          = "requires"
+	envFlagName               = "env"
+)
+
 var (
+	deprecation = `
+DEPRECATED command:
+It is recommended to use Quadlets for running containers and pods under systemd.
+
+Please refer to podman-systemd.unit(5) for details.
+`
+
+	envInput           []string
 	files              bool
 	format             string
-	systemdTimeout     uint
+	systemdRestart     string
+	systemdRestartSec  uint
+	startTimeout       uint
+	stopTimeout        uint
 	systemdOptions     = entities.GenerateSystemdOptions{}
 	systemdDescription = `Generate systemd units for a pod or container.
-  The generated units can later be controlled via systemctl(1).`
+  The generated units can later be controlled via systemctl(1).
+` + deprecation
 
 	systemdCmd = &cobra.Command{
-		Use:   "systemd [flags] CTR|POD",
-		Short: "Generate systemd units.",
-		Long:  systemdDescription,
-		RunE:  systemd,
-		Args:  cobra.ExactArgs(1),
+		Use:               "systemd [options] {CONTAINER|POD}",
+		Short:             "[DEPRECATED] Generate systemd units",
+		Long:              systemdDescription,
+		RunE:              systemd,
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: common.AutocompleteContainersAndPods,
 		Example: `podman generate systemd CTR
   podman generate systemd --new --time 10 CTR
   podman generate systemd --files --name POD`,
@@ -36,33 +67,110 @@ var (
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: systemdCmd,
-		Parent:  generateCmd,
+		Parent:  GenerateCmd,
 	})
 	flags := systemdCmd.Flags()
 	flags.BoolVarP(&systemdOptions.Name, "name", "n", false, "Use container/pod names instead of IDs")
 	flags.BoolVarP(&files, "files", "f", false, "Generate .service files instead of printing to stdout")
-	flags.UintVarP(&systemdTimeout, "time", "t", containerConfig.Engine.StopTimeout, "Stop timeout override")
-	flags.StringVar(&systemdOptions.RestartPolicy, "restart-policy", "on-failure", "Systemd restart-policy")
-	flags.BoolVarP(&systemdOptions.New, "new", "", false, "Create a new container instead of starting an existing one")
-	flags.StringVar(&systemdOptions.ContainerPrefix, "container-prefix", "container", "Systemd unit name prefix for containers")
-	flags.StringVar(&systemdOptions.PodPrefix, "pod-prefix", "pod", "Systemd unit name prefix for pods")
-	flags.StringVar(&systemdOptions.Separator, "separator", "-", "Systemd unit name separator between name/id and prefix")
-	flags.StringVar(&format, "format", "", "Print the created units in specified format (json)")
-	flags.SetNormalizeFunc(utils.AliasFlags)
+	flags.BoolVar(&systemdOptions.TemplateUnitFile, "template", false, "Make it a template file and use %i and %I specifiers. Working only for containers")
+
+	flags.UintVarP(&startTimeout, startTimeoutFlagName, "", 0, "Start timeout override")
+	_ = systemdCmd.RegisterFlagCompletionFunc(startTimeoutFlagName, completion.AutocompleteNone)
+
+	// NOTE: initially, there was only a --time/-t flag which mapped to
+	// stop-timeout. To remain backwards compatible create a hidden flag
+	// that maps to StopTimeout.
+	flags.UintVarP(&stopTimeout, stopTimeoutFlagName, "", containerConfig.Engine.StopTimeout, "Stop timeout override")
+	_ = systemdCmd.RegisterFlagCompletionFunc(stopTimeoutFlagName, completion.AutocompleteNone)
+	flags.UintVarP(&stopTimeout, stopTimeoutCompatFlagName, "t", containerConfig.Engine.StopTimeout, "Backwards alias for --stop-timeout")
+	_ = flags.MarkHidden("time")
+
+	flags.BoolVar(&systemdOptions.New, newFlagName, false, "Create a new container or pod instead of starting an existing one")
+	flags.BoolVarP(&systemdOptions.NoHeader, "no-header", "", false, "Skip header generation")
+
+	containerPrefixFlagName := "container-prefix"
+	flags.StringVar(&systemdOptions.ContainerPrefix, containerPrefixFlagName, "container", "Systemd unit name prefix for containers")
+	_ = systemdCmd.RegisterFlagCompletionFunc(containerPrefixFlagName, completion.AutocompleteNone)
+
+	podPrefixFlagName := "pod-prefix"
+	flags.StringVar(&systemdOptions.PodPrefix, podPrefixFlagName, "pod", "Systemd unit name prefix for pods")
+	_ = systemdCmd.RegisterFlagCompletionFunc(podPrefixFlagName, completion.AutocompleteNone)
+
+	separatorFlagName := "separator"
+	flags.StringVar(&systemdOptions.Separator, separatorFlagName, "-", "Systemd unit name separator between name/id and prefix")
+	_ = systemdCmd.RegisterFlagCompletionFunc(separatorFlagName, completion.AutocompleteNone)
+
+	flags.StringVar(&systemdRestart, restartPolicyFlagName, systemDefine.DefaultRestartPolicy, "Systemd restart-policy")
+	_ = systemdCmd.RegisterFlagCompletionFunc(restartPolicyFlagName, common.AutocompleteSystemdRestartOptions)
+
+	flags.UintVarP(&systemdRestartSec, restartSecFlagName, "", 0, "Systemd restart-sec")
+	_ = systemdCmd.RegisterFlagCompletionFunc(restartSecFlagName, completion.AutocompleteNone)
+
+	formatFlagName := "format"
+	flags.StringVar(&format, formatFlagName, "", "Print the created units in specified format (json)")
+	_ = systemdCmd.RegisterFlagCompletionFunc(formatFlagName, common.AutocompleteFormat(nil))
+
+	flags.StringArrayVar(&systemdOptions.Wants, wantsFlagName, nil, "Add (weak) requirement dependencies to the generated unit file")
+	_ = systemdCmd.RegisterFlagCompletionFunc(wantsFlagName, completion.AutocompleteNone)
+
+	flags.StringArrayVar(&systemdOptions.After, afterFlagName, nil, "Add dependencies order to the generated unit file")
+	_ = systemdCmd.RegisterFlagCompletionFunc(afterFlagName, completion.AutocompleteNone)
+
+	flags.StringArrayVar(&systemdOptions.Requires, requiresFlagName, nil, "Similar to wants, but declares stronger requirement dependencies")
+	_ = systemdCmd.RegisterFlagCompletionFunc(requiresFlagName, completion.AutocompleteNone)
+
+	flags.StringArrayVarP(&envInput, envFlagName, "e", nil, "Set environment variables to the systemd unit files")
+	_ = systemdCmd.RegisterFlagCompletionFunc(envFlagName, completion.AutocompleteNone)
+
+	flags.SetNormalizeFunc(utils.TimeoutAliasFlags)
 }
 
 func systemd(cmd *cobra.Command, args []string) error {
-	if cmd.Flags().Changed("time") {
-		systemdOptions.StopTimeout = &systemdTimeout
+	fmt.Fprint(os.Stderr, deprecation)
+	if cmd.Flags().Changed(restartPolicyFlagName) {
+		systemdOptions.RestartPolicy = &systemdRestart
 	}
 
 	if registry.IsRemote() {
 		logrus.Warnln("The generated units should be placed on your remote system")
 	}
 
-	report, err := registry.ContainerEngine().GenerateSystemd(registry.GetContext(), args[0], systemdOptions)
+	if cmd.Flags().Changed(newFlagName) && !systemdOptions.New && systemdOptions.TemplateUnitFile {
+		return errors.New("--template cannot be set with --new=false")
+	}
+	if !systemdOptions.New && systemdOptions.TemplateUnitFile {
+		systemdOptions.New = true
+	}
+
+	if cmd.Flags().Changed(restartSecFlagName) {
+		systemdOptions.RestartSec = &systemdRestartSec
+	}
+	if cmd.Flags().Changed(startTimeoutFlagName) {
+		systemdOptions.StartTimeout = &startTimeout
+	}
+	setStopTimeout := 0
+	if cmd.Flags().Changed(stopTimeoutFlagName) {
+		setStopTimeout++
+	}
+	if cmd.Flags().Changed(stopTimeoutCompatFlagName) {
+		setStopTimeout++
+	}
+	if cmd.Flags().Changed(envFlagName) {
+		cliEnv, err := envLib.ParseSlice(envInput)
+		if err != nil {
+			return fmt.Errorf("parsing environment variables: %w", err)
+		}
+		systemdOptions.AdditionalEnvVariables = envLib.Slice(cliEnv)
+	}
+	switch setStopTimeout {
+	case 1:
+		systemdOptions.StopTimeout = &stopTimeout
+	case 2:
+		return fmt.Errorf("%s and %s are redundant and cannot be used together", stopTimeoutFlagName, stopTimeoutCompatFlagName)
+	}
+
+	reports, err := registry.ContainerEngine().GenerateSystemd(registry.GetContext(), args[0], systemdOptions)
 	if err != nil {
 		return err
 	}
@@ -70,9 +178,9 @@ func systemd(cmd *cobra.Command, args []string) error {
 	if files {
 		cwd, err := os.Getwd()
 		if err != nil {
-			return errors.Wrap(err, "error getting current working directory")
+			return fmt.Errorf("getting current working directory: %w", err)
 		}
-		for name, content := range report.Units {
+		for name, content := range reports.Units {
 			path := filepath.Join(cwd, fmt.Sprintf("%s.service", name))
 			f, err := os.Create(path)
 			if err != nil {
@@ -93,19 +201,18 @@ func systemd(cmd *cobra.Command, args []string) error {
 			}
 			// modify in place so we can print the
 			// paths when --files is set
-			report.Units[name] = path
+			reports.Units[name] = path
 		}
 	}
 
-	switch format {
-	case "json":
-		return printJSON(report.Units)
-	case "":
-		return printDefault(report.Units)
+	switch {
+	case report.IsJSON(format):
+		return printJSON(reports.Units)
+	case format == "":
+		return printDefault(reports.Units)
 	default:
-		return errors.Errorf("unknown --format argument: %s", format)
+		return fmt.Errorf("unknown --format argument: %s", format)
 	}
-
 }
 
 func printDefault(units map[string]string) error {

@@ -3,299 +3,212 @@
 # Library of common, shared utility functions.  This file is intended
 # to be sourced by other scripts, not called directly.
 
-# Global details persist here
-source /etc/environment  # not always loaded under all circumstances
+# BEGIN Global export of all variables
+set -a
 
-# Automation environment doesn't automatically load for Ubuntu 18
-if [[ -r '/usr/share/automation/environment' ]]; then
-    source '/usr/share/automation/environment'
+# Due to differences across platforms and runtime execution environments,
+# handling of the (otherwise) default shell setup is non-uniform.  Rather
+# than attempt to workaround differences, simply force-load/set required
+# items every time this library is utilized.
+USER="$(whoami)"
+HOME="$(getent passwd $USER | cut -d : -f 6)"
+# Some platforms set and make this read-only
+[[ -n "$UID" ]] || \
+    UID=$(getent passwd $USER | cut -d : -f 3)
+
+# Automation library installed at image-build time,
+# defining $AUTOMATION_LIB_PATH in this file.
+if [[ -r "/etc/automation_environment" ]]; then
+    source /etc/automation_environment
+fi
+# shellcheck disable=SC2154
+if [[ -n "$AUTOMATION_LIB_PATH" ]]; then
+        # shellcheck source=/usr/share/automation/lib/common_lib.sh
+        source $AUTOMATION_LIB_PATH/common_lib.sh
+else
+    (
+    echo "WARNING: It does not appear that containers/automation was installed."
+    echo "         Functionality of most of this library will be negatively impacted"
+    echo "         This ${BASH_SOURCE[0]} was loaded by ${BASH_SOURCE[1]}"
+    ) > /dev/stderr
 fi
 
-# Under some contexts these values are not set, make sure they are.
-export USER="$(whoami)"
-export HOME="$(getent passwd $USER | cut -d : -f 6)"
-[[ -n "$UID" ]] || export UID=$(getent passwd $USER | cut -d : -f 3)
-export GID=$(getent passwd $USER | cut -d : -f 4)
+# Managed by setup_environment.sh; holds task-specific definitions.
+if [[ -r "/etc/ci_environment" ]]; then source /etc/ci_environment; fi
+
+# This is normally set from .cirrus.yml but default is necessary when
+# running under hack/get_ci_vm.sh since it cannot infer the value.
+DISTRO_NV="${DISTRO_NV:-$OS_REL_VER}"
 
 # Essential default paths, many are overridden when executing under Cirrus-CI
-export GOPATH="${GOPATH:-/var/tmp/go}"
+GOPATH="${GOPATH:-/var/tmp/go}"
 if type -P go &> /dev/null
 then
-    # required for go 1.12+
-    export GOCACHE="${GOCACHE:-$HOME/.cache/go-build}"
+    # Cirrus-CI caches $GOPATH contents
+    export GOCACHE="${GOCACHE:-$GOPATH/cache/go-build}"
     # called processes like `make` and other tools need these vars.
     eval "export $(go env)"
 
     # Ensure compiled tooling is reachable
-    export PATH="$PATH:$GOPATH/bin"
+    PATH="$PATH:$GOPATH/bin:$HOME/.local/bin"
 fi
-CIRRUS_WORKING_DIR="${CIRRUS_WORKING_DIR:-$GOPATH/src/github.com/containers/podman}"
-export GOSRC="${GOSRC:-$CIRRUS_WORKING_DIR}"
-export PATH="$HOME/bin:$GOPATH/bin:/usr/local/bin:$PATH"
-export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+CIRRUS_WORKING_DIR="${CIRRUS_WORKING_DIR:-$(realpath $(dirname ${BASH_SOURCE[0]})/../../)}"
+GOSRC="${GOSRC:-$CIRRUS_WORKING_DIR}"
+PATH="$HOME/bin:/usr/local/bin:$PATH"
+LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
 # Saves typing / in case location ever moves
 SCRIPT_BASE=${SCRIPT_BASE:-./contrib/cirrus}
-# Important filepaths
-SETUP_MARKER_FILEPATH="${SETUP_MARKER_FILEPATH:-/var/tmp/.setup_environment_sh_complete}"
+
 # Downloaded, but not installed packages.
 PACKAGE_DOWNLOAD_DIR=/var/cache/download
 
-# Log remote-client system test varlink output here
-export VARLINK_LOG=/var/tmp/varlink.log
-
-cd $GOSRC
-if type -P git &> /dev/null && [[ -d "$GOSRC/.git" ]]
-then
-    CIRRUS_CHANGE_IN_REPO=${CIRRUS_CHANGE_IN_REPO:-$(git show-ref --hash=8 HEAD || date +%s)}
-else # pick something unique and obviously not from Cirrus
-    CIRRUS_CHANGE_IN_REPO=${CIRRUS_CHANGE_IN_REPO:-unknown_$(date +%s)}
-fi
+# Log remote-client system test server output here
+PODMAN_SERVER_LOG=$CIRRUS_WORKING_DIR/podman-server.log
 
 # Defaults when not running under CI
 export CI="${CI:-false}"
 CIRRUS_CI="${CIRRUS_CI:-false}"
-DEST_BRANCH="${DEST_BRANCH:-master}"
 CONTINUOUS_INTEGRATION="${CONTINUOUS_INTEGRATION:-false}"
-CIRRUS_REPO_NAME=${CIRRUS_REPO_NAME:-libpod}
-CIRRUS_BASE_SHA=${CIRRUS_BASE_SHA:-unknown$(date +%s)}  # difficult to reliably discover
-CIRRUS_BUILD_ID=${CIRRUS_BUILD_ID:-$RANDOM$(date +%s)}  # must be short and unique
+CIRRUS_REPO_NAME=${CIRRUS_REPO_NAME:-podman}
 
-OS_RELEASE_ID="$(source /etc/os-release; echo $ID)"
-# GCE image-name compatible string representation of distribution _major_ version
-OS_RELEASE_VER="$(source /etc/os-release; echo $VERSION_ID | cut -d '.' -f 1)"
-# Combined to ease soe usage
-OS_REL_VER="${OS_RELEASE_ID}-${OS_RELEASE_VER}"
+# All CI jobs use a local registry
+export CI_USE_REGISTRY_CACHE=true
 
-# IN_PODMAN container image
-IN_PODMAN_IMAGE="quay.io/libpod/${OS_RELEASE_ID}_podman:$_BUILT_IMAGE_SUFFIX"
-# Image for uploading releases
-UPLDREL_IMAGE="quay.io/libpod/upldrel:master"
-
-# This is needed under some environments/contexts
-SUDO=''
-[[ "$UID" -eq 0 ]] || \
-    SUDO='sudo -E'
-
-# Avoid getting stuck waiting for user input
-export DEBIAN_FRONTEND="noninteractive"
-SUDOAPTGET="$SUDO apt-get -qq --yes"
-SUDOAPTADD="$SUDO add-apt-repository --yes"
-# Regex that finds enabled periodic apt configuration items
-PERIODIC_APT_RE='^(APT::Periodic::.+")1"\;'
-# Short-cuts for retrying/timeout calls
-LILTO="timeout_attempt_delay_command 120s 5 30s"
-BIGTO="timeout_attempt_delay_command 300s 5 60s"
-
-# Safe env. vars. to transfer from root -> $ROOTLESS_USER  (go env handled separately)
-ROOTLESS_ENV_RE='(CIRRUS_.+)|(ROOTLESS_.+)|(.+_IMAGE.*)|(.+_BASE)|(.*DIRPATH)|(.*FILEPATH)|(SOURCE.*)|(DEPEND.*)|(.+_DEPS_.+)|(OS_REL.*)|(.+_ENV_RE)|(TRAVIS)|(CI.+)|(REMOTE.*)'
-# Unsafe env. vars for display
-SECRET_ENV_RE='(ACCOUNT)|(GC[EP]..+)|(SSH)'
-
-SPECIALMODE="${SPECIALMODE:-none}"
-RCLI="${RCLI:-false}"
-export CONTAINER_RUNTIME=${CONTAINER_RUNTIME:-podman}
-
-# When running as root, this may be empty or not, as a user, it MUST be set.
-if [[ "$USER" == "root" ]]
-then
-    ROOTLESS_USER="${ROOTLESS_USER:-}"
-else
-    ROOTLESS_USER="${ROOTLESS_USER:-$USER}"
+# shellcheck disable=SC2154
+if [[ -n "$CIRRUS_PR" ]] && [[ -z "$PR_BASE_SHA" ]]; then
+    # shellcheck disable=SC2154
+    PR_BASE_SHA=$(git merge-base ${DEST_BRANCH:-main} HEAD)
+    export PR_BASE_SHA
 fi
+
+# The next three values define regular expressions matching env. vars. necessary
+# for all possible testing contexts (rootless, container, etc.).  These values
+# are consumed by the passthrough_envars() automation library function.
+#
+# List of envariables which must be EXACT matches
+PASSTHROUGH_ENV_EXACT='CGROUP_MANAGER|DEST_BRANCH|DISTRO_NV|GOCACHE|GOPATH|GOSRC|NETWORK_BACKEND|OCI_RUNTIME|PR_BASE_SHA|ROOTLESS_USER|SCRIPT_BASE|SKIP_USERNS|EC2_INST_TYPE|PODMAN_DB|STORAGE_FS|PODMAN_BATS_LEAK_CHECK'
+
+# List of envariable patterns which must match AT THE BEGINNING of the name.
+# Consumed by the passthrough_envars() automation library function.
+PASSTHROUGH_ENV_ATSTART='CI|LANG|LC_|STORAGE_OPTIONS_|TEST'
+
+# List of envariable patterns which can match ANYWHERE in the name.
+# Consumed by the passthrough_envars() automation library function.
+PASSTHROUGH_ENV_ANYWHERE='_NAME|_FQIN'
+
+# Unsafe env. vars for display
+SECRET_ENV_RE='ACCOUNT|GC[EP]..|SSH|PASSWORD|SECRET|TOKEN'
+
 # Type of filesystem used for cgroups
 CG_FS_TYPE="$(stat -f -c %T /sys/fs/cgroup)"
 
-# Pass in a list of one or more envariable names; exit non-zero with
-# helpful error message if any value is empty
-req_env_var() {
-    # Provide context. If invoked from function use its name; else script name
-    local caller=${FUNCNAME[1]}
-    if [[ -n "$caller" ]]; then
-        # Indicate that it's a function name
-        caller="$caller()"
-    else
-        # Not called from a function: use script name
-        caller=$(basename $0)
-    fi
+# Set to 1 in all podman container images
+CONTAINER="${CONTAINER:-0}"
 
-    # Usage check
-    [[ -n "$1" ]] || die 1 "FATAL: req_env_var: invoked without arguments"
+# Without this, perl garbles "f39β" command-line args
+PERL_UNICODE=A
 
-    # Each input arg is an envariable name, e.g. HOME PATH etc. Expand each.
-    # If any is empty, bail out and explain why.
-    for i; do
-        if [[ -z "${!i}" ]]; then
-            die 9 "FATAL: $caller requires \$$i to be non-empty"
-        fi
-    done
-}
+# END Global export of all variables
+set +a
 
-item_test() {
-    ITEM="$1"
-    shift
-    TEST_ARGS="$@"
-    req_env_var ITEM TEST_ARGS
-
-    if ERR=$(test "$@" 2>&1)
-    then
-        echo "ok $ITEM"
-        return 0
-    else
-        RET=$?
-        echo -n "not ok $ITEM: $TEST_ARGS"
-        if [[ -z "$ERR" ]]
-        then
-            echo ""
-        else  # test command itself failed
-            echo -n ":"  # space follows :'s in $ERR
-            echo "$ERR" | cut -d : -f 4-  # omit filename, line number, and command
-        fi
-        return $RET
-    fi
-}
-
-show_env_vars() {
-    echo "Showing selection of environment variable definitions:"
-    _ENV_VAR_NAMES=$(awk 'BEGIN{for(v in ENVIRON) print v}' | \
-        egrep -v "(^PATH$)|(^BASH_FUNC)|(^[[:punct:][:space:]]+)|$SECRET_ENV_RE" | \
-        sort -u)
-    for _env_var_name in $_ENV_VAR_NAMES
-    do
-        # Supports older BASH versions
-        printf "    ${_env_var_name}=%q\n" "$(printenv $_env_var_name)"
-    done
-}
-
-die() {
-    echo "************************************************"
-    echo ">>>>> ${2:-FATAL ERROR (but no message given!) in ${FUNCNAME[1]}()}"
-    echo "************************************************"
-    exit ${1:-1}
-}
-
-warn() {
-    echo ">>>>> ${1:-WARNING (but no message given!) in ${FUNCNAME[1]}()}" > /dev/stderr
-}
-
-bad_os_id_ver() {
-    echo "Unknown/Unsupported distro. $OS_RELEASE_ID and/or version $OS_RELEASE_VER for $(basename $0)"
-    exit 42
-}
-
-stub() {
-    echo "STUB: Pretending to do $1"
-}
-
-timeout_attempt_delay_command() {
-    TIMEOUT=$1
-    ATTEMPTS=$2
-    DELAY=$3
-    shift 3
-    STDOUTERR=$(mktemp -p '' $(basename $0)_XXXXX)
-    req_env_var ATTEMPTS DELAY
-    echo "Retrying $ATTEMPTS times with a $DELAY delay, and $TIMEOUT timeout for command: $@"
-    for (( COUNT=1 ; COUNT <= $ATTEMPTS ; COUNT++ ))
-    do
-        echo "##### (attempt #$COUNT)" &>> "$STDOUTERR"
-        if timeout --foreground $TIMEOUT "$@" &>> "$STDOUTERR"
-        then
-            echo "##### (success after #$COUNT attempts)" &>> "$STDOUTERR"
-            break
-        else
-            echo "##### (failed with exit: $?)" &>> "$STDOUTERR"
-            sleep $DELAY
-        fi
-    done
-    cat "$STDOUTERR"
-    rm -f "$STDOUTERR"
-    if (( COUNT > $ATTEMPTS ))
-    then
-        echo "##### (exceeded $ATTEMPTS attempts)"
-        exit 125
-    fi
-}
+lilto() { err_retry 8 1000 "" "$@"; }  # just over 4 minutes max
+bigto() { err_retry 7 5670 "" "$@"; }  # 12 minutes max
 
 setup_rootless() {
-    req_env_var ROOTLESS_USER GOPATH GOSRC SECRET_ENV_RE ROOTLESS_ENV_RE
+    req_env_vars GOPATH GOSRC SECRET_ENV_RE
 
-    # Only do this once
+    ROOTLESS_USER="${ROOTLESS_USER:-some${RANDOM}dude}"
+    ROOTLESS_UID=""
+
+    local rootless_uid
+    local rootless_gid
+    local env_var_val
+    local akfilepath
+    local sshcmd
+
+    # Only do this once; established by setup_environment.sh
+    # shellcheck disable=SC2154
     if passwd --status $ROOTLESS_USER
     then
-        echo "Updating $ROOTLESS_USER user permissions on possibly changed libpod code"
-        chown -R $ROOTLESS_USER:$ROOTLESS_USER "$GOPATH" "$GOSRC"
-        return 0
-    fi
-
-    cd $GOSRC
-    # Guarantee independence from specific values
-    ROOTLESS_UID=$[RANDOM+1000]
-    ROOTLESS_GID=$[RANDOM+1000]
-    echo "creating $ROOTLESS_UID:$ROOTLESS_GID $ROOTLESS_USER user"
-    groupadd -g $ROOTLESS_GID $ROOTLESS_USER
-    useradd -g $ROOTLESS_GID -u $ROOTLESS_UID --no-user-group --create-home $ROOTLESS_USER
-    chown -R $ROOTLESS_USER:$ROOTLESS_USER "$GOPATH" "$GOSRC"
-
-    echo "creating ssh key pair for $USER"
-    [[ -r "$HOME/.ssh/id_rsa" ]] || \
-        ssh-keygen -P "" -f "$HOME/.ssh/id_rsa"
-
-    echo "Allowing ssh key for $ROOTLESS_USER"
-    (umask 077 && mkdir "/home/$ROOTLESS_USER/.ssh")
-    chown -R $ROOTLESS_USER:$ROOTLESS_USER "/home/$ROOTLESS_USER/.ssh"
-    install -o $ROOTLESS_USER -g $ROOTLESS_USER -m 0600 \
-        "$HOME/.ssh/id_rsa.pub" "/home/$ROOTLESS_USER/.ssh/authorized_keys"
-    # Makes debugging easier
-    cat /root/.ssh/authorized_keys >> "/home/$ROOTLESS_USER/.ssh/authorized_keys"
-
-    echo "Configuring subuid and subgid"
-    grep -q "${ROOTLESS_USER}" /etc/subuid || \
-        echo "${ROOTLESS_USER}:$[ROOTLESS_UID * 100]:65536" | \
-            tee -a /etc/subuid >> /etc/subgid
-
-    # Env. vars set by Cirrus and setup_environment.sh must be explicitly
-    # transferred to the test-user.
-    echo "Configuring rootless user's environment variables:"
-    echo "# Added by $GOSRC/$SCRIPT_PATH/lib.sh setup_rootless()"
-    _ENV_VAR_NAMES=$(awk 'BEGIN{for(v in ENVIRON) print v}' | \
-        egrep -v "(^PATH$)|(^BASH_FUNC)|(^[[:punct:][:space:]]+)|$SECRET_ENV_RE" | \
-        egrep "$ROOTLESS_ENV_RE" | \
-        sort -u)
-    for _env_var_name in $_ENV_VAR_NAMES
-    do
-        # Works with older versions of bash
-        printf "${_env_var_name}=%q\n" "$(printenv $_env_var_name)" >> "/home/$ROOTLESS_USER/.bashrc"
-    done
-
-    echo "Ensure the systems ssh process is up and running within 5 minutes"
-    systemctl start sshd
-    NOW=$(date +%s)
-    TIMEOUT=$(date --date '+5 minutes' +%s)
-    while [[ "$(date +%s)" -lt "$TIMEOUT" ]]
-    do
-        if timeout --foreground -k 1s 1s \
-            ssh $ROOTLESS_USER@localhost \
-            -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o CheckHostIP=no \
-            true
-        then
-            break
-        else
-            sleep 2s
+        # Farm tests utilize the rootless user to simulate a "remote" podman instance.
+    # Root still needs to own the repo. clone and all things under `$GOPATH`.  The
+    # opposite is true for the lower-level podman e2e tests, the rootless user
+    # runs them, and therefore needs permissions.
+        if [[ $PRIV_NAME = "rootless" ]] && [[ "$TEST_FLAVOR" != "farm"  ]]; then
+            msg "Updating $ROOTLESS_USER user permissions on possibly changed libpod code"
+            chown -R $ROOTLESS_USER:$ROOTLESS_USER "$GOPATH" "$GOSRC"
+            return 0
         fi
-    done
-    [[ "$(date +%s)" -lt "$TIMEOUT" ]] || \
-        die 11 "Timeout exceeded waiting for localhost ssh capability"
+    fi
+    msg "************************************************************"
+    msg "Setting up rootless user '$ROOTLESS_USER'"
+    msg "************************************************************"
+    cd $GOSRC || exit 1
+    # Guarantee independence from specific values
+    rootless_uid=$((1500 + RANDOM % 5000))
+    ROOTLESS_UID=$rootless_uid
+    rootless_gid=$((1500 + RANDOM % 5000))
+    msg "creating $rootless_uid:$rootless_gid $ROOTLESS_USER user"
+    showrun groupadd -g $rootless_gid $ROOTLESS_USER
+    showrun useradd -g $rootless_gid -u $rootless_uid --no-user-group --create-home $ROOTLESS_USER
+
+    # use tmpfs to speed up IO
+    mount -t tmpfs -o size=75%,mode=0700,uid=$rootless_uid,gid=$rootless_gid none /home/$ROOTLESS_USER
+
+    echo "$ROOTLESS_USER ALL=(root) NOPASSWD: ALL" > /etc/sudoers.d/ci-rootless
+
+    mkdir -p "$HOME/.ssh" "/home/$ROOTLESS_USER/.ssh"
+
+    msg "Creating ssh key pairs"
+    [[ -r "$HOME/.ssh/id_rsa" ]] || \
+        ssh-keygen -t rsa -P "" -f "$HOME/.ssh/id_rsa"
+    showrun ssh-keygen -t ed25519 -P "" -f "/home/$ROOTLESS_USER/.ssh/id_ed25519"
+    showrun ssh-keygen -t rsa -P "" -f "/home/$ROOTLESS_USER/.ssh/id_rsa"
+
+    msg "Set up authorized_keys"
+    cat $HOME/.ssh/*.pub /home/$ROOTLESS_USER/.ssh/*.pub >> $HOME/.ssh/authorized_keys
+    cat $HOME/.ssh/*.pub /home/$ROOTLESS_USER/.ssh/*.pub >> /home/$ROOTLESS_USER/.ssh/authorized_keys
+
+    msg "Configure ssh file permissions"
+    chmod -R 700 "$HOME/.ssh"
+    chmod -R 700 "/home/$ROOTLESS_USER/.ssh"
+    chown -R $ROOTLESS_USER:$ROOTLESS_USER "/home/$ROOTLESS_USER/.ssh"
+
+    # N/B: We're clobbering the known_hosts here on purpose.  There should
+    # never be any non-localhost connections made from tests (using strict-mode).
+    # If there are, it's either a security problem or a broken test, both of which
+    # we want to lead to test failures.
+    msg "   set up known_hosts for $USER"
+    ssh-keyscan localhost > /root/.ssh/known_hosts
+    msg "   set up known_hosts for $ROOTLESS_USER"
+    # Maintain access-permission consistency with all other .ssh files.
+    install -Z -m 700 -o $ROOTLESS_USER -g $ROOTLESS_USER \
+        /root/.ssh/known_hosts /home/$ROOTLESS_USER/.ssh/known_hosts
+
+    if [[ -n "$ROOTLESS_USER" ]]; then
+        showrun echo "conditional setup for ROOTLESS_USER [=$ROOTLESS_USER]"
+        # Make all future CI scripts aware of these values
+        echo "ROOTLESS_USER=$ROOTLESS_USER" >> /etc/ci_environment
+        echo "ROOTLESS_UID=$ROOTLESS_UID" >> /etc/ci_environment
+    fi
 }
 
 install_test_configs() {
-    echo "Installing cni config, policy and registry config"
-    req_env_var GOSRC SCRIPT_BASE
-    cd $GOSRC
-    install -v -D -m 644 ./cni/87-podman-bridge.conflist /etc/cni/net.d/
-    # This config must always sort last in the list of networks (podman picks first one
-    # as the default).  This config prevents allocation of network address space used
-    # by default in google cloud.  https://cloud.google.com/vpc/docs/vpc#ip-ranges
-    install -v -D -m 644 $SCRIPT_BASE/99-do-not-use-google-subnets.conflist /etc/cni/net.d/
-    install -v -D -m 644 ./test/registries.conf /etc/containers/
+    # Which registries.conf to use. By default we always want the cached one...
+    cached="-cached"
+    # ...except for podman-machine, where it's antihelpful
+    if [[ -n "$1" ]]; then
+        if [[ "$1" = "nocache" ]]; then
+            cached=""
+        else
+            die "Internal error: install_test_configs(): unknown arg '$*'"
+        fi
+    fi
+
+    msg "Installing ./test/registries$cached.conf system-wide."
+    # All CI VMs run with a local registry
+    install -v -D -m 644 ./test/registries$cached.conf /etc/containers/registries.conf
 }
 
 # Remove all files provided by the distro version of podman.
@@ -306,57 +219,45 @@ install_test_configs() {
 # can only run the compiled source version.
 remove_packaged_podman_files() {
     echo "Removing packaged podman files to prevent conflicts with source build and testing."
-    req_env_var OS_RELEASE_ID
+    req_env_vars OS_RELEASE_ID
 
     # If any binaries are resident they could cause unexpected pollution
-    for unit in io.podman.service io.podman.socket
+    for unit in podman.socket podman-auto-update.timer
     do
         for state in enabled active
         do
             if systemctl --quiet is-$state $unit
             then
                 echo "Warning: $unit found $state prior to packaged-file removal"
-                systemctl --quiet disable $unit || true
-                systemctl --quiet stop $unit || true
+                showrun systemctl --quiet disable $unit || true
+                showrun systemctl --quiet stop $unit || true
             fi
         done
     done
 
-    if [[ "$OS_RELEASE_ID" =~ "ubuntu" ]]
+    # OS_RELEASE_ID is defined by automation-library
+    # shellcheck disable=SC2154
+    if [[ "$OS_RELEASE_ID" =~ "debian" ]]
     then
-        LISTING_CMD="$SUDO dpkg-query -L podman"
+        LISTING_CMD="dpkg-query -L podman"
     else
-        LISTING_CMD="$SUDO rpm -ql podman"
+        LISTING_CMD="rpm -ql podman"
     fi
+
+    # delete the podman socket in case it has been created previously.
+    # Do so without running podman, lest that invocation initialize unwanted state.
+    rm -f /run/podman/podman.sock  /run/user/$(id -u)/podman/podman.sock || true
 
     # yum/dnf/dpkg may list system directories, only remove files
     $LISTING_CMD | while read fullpath
     do
         # Sub-directories may contain unrelated/valuable stuff
         if [[ -d "$fullpath" ]]; then continue; fi
-        ooe.sh $SUDO rm -vf "$fullpath"
+        showrun ooe.sh rm -vf "$fullpath"
     done
 
     # Be super extra sure and careful vs performant and completely safe
-    sync && echo 3 > /proc/sys/vm/drop_caches
+    sync && echo 3 > /proc/sys/vm/drop_caches || true
 }
 
-# The version of CRI-O and Kubernetes must always match
-get_kubernetes_version(){
-    # TODO: Look up the kube RPM/DEB version installed, or in $PACKAGE_DOWNLOAD_DIR
-    #       and retrieve the major-minor version directly.
-    local KUBERNETES_VERSION="1.15"
-    echo "$KUBERNETES_VERSION"
-}
-
-canonicalize_image_names() {
-    req_env_var IMGNAMES
-    echo "Adding all current base images to \$IMGNAMES for timestamp update"
-    export IMGNAMES="\
-$IMGNAMES
-$UBUNTU_BASE_IMAGE
-$PRIOR_UBUNTU_BASE_IMAGE
-$FEDORA_BASE_IMAGE
-$PRIOR_FEDORA_BASE_IMAGE
-"
-}
+showrun echo "finished"

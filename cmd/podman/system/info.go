@@ -3,15 +3,15 @@ package system
 import (
 	"fmt"
 	"os"
-	"text/template"
 
-	"github.com/containers/podman/v2/cmd/podman/parse"
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/validate"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/ghodss/yaml"
+	"github.com/containers/common/pkg/completion"
+	"github.com/containers/common/pkg/report"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/libpod/define"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
+	"sigs.k8s.io/yaml"
 )
 
 var (
@@ -20,21 +20,23 @@ var (
   Useful for the user and when reporting issues.
 `
 	infoCommand = &cobra.Command{
-		Use:     "info",
-		Args:    validate.NoArgs,
-		Long:    infoDescription,
-		Short:   "Display podman system information",
-		RunE:    info,
-		Example: `podman info`,
+		Use:               "info [options]",
+		Args:              validate.NoArgs,
+		Long:              infoDescription,
+		Short:             "Display podman system information",
+		RunE:              info,
+		ValidArgsFunction: completion.AutocompleteNone,
+		Example:           `podman info`,
 	}
 
 	systemInfoCommand = &cobra.Command{
-		Args:    infoCommand.Args,
-		Use:     infoCommand.Use,
-		Short:   infoCommand.Short,
-		Long:    infoCommand.Long,
-		RunE:    infoCommand.RunE,
-		Example: `podman system info`,
+		Args:              infoCommand.Args,
+		Use:               infoCommand.Use,
+		Short:             infoCommand.Short,
+		Long:              infoCommand.Long,
+		RunE:              infoCommand.RunE,
+		ValidArgsFunction: infoCommand.ValidArgsFunction,
+		Example:           `podman system info`,
 	}
 )
 
@@ -45,22 +47,26 @@ var (
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: infoCommand,
 	})
-	infoFlags(infoCommand.Flags())
+	infoFlags(infoCommand)
 
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: systemInfoCommand,
 		Parent:  systemCmd,
 	})
-	infoFlags(systemInfoCommand.Flags())
+	infoFlags(systemInfoCommand)
 }
 
-func infoFlags(flags *pflag.FlagSet) {
+func infoFlags(cmd *cobra.Command) {
+	flags := cmd.Flags()
+
 	flags.BoolVarP(&debug, "debug", "D", false, "Display additional debug information")
-	flags.StringVarP(&inFormat, "format", "f", "", "Change the output format to JSON or a Go template")
+	_ = flags.MarkHidden("debug") // It's a NOP since Podman version 2.0
+
+	formatFlagName := "format"
+	flags.StringVarP(&inFormat, formatFlagName, "f", "", "Change the output format to JSON or a Go template")
+	_ = cmd.RegisterFlagCompletionFunc(formatFlagName, common.AutocompleteFormat(&define.Info{}))
 }
 
 func info(cmd *cobra.Command, args []string) error {
@@ -69,26 +75,32 @@ func info(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if parse.MatchesJSONFormat(inFormat) {
+	info.Host.ServiceIsRemote = registry.IsRemote()
+
+	switch {
+	case report.IsJSON(inFormat):
 		b, err := json.MarshalIndent(info, "", "  ")
 		if err != nil {
 			return err
 		}
 		fmt.Println(string(b))
-		return nil
-	}
-	if !cmd.Flag("format").Changed {
+	case cmd.Flags().Changed("format"):
+		rpt := report.New(os.Stdout, cmd.Name())
+		defer rpt.Flush()
+
+		// Use OriginUnknown so it does not add an extra range since it
+		// will only be called for a single element and not a slice.
+		rpt, err = rpt.Parse(report.OriginUnknown, inFormat)
+		if err != nil {
+			return err
+		}
+		return rpt.Execute(info)
+	default:
 		b, err := yaml.Marshal(info)
 		if err != nil {
 			return err
 		}
 		fmt.Println(string(b))
-		return nil
 	}
-	tmpl, err := template.New("info").Parse(inFormat)
-	if err != nil {
-		return err
-	}
-	err = tmpl.Execute(os.Stdout, info)
-	return err
+	return nil
 }

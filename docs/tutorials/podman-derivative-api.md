@@ -1,4 +1,4 @@
-![PODMAN logo](../../logo/podman-logo-source.svg)
+![PODMAN logo](https://raw.githubusercontent.com/containers/common/main/logos/podman-logo-full-vert.png)
 
 # How to use libpod for custom/derivative projects
 
@@ -45,11 +45,6 @@ Disadvantages:
  - You are now on the hook for container runtime security updates (partially, `runc`/`crun` are separate)
  - Binary size
  - Potential skew between multiple libpod versions operating on the same storage can cause problems
-
-Varlink
----
-
-The Varlink API is presently deprecated. We do not recommend adopting it for new projects.
 
 Making the choice
 ---

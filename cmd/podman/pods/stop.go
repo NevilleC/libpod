@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containers/podman/v2/cmd/podman/common"
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/utils"
-	"github.com/containers/podman/v2/cmd/podman/validate"
-	"github.com/containers/podman/v2/pkg/domain/entities"
+	"github.com/containers/common/pkg/completion"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/specgenutil"
 	"github.com/spf13/cobra"
 )
 
@@ -16,8 +18,8 @@ import (
 type podStopOptionsWrapper struct {
 	entities.PodStopOptions
 
-	PodIDFiles []string
-	TimeoutCLI uint
+	podIDFiles []string
+	timeoutCLI int
 }
 
 var (
@@ -29,30 +31,36 @@ var (
   This command will stop all running containers in each of the specified pods.`
 
 	stopCommand = &cobra.Command{
-		Use:   "stop [flags] POD [POD...]",
+		Use:   "stop [options] POD [POD...]",
 		Short: "Stop one or more pods",
 		Long:  podStopDescription,
 		RunE:  stop,
 		Args: func(cmd *cobra.Command, args []string) error {
-			return validate.CheckAllLatestAndPodIDFile(cmd, args, false, true)
+			return validate.CheckAllLatestAndIDFile(cmd, args, false, "pod-id-file")
 		},
+		ValidArgsFunction: common.AutocompletePodsRunning,
 		Example: `podman pod stop mywebserverpod
-  podman pod stop --latest
   podman pod stop --time 0 490eb 3557fb`,
 	}
 )
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: stopCommand,
 		Parent:  podCmd,
 	})
 	flags := stopCommand.Flags()
 	flags.BoolVarP(&stopOptions.All, "all", "a", false, "Stop all running pods")
 	flags.BoolVarP(&stopOptions.Ignore, "ignore", "i", false, "Ignore errors when a specified pod is missing")
-	flags.UintVarP(&stopOptions.TimeoutCLI, "time", "t", containerConfig.Engine.StopTimeout, "Seconds to wait for pod stop before killing the container")
-	flags.StringArrayVarP(&stopOptions.PodIDFiles, "pod-id-file", "", nil, "Read the pod ID from the file")
+
+	timeFlagName := "time"
+	flags.IntVarP(&stopOptions.timeoutCLI, timeFlagName, "t", int(containerConfig.Engine.StopTimeout), "Seconds to wait for pod stop before killing the container")
+	_ = stopCommand.RegisterFlagCompletionFunc(timeFlagName, completion.AutocompleteNone)
+
+	podIDFileFlagName := "pod-id-file"
+	flags.StringArrayVarP(&stopOptions.podIDFiles, podIDFileFlagName, "", nil, "Write the pod ID to the file")
+	_ = stopCommand.RegisterFlagCompletionFunc(podIDFileFlagName, completion.AutocompleteDefault)
+
 	validate.AddLatestFlag(stopCommand, &stopOptions.Latest)
 
 	if registry.IsRemote() {
@@ -63,14 +71,12 @@ func init() {
 }
 
 func stop(cmd *cobra.Command, args []string) error {
-	var (
-		errs utils.OutputErrors
-	)
+	var errs utils.OutputErrors
 	if cmd.Flag("time").Changed {
-		stopOptions.Timeout = int(stopOptions.TimeoutCLI)
+		stopOptions.Timeout = stopOptions.timeoutCLI
 	}
 
-	ids, err := common.ReadPodIDFiles(stopOptions.PodIDFiles)
+	ids, err := specgenutil.ReadPodIDFiles(stopOptions.podIDFiles)
 	if err != nil {
 		return err
 	}
@@ -83,7 +89,7 @@ func stop(cmd *cobra.Command, args []string) error {
 	// in the cli, first we print out all the successful attempts
 	for _, r := range responses {
 		if len(r.Errs) == 0 {
-			fmt.Println(r.Id)
+			fmt.Println(r.RawInput)
 		} else {
 			errs = append(errs, r.Errs...)
 		}

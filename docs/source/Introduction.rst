@@ -2,16 +2,18 @@
 
 Introduction
 ==================================
-Containers_ simplify the consumption of applications with all of their dependencies and default configuration files. Users test drive or deploy a new application with one or two commands instead of following pages of installation instructions. Here's how to find your first `Container Image`_::
+Containers_ simplify the production, distribution, discoverability, and usage of applications with all of their dependencies and default configuration files. Users test drive or deploy a new application with one or two commands instead of following pages of installation instructions. Here's how to find your first `Container Image`_::
 
-    podman search busybox
+    podman search docker.io/busybox
 
 Output::
 
-    INDEX       NAME                                DESCRIPTION                                       STARS   OFFICIAL   AUTOMATED
-    docker.io   docker.io/library/busybox           Busybox base image.                               1882    [OK]
-    docker.io   docker.io/radial/busyboxplus        Full-chain, Internet enabled, busybox made f...   30                 [OK]
-    docker.io   docker.io/yauritux/busybox-curl     Busybox with CURL                                 8
+    NAME                                         DESCRIPTION
+    docker.io/library/busybox                    Busybox base image.
+    docker.io/rancher/busybox
+    docker.io/openebs/busybox-client
+    docker.io/antrea/busybox
+    docker.io/hugegraph/busybox                  test image
     ...
 
 The previous command returned a list of publicly available container images on DockerHub. These container images are easy to consume, but of differing levels of quality and maintenance. Let’s use the first one listed because it seems to be well maintained.
@@ -30,11 +32,11 @@ You can poke around in the busybox container for a while, but you’ll quickly f
 
 There’s an old saying that “nobody runs an operating system just to run an operating system” and the same is true with containers. It’s the workload running on top of an operating system or in a container that’s interesting and valuable.
 
-Sometimes we can find a publicly available container image for the exact workload we’re looking for and it will already be packaged exactly how we want. But, more often than not, there’s something that we want to add, remove, or customize. It could be as simple as a configuration setting for security or performance, or as complex as adding a complex workload. Either way, containers make it fairly easy to make the changes we need.
+Sometimes we can find a publicly available container image for the exact workload we’re looking for and it will already be packaged exactly how we want. But, more often than not, there’s something that we want to add, remove, or customize. It can be as simple as a configuration setting for security or performance, or as complex as adding a complex workload. Either way, containers make it fairly easy to make the changes we need.
 
-Container Images aren’t actually images, they’re repositories often made up of multiple layers. These layers can easily be added, saved, and shared with others by using a Containerfile (Dockerfile). This single file often contains all the instructions needed to build the new and can easily be shared with others publicly using tools like GitHub.
+Container Images aren’t actually images, they’re repositories often made up of multiple layers. These layers can easily be added, saved, and shared with others by using a Containerfile (Dockerfile). This single file often contains all the instructions needed to build a new container image and can easily be shared with others publicly using tools like GitHub.
 
-Here's an example of how to build an Nginx web server on top of a Debian base image using the Dockerfile maintained by Nginx and published in GitHub::
+Here's an example of how to build a Nginx web server on top of a Debian base image using the Dockerfile maintained by Nginx and published in GitHub::
 
     podman build -t nginx https://git.io/Jf8ol
 
@@ -49,7 +51,7 @@ Output::
     <p><em>Thank you for using nginx.</em></p>
     ...
 
-Building new images is great, but sharing our work with others let’s them review our work, critique how we built them, and offer improved versions. Our newly built Nginx image could be published at quay.io or docker.io to share it with the world. Everything needed to run the Nginx application is provided in the container image. Others could easily pull it down and use it, or make improvements to it.
+Building new images is great, but sharing our work with others lets them review our work, critique how we built them, and offer improved versions. Our newly built Nginx image can be published at quay.io or docker.io to share it with the world. Everything needed to run the Nginx application is provided in the container image. Others can easily pull it down and use it, or make improvements to it.
 
 Standardizing on container images and `Container Registries`_ enable a new level of collaboration through simple consumption. This simple consumption model is possible because every major Container Engine and Registry Server uses the Open Containers Initiative (OCI_) format. This allows users to find, run, build, share and deploy containers anywhere they want. Podman and other `Container Engines`_ like CRI-O, Docker, or containerd can create and consume container images from docker.io, quay.io, an on premise registry or even one provided by a cloud provider. The OCI image format facilitates this ecosystem through a single standard.
 
@@ -62,7 +64,7 @@ Input::
     Password: ********
     Login Succeeded!
 
-Nex, tag the image so that we can push it into our user account::
+Next, tag the image so that we can push it into our user account::
 
     podman tag localhost/nginx quay.io/USERNAME/nginx
 
@@ -100,7 +102,7 @@ To summarize, Podman makes it easy to find, run, build and share containers.
 
 * Find: whether finding a container on dockerhub.io or quay.io, an internal registry server, or directly from a vendor, a couple of `podman search`_, and `podman pull`_ commands make it easy
 * Run: it's easy to consume pre-built images with everything needed to run an entire application, or start from a Linux distribution base image with the `podman run`_ command
-* Build: creating new layers with small tweaks, or major overhauls is easy with `podman build`
-* Share: Podman let’s you push your newly built containers anywhere you want with a single `podman push`_ command
+* Build: creating new layers with small tweaks, or major overhauls is easy with `podman build`_
+* Share: Podman lets you push your newly built containers anywhere you want with a single `podman push`_ command
 
 For more instructions on use cases, take a look at our :doc:`Tutorials` page.

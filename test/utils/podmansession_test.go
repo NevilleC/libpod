@@ -1,8 +1,8 @@
 package utils_test
 
 import (
-	. "github.com/containers/podman/v2/test/utils"
-	. "github.com/onsi/ginkgo"
+	. "github.com/containers/podman/v5/test/utils"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -53,8 +53,8 @@ var _ = Describe("PodmanSession test", func() {
 	})
 
 	It("Test LineInOutputStartsWith", func() {
-		Expect(session.LineInOuputStartsWith("Podman")).To(BeTrue())
-		Expect(session.LineInOuputStartsWith("Session")).To(Not(BeTrue()))
+		Expect(session.LineInOutputStartsWith("Podman")).To(BeTrue())
+		Expect(session.LineInOutputStartsWith("Session")).To(Not(BeTrue()))
 	})
 
 	It("Test LineInOutputContains", func() {

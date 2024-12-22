@@ -2,15 +2,17 @@ package containers
 
 import (
 	"context"
+	"errors"
 	"os"
+	"strings"
 
-	"github.com/containers/podman/v2/cmd/podman/parse"
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/pkg/errors"
+	"github.com/containers/common/pkg/completion"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/parse"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 var (
@@ -18,21 +20,23 @@ var (
 		" and saves it on the local machine."
 
 	exportCommand = &cobra.Command{
-		Use:   "export [flags] CONTAINER",
-		Short: "Export container's filesystem contents as a tar archive",
-		Long:  exportDescription,
-		RunE:  export,
-		Args:  cobra.ExactArgs(1),
+		Use:               "export [options] CONTAINER",
+		Short:             "Export container's filesystem contents as a tar archive",
+		Long:              exportDescription,
+		RunE:              export,
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: common.AutocompleteContainers,
 		Example: `podman export ctrID > myCtr.tar
   podman export --output="myCtr.tar" ctrID`,
 	}
 
 	containerExportCommand = &cobra.Command{
-		Args:  cobra.ExactArgs(1),
-		Use:   exportCommand.Use,
-		Short: exportCommand.Short,
-		Long:  exportCommand.Long,
-		RunE:  exportCommand.RunE,
+		Args:              cobra.ExactArgs(1),
+		Use:               exportCommand.Use,
+		Short:             exportCommand.Short,
+		Long:              exportCommand.Long,
+		RunE:              exportCommand.RunE,
+		ValidArgsFunction: exportCommand.ValidArgsFunction,
 		Example: `podman container export ctrID > myCtr.tar
   podman container export --output="myCtr.tar" ctrID`,
 	}
@@ -40,39 +44,49 @@ var (
 
 var (
 	exportOpts entities.ContainerExportOptions
+	outputFile string
 )
 
-func exportFlags(flags *pflag.FlagSet) {
-	flags.StringVarP(&exportOpts.Output, "output", "o", "", "Write to a specified file (default: stdout, which must be redirected)")
+func exportFlags(cmd *cobra.Command) {
+	flags := cmd.Flags()
+
+	outputFlagName := "output"
+	flags.StringVarP(&outputFile, outputFlagName, "o", "", "Write to a specified file (default: stdout, which must be redirected)")
+	_ = cmd.RegisterFlagCompletionFunc(outputFlagName, completion.AutocompleteDefault)
 }
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: exportCommand,
 	})
-	flags := exportCommand.Flags()
-	exportFlags(flags)
+	exportFlags(exportCommand)
 
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: containerExportCommand,
 		Parent:  containerCmd,
 	})
-
-	containerExportFlags := containerExportCommand.Flags()
-	exportFlags(containerExportFlags)
+	exportFlags(containerExportCommand)
 }
 
 func export(cmd *cobra.Command, args []string) error {
-	if len(exportOpts.Output) == 0 {
+	if len(outputFile) == 0 {
 		file := os.Stdout
-		if terminal.IsTerminal(int(file.Fd())) {
-			return errors.Errorf("refusing to export to terminal. Use -o flag or redirect")
+		if term.IsTerminal(int(file.Fd())) {
+			return errors.New("refusing to export to terminal. Use -o flag or redirect")
 		}
-		exportOpts.Output = "/dev/stdout"
-	} else if err := parse.ValidateFileName(exportOpts.Output); err != nil {
-		return err
+		exportOpts.Output = file
+	} else {
+		if err := parse.ValidateFileName(outputFile); err != nil {
+			return err
+		}
+		// open file here with O_WRONLY since on MacOS it can fail to open /dev/stderr in read mode for example
+		// https://github.com/containers/podman/issues/16870
+		file, err := os.OpenFile(outputFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		exportOpts.Output = file
 	}
-	return registry.ContainerEngine().ContainerExport(context.Background(), args[0], exportOpts)
+	return registry.ContainerEngine().ContainerExport(context.Background(), strings.TrimPrefix(args[0], "/"), exportOpts)
 }

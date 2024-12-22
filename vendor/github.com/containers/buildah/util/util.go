@@ -1,28 +1,30 @@
 package util
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
-	"path"
+	"path/filepath"
+	"sort"
 	"strings"
-	"sync"
 	"syscall"
 
+	"github.com/containers/buildah/define"
+	"github.com/containers/common/libimage"
 	"github.com/containers/common/pkg/config"
 	"github.com/containers/image/v5/docker/reference"
-	"github.com/containers/image/v5/pkg/sysregistriesv2"
+	"github.com/containers/image/v5/pkg/shortnames"
 	"github.com/containers/image/v5/signature"
-	is "github.com/containers/image/v5/storage"
-	"github.com/containers/image/v5/transports"
 	"github.com/containers/image/v5/transports/alltransports"
 	"github.com/containers/image/v5/types"
 	"github.com/containers/storage"
 	"github.com/docker/distribution/registry/api/errcode"
+	"github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/exp/slices"
 )
 
 const (
@@ -33,20 +35,22 @@ const (
 	DefaultTransport = "docker://"
 )
 
-var (
-	// RegistryDefaultPathPrefix contains a per-registry listing of default prefixes
-	// to prepend to image names that only contain a single path component.
-	RegistryDefaultPathPrefix = map[string]string{
-		"index.docker.io": "library",
-		"docker.io":       "library",
-	}
-)
+// RegistryDefaultPathPrefix contains a per-registry listing of default prefixes
+// to prepend to image names that only contain a single path component.
+var RegistryDefaultPathPrefix = map[string]string{
+	"index.docker.io": "library",
+	"docker.io":       "library",
+}
 
-// ResolveName checks if name is a valid image name, and if that name doesn't
+// StringInSlice is deprecated, use golang.org/x/exp/slices.Contains
+func StringInSlice(s string, slice []string) bool {
+	return slices.Contains(slice, s)
+}
+
+// resolveName checks if name is a valid image name, and if that name doesn't
 // include a domain portion, returns a list of the names which it might
-// correspond to in the set of configured registries, the transport used to
-// pull the image, and a boolean which is true iff
-// 1) the list of search registries was used, and 2) it was empty.
+// correspond to in the set of configured registries, and the transport used to
+// pull the image.
 //
 // The returned image names never include a transport: prefix, and if transport != "",
 // (transport, image) should be a valid input to alltransports.ParseImageName.
@@ -55,9 +59,9 @@ var (
 //
 // NOTE: The "list of search registries is empty" check does not count blocked registries,
 // and neither the implied "localhost" nor a possible firstRegistry are counted
-func ResolveName(name string, firstRegistry string, sc *types.SystemContext, store storage.Store) ([]string, string, bool, error) {
+func resolveName(name string, sc *types.SystemContext, store storage.Store) ([]string, string, error) {
 	if name == "" {
-		return nil, "", false, nil
+		return nil, "", nil
 	}
 
 	// Maybe it's a truncated image ID.  Don't prepend a registry name, then.
@@ -65,117 +69,64 @@ func ResolveName(name string, firstRegistry string, sc *types.SystemContext, sto
 		if img, err := store.Image(name); err == nil && img != nil && strings.HasPrefix(img.ID, name) {
 			// It's a truncated version of the ID of an image that's present in local storage;
 			// we need only expand the ID.
-			return []string{img.ID}, "", false, nil
+			return []string{img.ID}, "", nil
 		}
 	}
-
-	// If the image includes a transport's name as a prefix, use it as-is.
-	if strings.HasPrefix(name, DefaultTransport) {
-		return []string{strings.TrimPrefix(name, DefaultTransport)}, DefaultTransport, false, nil
-	}
-	split := strings.SplitN(name, ":", 2)
-	if StartsWithValidTransport(name) && len(split) == 2 {
-		if trans := transports.Get(split[0]); trans != nil {
-			return []string{split[1]}, trans.Name(), false, nil
-		}
-	}
-	// If the image name already included a domain component, we're done.
-	named, err := reference.ParseNormalizedNamed(name)
-	if err != nil {
-		return nil, "", false, errors.Wrapf(err, "error parsing image name %q", name)
-	}
-	if named.String() == name {
-		// Parsing produced the same result, so there was a domain name in there to begin with.
-		return []string{name}, DefaultTransport, false, nil
-	}
-	if reference.Domain(named) != "" && RegistryDefaultPathPrefix[reference.Domain(named)] != "" {
-		// If this domain can cause us to insert something in the middle, check if that happened.
-		repoPath := reference.Path(named)
-		domain := reference.Domain(named)
-		tag := ""
-		if tagged, ok := named.(reference.Tagged); ok {
-			tag = ":" + tagged.Tag()
-		}
-		digest := ""
-		if digested, ok := named.(reference.Digested); ok {
-			digest = "@" + digested.Digest().String()
-		}
-		defaultPrefix := RegistryDefaultPathPrefix[reference.Domain(named)] + "/"
-		if strings.HasPrefix(repoPath, defaultPrefix) && path.Join(domain, repoPath[len(defaultPrefix):])+tag+digest == name {
-			// Yup, parsing just inserted a bit in the middle, so there was a domain name there to begin with.
-			return []string{name}, DefaultTransport, false, nil
-		}
-	}
-
-	// Figure out the list of registries.
-	var registries []string
-	searchRegistries, err := sysregistriesv2.UnqualifiedSearchRegistries(sc)
-	if err != nil {
-		logrus.Debugf("unable to read configured registries to complete %q: %v", name, err)
-		searchRegistries = nil
-	}
-	for _, registry := range searchRegistries {
-		reg, err := sysregistriesv2.FindRegistry(sc, registry)
+	// If we're referring to an image by digest, it *must* be local and we
+	// should not have any fall through/back logic.
+	if strings.HasPrefix(name, "sha256:") {
+		d, err := digest.Parse(name)
 		if err != nil {
-			logrus.Debugf("unable to read registry configuration for %#v: %v", registry, err)
-			continue
+			return nil, "", err
 		}
-		if reg == nil || !reg.Blocked {
-			registries = append(registries, registry)
+		img, err := store.Image(d.Encoded())
+		if err != nil {
+			return nil, "", err
 		}
+		return []string{img.ID}, "", nil
 	}
-	searchRegistriesAreEmpty := len(registries) == 0
 
-	// Create all of the combinations.  Some registries need an additional component added, so
-	// use our lookaside map to keep track of them.  If there are no configured registries, we'll
-	// return a name using "localhost" as the registry name.
-	candidates := []string{}
-	initRegistries := []string{"localhost"}
-	if firstRegistry != "" && firstRegistry != "localhost" {
-		initRegistries = append([]string{firstRegistry}, initRegistries...)
+	// Transports are not supported for local image look ups.
+	srcRef, err := alltransports.ParseImageName(name)
+	if err == nil {
+		return []string{srcRef.StringWithinTransport()}, srcRef.Transport().Name(), nil
 	}
-	for _, registry := range append(initRegistries, registries...) {
-		if registry == "" {
-			continue
-		}
-		middle := ""
-		if prefix, ok := RegistryDefaultPathPrefix[registry]; ok && !strings.ContainsRune(name, '/') {
-			middle = prefix
-		}
-		candidate := path.Join(registry, middle, name)
-		candidates = append(candidates, candidate)
-	}
-	return candidates, DefaultTransport, searchRegistriesAreEmpty, nil
-}
 
-// StartsWithValidTransport validates the name starts with Buildah supported transport
-// to avoid the corner case image name same as the transport name
-func StartsWithValidTransport(name string) bool {
-	return strings.HasPrefix(name, "dir:") || strings.HasPrefix(name, "docker://") || strings.HasPrefix(name, "docker-archive:") || strings.HasPrefix(name, "docker-daemon:") || strings.HasPrefix(name, "oci:") || strings.HasPrefix(name, "oci-archive:")
+	var candidates []string
+	// Local short-name resolution.
+	namedCandidates, err := shortnames.ResolveLocally(sc, name)
+	if err != nil {
+		return nil, "", err
+	}
+	for _, named := range namedCandidates {
+		candidates = append(candidates, named.String())
+	}
+
+	return candidates, DefaultTransport, nil
 }
 
 // ExpandNames takes unqualified names, parses them as image names, and returns
 // the fully expanded result, including a tag.  Names which don't include a registry
 // name will be marked for the most-preferred registry (i.e., the first one in our
 // configuration).
-func ExpandNames(names []string, firstRegistry string, systemContext *types.SystemContext, store storage.Store) ([]string, error) {
+func ExpandNames(names []string, systemContext *types.SystemContext, store storage.Store) ([]string, error) {
 	expanded := make([]string, 0, len(names))
 	for _, n := range names {
 		var name reference.Named
-		nameList, _, _, err := ResolveName(n, firstRegistry, systemContext, store)
+		nameList, _, err := resolveName(n, systemContext, store)
 		if err != nil {
-			return nil, errors.Wrapf(err, "error parsing name %q", n)
+			return nil, fmt.Errorf("parsing name %q: %w", n, err)
 		}
 		if len(nameList) == 0 {
 			named, err := reference.ParseNormalizedNamed(n)
 			if err != nil {
-				return nil, errors.Wrapf(err, "error parsing name %q", n)
+				return nil, fmt.Errorf("parsing name %q: %w", n, err)
 			}
 			name = named
 		} else {
 			named, err := reference.ParseNormalizedNamed(nameList[0])
 			if err != nil {
-				return nil, errors.Wrapf(err, "error parsing name %q", nameList[0])
+				return nil, fmt.Errorf("parsing name %q: %w", nameList[0], err)
 			}
 			name = named
 		}
@@ -185,48 +136,37 @@ func ExpandNames(names []string, firstRegistry string, systemContext *types.Syst
 	return expanded, nil
 }
 
-// FindImage locates the locally-stored image which corresponds to a given name.
-func FindImage(store storage.Store, firstRegistry string, systemContext *types.SystemContext, image string) (types.ImageReference, *storage.Image, error) {
-	var ref types.ImageReference
-	var img *storage.Image
-	var err error
-	names, _, _, err := ResolveName(image, firstRegistry, systemContext, store)
+// FindImage locates the locally-stored image which corresponds to a given
+// name.  Please note that the second argument has been deprecated and has no
+// effect anymore.
+func FindImage(store storage.Store, _ string, systemContext *types.SystemContext, image string) (types.ImageReference, *storage.Image, error) {
+	runtime, err := libimage.RuntimeFromStore(store, &libimage.RuntimeOptions{SystemContext: systemContext})
 	if err != nil {
-		return nil, nil, errors.Wrapf(err, "error parsing name %q", image)
+		return nil, nil, err
 	}
-	for _, name := range names {
-		ref, err = is.Transport.ParseStoreReference(store, name)
-		if err != nil {
-			logrus.Debugf("error parsing reference to image %q: %v", name, err)
-			continue
-		}
-		img, err = is.Transport.GetStoreImage(store, ref)
-		if err != nil {
-			img2, err2 := store.Image(name)
-			if err2 != nil {
-				logrus.Debugf("error locating image %q: %v", name, err2)
-				continue
-			}
-			img = img2
-		}
-		break
+
+	localImage, _, err := runtime.LookupImage(image, nil)
+	if err != nil {
+		return nil, nil, err
 	}
-	if ref == nil || img == nil {
-		return nil, nil, errors.Wrapf(err, "error locating image with name %q (%v)", image, names)
+	ref, err := localImage.StorageReference()
+	if err != nil {
+		return nil, nil, err
 	}
-	return ref, img, nil
+
+	return ref, localImage.StorageImage(), nil
 }
 
-// ResolveNameToReferences tries to create a list of possible references
+// resolveNameToReferences tries to create a list of possible references
 // (including their transports) from the provided image name.
 func ResolveNameToReferences(
 	store storage.Store,
 	systemContext *types.SystemContext,
 	image string,
 ) (refs []types.ImageReference, err error) {
-	names, transport, _, err := ResolveName(image, "", systemContext, store)
+	names, transport, err := resolveName(image, systemContext, store)
 	if err != nil {
-		return nil, errors.Wrapf(err, "error parsing name %q", image)
+		return nil, fmt.Errorf("parsing name %q: %w", image, err)
 	}
 
 	if transport != DefaultTransport {
@@ -242,21 +182,30 @@ func ResolveNameToReferences(
 		refs = append(refs, ref)
 	}
 	if len(refs) == 0 {
-		return nil, errors.Errorf("error locating images with names %v", names)
+		return nil, fmt.Errorf("locating images with names %v", names)
 	}
 	return refs, nil
 }
 
-// AddImageNames adds the specified names to the specified image.
-func AddImageNames(store storage.Store, firstRegistry string, systemContext *types.SystemContext, image *storage.Image, addNames []string) error {
-	names, err := ExpandNames(addNames, firstRegistry, systemContext, store)
+// AddImageNames adds the specified names to the specified image.  Please note
+// that the second argument has been deprecated and has no effect anymore.
+func AddImageNames(store storage.Store, _ string, systemContext *types.SystemContext, image *storage.Image, addNames []string) error {
+	runtime, err := libimage.RuntimeFromStore(store, &libimage.RuntimeOptions{SystemContext: systemContext})
 	if err != nil {
 		return err
 	}
-	err = store.SetNames(image.ID, append(image.Names, names...))
+
+	localImage, _, err := runtime.LookupImage(image.ID, nil)
 	if err != nil {
-		return errors.Wrapf(err, "error adding names (%v) to image %q", names, image.ID)
+		return err
 	}
+
+	for _, tag := range addNames {
+		if err := localImage.Tag(tag); err != nil {
+			return fmt.Errorf("tagging image %s: %w", image.ID, err)
+		}
+	}
+
 	return nil
 }
 
@@ -264,7 +213,7 @@ func AddImageNames(store storage.Store, firstRegistry string, systemContext *typ
 // error message that reflects the reason of the failure.
 // In case err type is not a familiar one the error "defaultError" is returned.
 func GetFailureCause(err, defaultError error) error {
-	switch nErr := errors.Cause(err).(type) {
+	switch nErr := err.(type) {
 	case errcode.Errors:
 		return err
 	case errcode.Error, *url.Error:
@@ -289,23 +238,12 @@ func Runtime() string {
 		return runtime
 	}
 
-	// Need to switch default until runc supports cgroups v2
-	if unified, _ := IsCgroup2UnifiedMode(); unified {
-		return "crun"
+	conf, err := config.Default()
+	if err != nil {
+		logrus.Warnf("Error loading default container config when searching for local runtime: %v", err)
+		return define.DefaultRuntime
 	}
-
-	return DefaultRuntime
-}
-
-// StringInSlice returns a boolean indicating if the exact value s is present
-// in the slice slice.
-func StringInSlice(s string, slice []string) bool {
-	for _, v := range slice {
-		if v == s {
-			return true
-		}
-	}
-	return false
+	return conf.Engine.OCIRuntime
 }
 
 // GetContainerIDs uses ID mappings to compute the container-level IDs that will
@@ -321,7 +259,7 @@ func GetContainerIDs(uidmap, gidmap []specs.LinuxIDMapping, uid, gid uint32) (ui
 		}
 	}
 	if !uidMapped {
-		return 0, 0, errors.Errorf("container uses ID mappings (%#v), but doesn't map UID %d", uidmap, uid)
+		return 0, 0, fmt.Errorf("container uses ID mappings (%#v), but doesn't map UID %d", uidmap, uid)
 	}
 	gidMapped := true
 	for _, m := range gidmap {
@@ -333,7 +271,7 @@ func GetContainerIDs(uidmap, gidmap []specs.LinuxIDMapping, uid, gid uint32) (ui
 		}
 	}
 	if !gidMapped {
-		return 0, 0, errors.Errorf("container uses ID mappings (%#v), but doesn't map GID %d", gidmap, gid)
+		return 0, 0, fmt.Errorf("container uses ID mappings (%#v), but doesn't map GID %d", gidmap, gid)
 	}
 	return uid, gid, nil
 }
@@ -351,7 +289,7 @@ func GetHostIDs(uidmap, gidmap []specs.LinuxIDMapping, uid, gid uint32) (uint32,
 		}
 	}
 	if !uidMapped {
-		return 0, 0, errors.Errorf("container uses ID mappings (%#v), but doesn't map UID %d", uidmap, uid)
+		return 0, 0, fmt.Errorf("container uses ID mappings (%#v), but doesn't map UID %d", uidmap, uid)
 	}
 	gidMapped := true
 	for _, m := range gidmap {
@@ -363,7 +301,7 @@ func GetHostIDs(uidmap, gidmap []specs.LinuxIDMapping, uid, gid uint32) (uint32,
 		}
 	}
 	if !gidMapped {
-		return 0, 0, errors.Errorf("container uses ID mappings (%#v), but doesn't map GID %d", gidmap, gid)
+		return 0, 0, fmt.Errorf("container uses ID mappings (%#v), but doesn't map GID %d", gidmap, gid)
 	}
 	return uid, gid, nil
 }
@@ -434,21 +372,17 @@ func TruncateString(str string, to int) string {
 	return newStr
 }
 
-var (
-	isUnifiedOnce sync.Once
-	isUnified     bool
-	isUnifiedErr  error
-)
-
 // fileExistsAndNotADir - Check to see if a file exists
 // and that it is not a directory.
-func fileExistsAndNotADir(path string) bool {
+func fileExistsAndNotADir(path string) (bool, error) {
 	file, err := os.Stat(path)
-
-	if file == nil || err != nil || os.IsNotExist(err) {
-		return false
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
 	}
-	return !file.IsDir()
+	return !file.IsDir(), nil
 }
 
 // FindLocalRuntime find the local runtime of the
@@ -462,7 +396,11 @@ func FindLocalRuntime(runtime string) string {
 		return localRuntime
 	}
 	for _, val := range conf.Engine.OCIRuntimes[runtime] {
-		if fileExistsAndNotADir(val) {
+		exists, err := fileExistsAndNotADir(val)
+		if err != nil {
+			logrus.Errorf("Failed to determine if file exists and is not a directory: %v", err)
+		}
+		if exists {
 			localRuntime = val
 			break
 		}
@@ -484,4 +422,44 @@ func MergeEnv(defaults, overrides []string) []string {
 		index[envVar[0]] = len(s) - 1
 	}
 	return s
+}
+
+type byDestination []specs.Mount
+
+func (m byDestination) Len() int {
+	return len(m)
+}
+
+func (m byDestination) Less(i, j int) bool {
+	iparts, jparts := m.parts(i), m.parts(j)
+	switch {
+	case iparts < jparts:
+		return true
+	case iparts > jparts:
+		return false
+	}
+	return filepath.Clean(m[i].Destination) < filepath.Clean(m[j].Destination)
+}
+
+func (m byDestination) Swap(i, j int) {
+	m[i], m[j] = m[j], m[i]
+}
+
+func (m byDestination) parts(i int) int {
+	return strings.Count(filepath.Clean(m[i].Destination), string(os.PathSeparator))
+}
+
+func SortMounts(m []specs.Mount) []specs.Mount {
+	sort.Stable(byDestination(m))
+	return m
+}
+
+func VerifyTagName(imageSpec string) (types.ImageReference, error) {
+	ref, err := alltransports.ParseImageName(imageSpec)
+	if err != nil {
+		if ref, err = alltransports.ParseImageName(DefaultTransport + imageSpec); err != nil {
+			return nil, err
+		}
+	}
+	return ref, nil
 }

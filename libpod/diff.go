@@ -1,34 +1,39 @@
+//go:build !remote
+
 package libpod
 
 import (
-	"io"
+	"fmt"
 
-	"github.com/containers/podman/v2/libpod/layers"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/libpod/layers"
 	"github.com/containers/storage/pkg/archive"
-	"github.com/pkg/errors"
 )
 
-var containerMounts = map[string]bool{
-	"/dev":               true,
-	"/etc/hostname":      true,
-	"/etc/hosts":         true,
-	"/etc/resolv.conf":   true,
-	"/proc":              true,
-	"/run":               true,
-	"/run/.containerenv": true,
-	"/run/secrets":       true,
-	"/sys":               true,
+var initInodes = map[string]bool{
+	"/dev":                   true,
+	"/etc/hostname":          true,
+	"/etc/hosts":             true,
+	"/etc/resolv.conf":       true,
+	"/proc":                  true,
+	"/run":                   true,
+	"/run/notify":            true,
+	"/run/.containerenv":     true,
+	"/run/secrets":           true,
+	define.ContainerInitPath: true,
+	"/sys":                   true,
+	"/etc/mtab":              true,
 }
 
 // GetDiff returns the differences between the two images, layers, or containers
-func (r *Runtime) GetDiff(from, to string) ([]archive.Change, error) {
-	toLayer, err := r.getLayerID(to)
+func (r *Runtime) GetDiff(from, to string, diffType define.DiffType) ([]archive.Change, error) {
+	toLayer, err := r.getLayerID(to, diffType)
 	if err != nil {
 		return nil, err
 	}
 	fromLayer := ""
 	if from != "" {
-		fromLayer, err = r.getLayerID(from)
+		fromLayer, err = r.getLayerID(from, diffType)
 		if err != nil {
 			return nil, err
 		}
@@ -37,7 +42,7 @@ func (r *Runtime) GetDiff(from, to string) ([]archive.Change, error) {
 	changes, err := r.store.Changes(fromLayer, toLayer)
 	if err == nil {
 		for _, c := range changes {
-			if containerMounts[c.Path] {
+			if initInodes[c.Path] {
 				continue
 			}
 			rchanges = append(rchanges, c)
@@ -46,34 +51,33 @@ func (r *Runtime) GetDiff(from, to string) ([]archive.Change, error) {
 	return rchanges, err
 }
 
-// ApplyDiffTarStream applies the changes stored in 'diff' to the layer 'to'
-func (r *Runtime) ApplyDiffTarStream(to string, diff io.Reader) error {
-	toLayer, err := r.getLayerID(to)
-	if err != nil {
-		return err
-	}
-	_, err = r.store.ApplyDiff(toLayer, diff)
-	return err
-}
-
 // GetLayerID gets a full layer id given a full or partial id
 // If the id matches a container or image, the id of the top layer is returned
 // If the id matches a layer, the top layer id is returned
-func (r *Runtime) getLayerID(id string) (string, error) {
-	var toLayer string
-	toImage, err := r.imageRuntime.NewFromLocal(id)
-	if err != nil {
-		toCtr, err := r.store.Container(id)
-		if err != nil {
-			toLayer, err = layers.FullID(r.store, id)
-			if err != nil {
-				return "", errors.Errorf("layer, image, or container %s does not exist", id)
-			}
-		} else {
-			toLayer = toCtr.LayerID
+func (r *Runtime) getLayerID(id string, diffType define.DiffType) (string, error) {
+	var lastErr error
+	if diffType&define.DiffImage == define.DiffImage {
+		toImage, _, err := r.libimageRuntime.LookupImage(id, nil)
+		if err == nil {
+			return toImage.TopLayer(), nil
 		}
-	} else {
-		toLayer = toImage.TopLayer()
+		lastErr = err
 	}
-	return toLayer, nil
+
+	if diffType&define.DiffContainer == define.DiffContainer {
+		toCtr, err := r.store.Container(id)
+		if err == nil {
+			return toCtr.LayerID, nil
+		}
+		lastErr = err
+	}
+
+	if diffType == define.DiffAll {
+		toLayer, err := layers.FullID(r.store, id)
+		if err == nil {
+			return toLayer, nil
+		}
+		lastErr = err
+	}
+	return "", fmt.Errorf("%s not found: %w", id, lastErr)
 }

@@ -1,17 +1,23 @@
+//go:build !remote
+
 package compat
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 
-	"github.com/containers/podman/v2/libpod"
-	"github.com/containers/podman/v2/pkg/api/handlers/utils"
-	"github.com/gorilla/schema"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/infra/abi"
+	"github.com/containers/storage"
 )
 
 func RemoveImage(w http.ResponseWriter, r *http.Request) {
-	decoder := r.Context().Value("decoder").(*schema.Decoder)
-	runtime := r.Context().Value("runtime").(*libpod.Runtime)
+	decoder := utils.GetDecoder(r)
+	runtime := r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
 
 	query := struct {
 		Force   bool `schema:"force"`
@@ -21,38 +27,46 @@ func RemoveImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := decoder.Decode(&query, r.URL.Query()); err != nil {
-		utils.Error(w, "Something went wrong.", http.StatusBadRequest, errors.Wrapf(err, "Failed to parse parameters for %s", r.URL.String()))
+		utils.Error(w, http.StatusBadRequest, fmt.Errorf("failed to parse parameters for %s: %w", r.URL.String(), err))
 		return
-	}
-	if _, found := r.URL.Query()["noprune"]; found {
-		if query.NoPrune {
-			utils.UnSupportedParameter("noprune")
-		}
 	}
 	name := utils.GetName(r)
-	newImage, err := runtime.ImageRuntime().NewFromLocal(name)
+	possiblyNormalizedName, err := utils.NormalizeToDockerHub(r, name)
 	if err != nil {
-		utils.ImageNotFound(w, name, errors.Wrapf(err, "Failed to find image %s", name))
+		utils.Error(w, http.StatusInternalServerError, fmt.Errorf("normalizing image: %w", err))
 		return
 	}
 
-	results, err := runtime.RemoveImage(r.Context(), newImage, query.Force)
-	if err != nil {
-		utils.Error(w, "Something went wrong.", http.StatusInternalServerError, err)
+	imageEngine := abi.ImageEngine{Libpod: runtime}
+
+	options := entities.ImageRemoveOptions{
+		Force:   query.Force,
+		NoPrune: query.NoPrune,
+	}
+	report, rmerrors := imageEngine.Remove(r.Context(), []string{possiblyNormalizedName}, options)
+	if len(rmerrors) > 0 && rmerrors[0] != nil {
+		err := rmerrors[0]
+		if errors.Is(err, storage.ErrImageUnknown) {
+			utils.ImageNotFound(w, name, fmt.Errorf("failed to find image %s: %w", name, err))
+			return
+		}
+		if errors.Is(err, storage.ErrImageUsedByContainer) {
+			utils.Error(w, http.StatusConflict, fmt.Errorf("image %s is in use: %w", name, err))
+			return
+		}
+		utils.Error(w, http.StatusInternalServerError, err)
 		return
 	}
-
-	response := make([]map[string]string, 0, len(results.Untagged)+1)
-	deleted := make(map[string]string, 1)
-	deleted["Deleted"] = results.Deleted
-	response = append(response, deleted)
-
-	for _, u := range results.Untagged {
+	response := make([]map[string]string, 0, len(report.Untagged)+1)
+	for _, d := range report.Deleted {
+		deleted := make(map[string]string, 1)
+		deleted["Deleted"] = d
+		response = append(response, deleted)
+	}
+	for _, u := range report.Untagged {
 		untagged := make(map[string]string, 1)
 		untagged["Untagged"] = u
 		response = append(response, untagged)
 	}
-
 	utils.WriteResponse(w, http.StatusOK, response)
-
 }

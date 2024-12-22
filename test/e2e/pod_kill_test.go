@@ -1,154 +1,136 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
-	"fmt"
-	"os"
-
-	. "github.com/containers/podman/v2/test/utils"
-	. "github.com/onsi/ginkgo"
+	. "github.com/containers/podman/v5/test/utils"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
 var _ = Describe("Podman pod kill", func() {
-	var (
-		tempdir    string
-		err        error
-		podmanTest *PodmanTestIntegration
-	)
-
-	BeforeEach(func() {
-		tempdir, err = CreateTempDirInTempDir()
-		if err != nil {
-			os.Exit(1)
-		}
-		podmanTest = PodmanTestCreate(tempdir)
-		podmanTest.Setup()
-		podmanTest.SeedImages()
-	})
-
-	AfterEach(func() {
-		podmanTest.Cleanup()
-		f := CurrentGinkgoTestDescription()
-		processTestResult(f)
-
-	})
 
 	It("podman pod kill bogus", func() {
 		session := podmanTest.Podman([]string{"pod", "kill", "foobar"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
+		expect := "no pod with name or ID foobar found: no such pod"
+		if IsRemote() {
+			expect = `unable to find pod "foobar": no such pod`
+		}
+		Expect(session).To(ExitWithError(125, expect))
 	})
 
 	It("podman pod kill a pod by id", func() {
-		_, ec, podid := podmanTest.CreatePod("")
+		_, ec, podid := podmanTest.CreatePod(nil)
 		Expect(ec).To(Equal(0))
 
 		session := podmanTest.RunTopContainerInPod("", podid)
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
 		session = podmanTest.RunTopContainerInPod("", podid)
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
 		result := podmanTest.Podman([]string{"pod", "kill", podid})
 		result.WaitWithDefaultTimeout()
-		Expect(result.ExitCode()).To(Equal(0))
+		Expect(result).Should(ExitCleanly())
 		Expect(podmanTest.NumberOfContainersRunning()).To(Equal(0))
 	})
 
 	It("podman pod kill a pod by id with TERM", func() {
-		_, ec, podid := podmanTest.CreatePod("")
+		_, ec, podid := podmanTest.CreatePod(nil)
 		Expect(ec).To(Equal(0))
 
 		session := podmanTest.RunTopContainerInPod("", podid)
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
 		result := podmanTest.Podman([]string{"pod", "kill", "-s", "9", podid})
 		result.WaitWithDefaultTimeout()
-		Expect(result.ExitCode()).To(Equal(0))
+		Expect(result).Should(ExitCleanly())
 		Expect(podmanTest.NumberOfContainersRunning()).To(Equal(0))
 	})
 
 	It("podman pod kill a pod by name", func() {
-		_, ec, podid := podmanTest.CreatePod("test1")
+		_, ec, podid := podmanTest.CreatePod(map[string][]string{"--name": {"test1"}})
 		Expect(ec).To(Equal(0))
 
 		session := podmanTest.RunTopContainerInPod("", podid)
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
 		result := podmanTest.Podman([]string{"pod", "kill", "test1"})
 		result.WaitWithDefaultTimeout()
-		Expect(result.ExitCode()).To(Equal(0))
+		Expect(result).Should(ExitCleanly())
 		Expect(podmanTest.NumberOfContainersRunning()).To(Equal(0))
 	})
 
 	It("podman pod kill a pod by id with a bogus signal", func() {
-		_, ec, podid := podmanTest.CreatePod("test1")
+		_, ec, podid := podmanTest.CreatePod(map[string][]string{"--name": {"test1"}})
 		Expect(ec).To(Equal(0))
 
 		session := podmanTest.RunTopContainerInPod("", podid)
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
 		result := podmanTest.Podman([]string{"pod", "kill", "-s", "bogus", "test1"})
 		result.WaitWithDefaultTimeout()
-		Expect(result.ExitCode()).To(Equal(125))
+		Expect(result).Should(ExitWithError(125, "invalid signal: bogus"))
 		Expect(podmanTest.NumberOfContainersRunning()).To(Equal(1))
 	})
 
 	It("podman pod kill latest pod", func() {
-		_, ec, podid := podmanTest.CreatePod("")
+		_, ec, podid := podmanTest.CreatePod(nil)
 		Expect(ec).To(Equal(0))
 
 		session := podmanTest.RunTopContainerInPod("", podid)
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
-		_, ec, podid2 := podmanTest.CreatePod("")
+		_, ec, podid2 := podmanTest.CreatePod(nil)
 		Expect(ec).To(Equal(0))
 
 		session = podmanTest.RunTopContainerInPod("", podid2)
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
 		session = podmanTest.RunTopContainerInPod("", podid2)
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 		if !IsRemote() {
 			podid2 = "-l"
 		}
 		result := podmanTest.Podman([]string{"pod", "kill", podid2})
 		result.WaitWithDefaultTimeout()
-		Expect(result.ExitCode()).To(Equal(0))
+		Expect(result).Should(ExitCleanly())
 		Expect(podmanTest.NumberOfContainersRunning()).To(Equal(1))
 	})
 
 	It("podman pod kill all", func() {
-		_, ec, podid := podmanTest.CreatePod("")
+		SkipIfRootlessCgroupsV1("Not supported for rootless + CgroupsV1")
+		_, ec, podid := podmanTest.CreatePod(nil)
 		Expect(ec).To(Equal(0))
 
 		session := podmanTest.RunTopContainerInPod("", podid)
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
 		session = podmanTest.RunTopContainerInPod("", podid)
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
-		_, ec, podid2 := podmanTest.CreatePod("")
+		_, ec, podid2 := podmanTest.CreatePod(nil)
 		Expect(ec).To(Equal(0))
 
 		session = podmanTest.RunTopContainerInPod("", podid2)
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
 		result := podmanTest.Podman([]string{"pod", "kill", "-a"})
 		result.WaitWithDefaultTimeout()
-		fmt.Println(result.OutputToString(), result.ErrorToString())
-		Expect(result.ExitCode()).To(Equal(0))
+		GinkgoWriter.Println(result.OutputToString(), result.ErrorToString())
+		Expect(result).Should(ExitCleanly())
 		Expect(podmanTest.NumberOfContainersRunning()).To(Equal(0))
 	})
 })

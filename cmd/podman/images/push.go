@@ -1,24 +1,31 @@
 package images
 
 import (
+	"fmt"
 	"os"
 
+	"github.com/containers/buildah/pkg/cli"
 	"github.com/containers/common/pkg/auth"
+	"github.com/containers/common/pkg/completion"
 	"github.com/containers/image/v5/types"
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/containers/podman/v2/pkg/util"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/util"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 )
 
 // pushOptionsWrapper wraps entities.ImagepushOptions and prevents leaking
 // CLI-only fields into the API types.
 type pushOptionsWrapper struct {
 	entities.ImagePushOptions
-	TLSVerifyCLI   bool // CLI only
-	CredentialsCLI string
+	TLSVerifyCLI               bool // CLI only
+	CredentialsCLI             string
+	SignPassphraseFileCLI      string
+	SignBySigstoreParamFileCLI string
+	EncryptionKeys             []string
+	EncryptLayers              []int
+	DigestFile                 string
 }
 
 var (
@@ -29,11 +36,12 @@ var (
 
 	// Command: podman push
 	pushCmd = &cobra.Command{
-		Use:   "push [flags] SOURCE [DESTINATION]",
-		Short: "Push an image to a specified destination",
-		Long:  pushDescription,
-		RunE:  imagePush,
-		Args:  cobra.RangeArgs(1, 2),
+		Use:               "push [options] IMAGE [DESTINATION]",
+		Short:             "Push an image to a specified destination",
+		Long:              pushDescription,
+		RunE:              imagePush,
+		Args:              cobra.RangeArgs(1, 2),
+		ValidArgsFunction: common.AutocompleteImages,
 		Example: `podman push imageID docker://registry.example.com/repository:tag
 		podman push imageID oci-archive:/path/to/layout:image:tag`,
 	}
@@ -42,11 +50,12 @@ var (
 	// It's basically a clone of `pushCmd` with the exception of being a
 	// child of the images command.
 	imagePushCmd = &cobra.Command{
-		Use:   pushCmd.Use,
-		Short: pushCmd.Short,
-		Long:  pushCmd.Long,
-		RunE:  pushCmd.RunE,
-		Args:  pushCmd.Args,
+		Use:               pushCmd.Use,
+		Short:             pushCmd.Short,
+		Long:              pushCmd.Long,
+		RunE:              pushCmd.RunE,
+		Args:              pushCmd.Args,
+		ValidArgsFunction: pushCmd.ValidArgsFunction,
 		Example: `podman image push imageID docker://registry.example.com/repository:tag
 		podman image push imageID oci-archive:/path/to/layout:image:tag`,
 	}
@@ -55,46 +64,109 @@ var (
 func init() {
 	// push
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: pushCmd,
 	})
-
-	flags := pushCmd.Flags()
-	pushFlags(flags)
+	pushFlags(pushCmd)
 
 	// images push
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: imagePushCmd,
 		Parent:  imageCmd,
 	})
-
-	pushFlags(imagePushCmd.Flags())
+	pushFlags(imagePushCmd)
 }
 
 // pushFlags set the flags for the push command.
-func pushFlags(flags *pflag.FlagSet) {
-	flags.StringVar(&pushOptions.Authfile, "authfile", auth.GetDefaultAuthFile(), "Path of the authentication file. Use REGISTRY_AUTH_FILE environment variable to override")
-	flags.StringVar(&pushOptions.CertDir, "cert-dir", "", "Path to a directory containing TLS certificates and keys")
+func pushFlags(cmd *cobra.Command) {
+	flags := cmd.Flags()
+
+	// For now default All flag to true, for pushing of manifest lists
+	pushOptions.All = true
+	authfileFlagName := "authfile"
+	flags.StringVar(&pushOptions.Authfile, authfileFlagName, auth.GetDefaultAuthFile(), "Path of the authentication file. Use REGISTRY_AUTH_FILE environment variable to override")
+	_ = cmd.RegisterFlagCompletionFunc(authfileFlagName, completion.AutocompleteDefault)
+
+	certDirFlagName := "cert-dir"
+	flags.StringVar(&pushOptions.CertDir, certDirFlagName, "", "Path to a directory containing TLS certificates and keys")
+	_ = cmd.RegisterFlagCompletionFunc(certDirFlagName, completion.AutocompleteDefault)
+
 	flags.BoolVar(&pushOptions.Compress, "compress", false, "Compress tarball image layers when pushing to a directory using the 'dir' transport. (default is same compression type as source)")
-	flags.StringVar(&pushOptions.CredentialsCLI, "creds", "", "`Credentials` (USERNAME:PASSWORD) to use for authenticating to a registry")
-	flags.StringVar(&pushOptions.DigestFile, "digestfile", "", "Write the digest of the pushed image to the specified file")
+
+	credsFlagName := "creds"
+	flags.StringVar(&pushOptions.CredentialsCLI, credsFlagName, "", "`Credentials` (USERNAME:PASSWORD) to use for authenticating to a registry")
+	_ = cmd.RegisterFlagCompletionFunc(credsFlagName, completion.AutocompleteNone)
+
 	flags.Bool("disable-content-trust", false, "This is a Docker specific option and is a NOOP")
-	flags.StringVarP(&pushOptions.Format, "format", "f", "", "Manifest type (oci, v2s1, or v2s2) to use when pushing an image using the 'dir' transport (default is manifest type of source)")
+
+	digestfileFlagName := "digestfile"
+	flags.StringVar(&pushOptions.DigestFile, digestfileFlagName, "", "Write the digest of the pushed image to the specified file")
+	_ = cmd.RegisterFlagCompletionFunc(digestfileFlagName, completion.AutocompleteDefault)
+
+	flags.BoolVar(&pushOptions.ForceCompressionFormat, "force-compression", false, "Use the specified compression algorithm even if the destination contains a differently-compressed variant already")
+
+	formatFlagName := "format"
+	flags.StringVarP(&pushOptions.Format, formatFlagName, "f", "", "Manifest type (oci, v2s2, or v2s1) to use in the destination (default is manifest type of source, with fallbacks)")
+	_ = cmd.RegisterFlagCompletionFunc(formatFlagName, common.AutocompleteManifestFormat)
+
 	flags.BoolVarP(&pushOptions.Quiet, "quiet", "q", false, "Suppress output information when pushing images")
 	flags.BoolVar(&pushOptions.RemoveSignatures, "remove-signatures", false, "Discard any pre-existing signatures in the image")
-	flags.StringVar(&pushOptions.SignaturePolicy, "signature-policy", "", "Path to a signature-policy file")
-	flags.StringVar(&pushOptions.SignBy, "sign-by", "", "Add a signature at the destination using the specified key")
+
+	retryFlagName := "retry"
+	flags.Uint(retryFlagName, registry.RetryDefault(), "number of times to retry in case of failure when performing push")
+	_ = cmd.RegisterFlagCompletionFunc(retryFlagName, completion.AutocompleteNone)
+	retryDelayFlagName := "retry-delay"
+	flags.String(retryDelayFlagName, registry.RetryDelayDefault(), "delay between retries in case of push failures")
+	_ = cmd.RegisterFlagCompletionFunc(retryDelayFlagName, completion.AutocompleteNone)
+
+	signByFlagName := "sign-by"
+	flags.StringVar(&pushOptions.SignBy, signByFlagName, "", "Add a signature at the destination using the specified key")
+	_ = cmd.RegisterFlagCompletionFunc(signByFlagName, completion.AutocompleteNone)
+
+	signBySigstoreFlagName := "sign-by-sigstore"
+	flags.StringVar(&pushOptions.SignBySigstoreParamFileCLI, signBySigstoreFlagName, "", "Sign the image using a sigstore parameter file at `PATH`")
+	_ = cmd.RegisterFlagCompletionFunc(signBySigstoreFlagName, completion.AutocompleteDefault)
+
+	signBySigstorePrivateKeyFlagName := "sign-by-sigstore-private-key"
+	flags.StringVar(&pushOptions.SignBySigstorePrivateKeyFile, signBySigstorePrivateKeyFlagName, "", "Sign the image using a sigstore private key at `PATH`")
+	_ = cmd.RegisterFlagCompletionFunc(signBySigstorePrivateKeyFlagName, completion.AutocompleteDefault)
+
+	signPassphraseFileFlagName := "sign-passphrase-file"
+	flags.StringVar(&pushOptions.SignPassphraseFileCLI, signPassphraseFileFlagName, "", "Read a passphrase for signing an image from `PATH`")
+	_ = cmd.RegisterFlagCompletionFunc(signPassphraseFileFlagName, completion.AutocompleteDefault)
+
 	flags.BoolVar(&pushOptions.TLSVerifyCLI, "tls-verify", true, "Require HTTPS and verify certificates when contacting registries")
 
+	compFormat := "compression-format"
+	flags.StringVar(&pushOptions.CompressionFormat, compFormat, compressionFormat(), "compression format to use")
+	_ = cmd.RegisterFlagCompletionFunc(compFormat, common.AutocompleteCompressionFormat)
+
+	compLevel := "compression-level"
+	flags.Int(compLevel, compressionLevel(), "compression level to use")
+	_ = cmd.RegisterFlagCompletionFunc(compLevel, completion.AutocompleteNone)
+
+	encryptionKeysFlagName := "encryption-key"
+	flags.StringArrayVar(&pushOptions.EncryptionKeys, encryptionKeysFlagName, nil, "Key with the encryption protocol to use to encrypt the image (e.g. jwe:/path/to/key.pem)")
+	_ = cmd.RegisterFlagCompletionFunc(encryptionKeysFlagName, completion.AutocompleteDefault)
+
+	encryptLayersFlagName := "encrypt-layer"
+	flags.IntSliceVar(&pushOptions.EncryptLayers, encryptLayersFlagName, nil, "Layers to encrypt, 0-indexed layer indices with support for negative indexing (e.g. 0 is the first layer, -1 is the last layer). If not defined, will encrypt all layers if encryption-key flag is specified")
+	_ = cmd.RegisterFlagCompletionFunc(encryptLayersFlagName, completion.AutocompleteDefault)
+
 	if registry.IsRemote() {
-		_ = flags.MarkHidden("authfile")
 		_ = flags.MarkHidden("cert-dir")
 		_ = flags.MarkHidden("compress")
 		_ = flags.MarkHidden("quiet")
-		_ = flags.MarkHidden("tls-verify")
+		_ = flags.MarkHidden(signByFlagName)
+		_ = flags.MarkHidden(signBySigstoreFlagName)
+		_ = flags.MarkHidden(signBySigstorePrivateKeyFlagName)
+		_ = flags.MarkHidden(signPassphraseFileFlagName)
+		_ = flags.MarkHidden(encryptionKeysFlagName)
+		_ = flags.MarkHidden(encryptLayersFlagName)
+	} else {
+		signaturePolicyFlagName := "signature-policy"
+		flags.StringVar(&pushOptions.SignaturePolicy, signaturePolicyFlagName, "", "Path to a signature-policy file")
+		_ = flags.MarkHidden(signaturePolicyFlagName)
 	}
-	_ = flags.MarkHidden("signature-policy")
 }
 
 // imagePush is implement the command for pushing images.
@@ -110,9 +182,9 @@ func imagePush(cmd *cobra.Command, args []string) error {
 		pushOptions.SkipTLSVerify = types.NewOptionalBool(!pushOptions.TLSVerifyCLI)
 	}
 
-	if pushOptions.Authfile != "" {
-		if _, err := os.Stat(pushOptions.Authfile); err != nil {
-			return errors.Wrapf(err, "error getting authfile %s", pushOptions.Authfile)
+	if cmd.Flags().Changed("authfile") {
+		if err := auth.CheckAuthFile(pushOptions.Authfile); err != nil {
+			return err
 		}
 	}
 
@@ -125,7 +197,86 @@ func imagePush(cmd *cobra.Command, args []string) error {
 		pushOptions.Password = creds.Password
 	}
 
+	if !pushOptions.Quiet {
+		pushOptions.Writer = os.Stderr
+	}
+
+	signingCleanup, err := common.PrepareSigning(&pushOptions.ImagePushOptions,
+		pushOptions.SignPassphraseFileCLI, pushOptions.SignBySigstoreParamFileCLI)
+	if err != nil {
+		return err
+	}
+	defer signingCleanup()
+
+	encConfig, encLayers, err := cli.EncryptConfig(pushOptions.EncryptionKeys, pushOptions.EncryptLayers)
+	if err != nil {
+		return fmt.Errorf("unable to obtain encryption config: %w", err)
+	}
+	pushOptions.OciEncryptConfig = encConfig
+	pushOptions.OciEncryptLayers = encLayers
+
+	if cmd.Flags().Changed("retry") {
+		retry, err := cmd.Flags().GetUint("retry")
+		if err != nil {
+			return err
+		}
+
+		pushOptions.Retry = &retry
+	}
+
+	if cmd.Flags().Changed("retry-delay") {
+		val, err := cmd.Flags().GetString("retry-delay")
+		if err != nil {
+			return err
+		}
+
+		pushOptions.RetryDelay = val
+	}
+
+	if cmd.Flags().Changed("compression-level") {
+		val, err := cmd.Flags().GetInt("compression-level")
+		if err != nil {
+			return err
+		}
+		pushOptions.CompressionLevel = &val
+	}
+
+	if cmd.Flags().Changed("compression-format") {
+		if !cmd.Flags().Changed("force-compression") {
+			// If `compression-format` is set and no value for `--force-compression`
+			// is selected then defaults to `true`.
+			pushOptions.ForceCompressionFormat = true
+		}
+	}
+
 	// Let's do all the remaining Yoga in the API to prevent us from scattering
 	// logic across (too) many parts of the code.
-	return registry.ImageEngine().Push(registry.GetContext(), source, destination, pushOptions.ImagePushOptions)
+	report, err := registry.ImageEngine().Push(registry.GetContext(), source, destination, pushOptions.ImagePushOptions)
+	if err != nil {
+		return err
+	}
+
+	if pushOptions.DigestFile != "" {
+		if err := os.WriteFile(pushOptions.DigestFile, []byte(report.ManifestDigest), 0o644); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func compressionFormat() string {
+	if registry.IsRemote() {
+		return ""
+	}
+
+	return containerConfig.ContainersConfDefaultsRO.Engine.CompressionFormat
+}
+
+func compressionLevel() int {
+	if registry.IsRemote() || containerConfig.ContainersConfDefaultsRO.Engine.CompressionLevel == nil {
+		return 0
+	}
+
+	return *containerConfig.ContainersConfDefaultsRO.Engine.CompressionLevel
 }

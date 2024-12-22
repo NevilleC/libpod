@@ -1,8 +1,8 @@
-// +build !linux
+//go:build !linux
 
 package cgroupv2
 
-// Enabled returns whether we are running in cgroup 2 cgroup2 mode.
+// Enabled returns whether we are running on cgroup v2
 func Enabled() (bool, error) {
 	return false, nil
 }

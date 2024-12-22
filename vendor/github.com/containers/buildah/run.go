@@ -3,14 +3,21 @@ package buildah
 import (
 	"fmt"
 	"io"
+	"net"
 
-	"github.com/opencontainers/runc/libcontainer/configs"
+	"github.com/containers/buildah/define"
+	"github.com/containers/buildah/internal"
+	"github.com/containers/buildah/pkg/sshagent"
+	"github.com/containers/common/libnetwork/etchosts"
+	"github.com/containers/image/v5/types"
+	"github.com/containers/storage/pkg/lockfile"
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/sirupsen/logrus"
 )
 
 const (
 	// runUsingRuntimeCommand is a command we use as a key for reexec
-	runUsingRuntimeCommand = Package + "-oci-runtime"
+	runUsingRuntimeCommand = define.Package + "-oci-runtime"
 )
 
 // TerminalPolicy takes the value DefaultTerminal, WithoutTerminal, or WithTerminal.
@@ -28,7 +35,7 @@ const (
 	WithTerminal
 )
 
-// String converts a TerminalPoliicy into a string.
+// String converts a TerminalPolicy into a string.
 func (t TerminalPolicy) String() string {
 	switch t {
 	case DefaultTerminal:
@@ -42,79 +49,49 @@ func (t TerminalPolicy) String() string {
 }
 
 // NamespaceOption controls how we set up a namespace when launching processes.
-type NamespaceOption struct {
-	// Name specifies the type of namespace, typically matching one of the
-	// ...Namespace constants defined in
-	// github.com/opencontainers/runtime-spec/specs-go.
-	Name string
-	// Host is used to force our processes to use the host's namespace of
-	// this type.
-	Host bool
-	// Path is the path of the namespace to attach our process to, if Host
-	// is not set.  If Host is not set and Path is also empty, a new
-	// namespace will be created for the process that we're starting.
-	// If Name is specs.NetworkNamespace, if Path doesn't look like an
-	// absolute path, it is treated as a comma-separated list of CNI
-	// configuration names which will be selected from among all of the CNI
-	// network configurations which we find.
-	Path string
-}
+type NamespaceOption = define.NamespaceOption
 
 // NamespaceOptions provides some helper methods for a slice of NamespaceOption
 // structs.
-type NamespaceOptions []NamespaceOption
+type NamespaceOptions = define.NamespaceOptions
 
 // IDMappingOptions controls how we set up UID/GID mapping when we set up a
 // user namespace.
-type IDMappingOptions struct {
-	HostUIDMapping bool
-	HostGIDMapping bool
-	UIDMap         []specs.LinuxIDMapping
-	GIDMap         []specs.LinuxIDMapping
-}
+type IDMappingOptions = define.IDMappingOptions
 
 // Isolation provides a way to specify whether we're supposed to use a proper
 // OCI runtime, or some other method for running commands.
-type Isolation int
+type Isolation = define.Isolation
 
 const (
 	// IsolationDefault is whatever we think will work best.
-	IsolationDefault Isolation = iota
+	IsolationDefault = define.IsolationDefault
 	// IsolationOCI is a proper OCI runtime.
-	IsolationOCI
+	IsolationOCI = define.IsolationOCI
 	// IsolationChroot is a more chroot-like environment: less isolation,
 	// but with fewer requirements.
-	IsolationChroot
+	IsolationChroot = define.IsolationChroot
 	// IsolationOCIRootless is a proper OCI runtime in rootless mode.
-	IsolationOCIRootless
+	IsolationOCIRootless = define.IsolationOCIRootless
 )
-
-// String converts a Isolation into a string.
-func (i Isolation) String() string {
-	switch i {
-	case IsolationDefault:
-		return "IsolationDefault"
-	case IsolationOCI:
-		return "IsolationOCI"
-	case IsolationChroot:
-		return "IsolationChroot"
-	case IsolationOCIRootless:
-		return "IsolationOCIRootless"
-	}
-	return fmt.Sprintf("unrecognized isolation type %d", i)
-}
 
 // RunOptions can be used to alter how a command is run in the container.
 type RunOptions struct {
+	// Logger is the logrus logger to write log messages with
+	Logger *logrus.Logger `json:"-"`
 	// Hostname is the hostname we set for the running container.
 	Hostname string
 	// Isolation is either IsolationDefault, IsolationOCI, IsolationChroot, or IsolationOCIRootless.
-	Isolation Isolation
+	Isolation define.Isolation
 	// Runtime is the name of the runtime to run.  It should accept the
 	// same arguments that runc does, and produce similar output.
 	Runtime string
 	// Args adds global arguments for the runtime.
 	Args []string
+	// NoHostname won't create new /etc/hostname file
+	NoHostname bool
+	// NoHosts won't create new /etc/hosts file
+	NoHosts bool
 	// NoPivot adds the --no-pivot runtime flag.
 	NoPivot bool
 	// Mounts are additional mount points which we want to provide.
@@ -125,6 +102,8 @@ type RunOptions struct {
 	User string
 	// WorkingDir is an override for the working directory.
 	WorkingDir string
+	// ContextDir is used as the root directory for the source location for mounts that are of type "bind".
+	ContextDir string
 	// Shell is default shell to run in a container.
 	Shell string
 	// Cmd is an override for the configured default command.
@@ -132,13 +111,13 @@ type RunOptions struct {
 	// Entrypoint is an override for the configured entry point.
 	Entrypoint []string
 	// NamespaceOptions controls how we set up the namespaces for the process.
-	NamespaceOptions NamespaceOptions
+	NamespaceOptions define.NamespaceOptions
 	// ConfigureNetwork controls whether or not network interfaces and
 	// routing are configured for a new network namespace (i.e., when not
 	// joining another's namespace and not just using the host's
 	// namespace), effectively deciding whether or not the process has a
 	// usable network.
-	ConfigureNetwork NetworkConfigurationPolicy
+	ConfigureNetwork define.NetworkConfigurationPolicy
 	// CNIPluginPath is the location of CNI plugin helpers, if they should be
 	// run from a location other than the default location.
 	CNIPluginPath string
@@ -168,34 +147,85 @@ type RunOptions struct {
 	// after processing the AddCapabilities set.  If a capability appears in both
 	// lists, it will be dropped.
 	DropCapabilities []string
-	// Devices are the additional devices to add to the containers
-	Devices []configs.Device
+	// Devices are parsed additional devices to add
+	Devices define.ContainerDevices
+	// DeviceSpecs are unparsed additional devices to add
+	DeviceSpecs []string
+	// Secrets are the available secrets to use
+	Secrets map[string]define.Secret
+	// SSHSources is the available ssh agents to use
+	SSHSources map[string]*sshagent.Source `json:"-"`
+	// RunMounts are unparsed mounts to be added for this run
+	RunMounts []string
+	// Map of stages and container mountpoint if any from stage executor
+	StageMountPoints map[string]internal.StageMountDetails
+	// External Image mounts to be cleaned up.
+	// Buildah run --mount could mount image before RUN calls, RUN could cleanup
+	// them up as well
+	ExternalImageMounts []string
+	// System context of current build
+	SystemContext *types.SystemContext
+	// CgroupManager to use for running OCI containers
+	CgroupManager string
+	// CDIConfigDir is the location of CDI configuration files, if the files in
+	// the default configuration locations shouldn't be used.
+	CDIConfigDir string
+	// CompatBuiltinVolumes causes the contents of locations marked as
+	// volumes in the container's configuration to be set up as bind mounts to
+	// directories which are not in the container's rootfs, hiding changes
+	// made to contents of those changes when the container is subsequently
+	// committed.
+	CompatBuiltinVolumes types.OptionalBool
 }
 
-// Find the configuration for the namespace of the given type.  If there are
-// duplicates, find the _last_ one of the type, since we assume it was appended
-// more recently.
-func (n *NamespaceOptions) Find(namespace string) *NamespaceOption {
-	for i := range *n {
-		j := len(*n) - 1 - i
-		if (*n)[j].Name == namespace {
-			return &((*n)[j])
-		}
-	}
-	return nil
+// RunMountArtifacts are the artifacts created when using a run mount.
+type runMountArtifacts struct {
+	// RunMountTargets are the run mount targets inside the container
+	RunMountTargets []string
+	// TmpFiles are artifacts that need to be removed outside the container
+	TmpFiles []string
+	// Any external images which were mounted inside container
+	MountedImages []string
+	// Agents are the ssh agents started
+	Agents []*sshagent.AgentServer
+	// SSHAuthSock is the path to the ssh auth sock inside the container
+	SSHAuthSock string
+	// TargetLocks to be unlocked if there are any.
+	TargetLocks []*lockfile.LockFile
 }
 
-// AddOrReplace either adds or replaces the configuration for a given namespace.
-func (n *NamespaceOptions) AddOrReplace(options ...NamespaceOption) {
-nextOption:
-	for _, option := range options {
-		for i := range *n {
-			j := len(*n) - 1 - i
-			if (*n)[j].Name == option.Name {
-				(*n)[j] = option
-				continue nextOption
-			}
-		}
-		*n = append(*n, option)
-	}
+// RunMountInfo are the available run mounts for this run
+type runMountInfo struct {
+	// WorkDir is the current working directory inside the container.
+	WorkDir string
+	// ContextDir is the root directory for the source location for bind mounts.
+	ContextDir string
+	// Secrets are the available secrets to use in a RUN
+	Secrets map[string]define.Secret
+	// SSHSources is the available ssh agents to use in a RUN
+	SSHSources map[string]*sshagent.Source `json:"-"`
+	// Map of stages and container mountpoint if any from stage executor
+	StageMountPoints map[string]internal.StageMountDetails
+	// System context of current build
+	SystemContext *types.SystemContext
+}
+
+// IDMaps are the UIDs, GID, and maps for the run
+type IDMaps struct {
+	uidmap     []specs.LinuxIDMapping
+	gidmap     []specs.LinuxIDMapping
+	rootUID    int
+	rootGID    int
+	processUID int
+	processGID int
+}
+
+// netResult type to hold network info for hosts/resolv.conf
+type netResult struct {
+	entries                           etchosts.HostEntries
+	dnsServers                        []string
+	excludeIPs                        []net.IP
+	ipv6                              bool
+	keepHostResolvers                 bool
+	preferredHostContainersInternalIP string
 }

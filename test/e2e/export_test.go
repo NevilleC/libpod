@@ -1,37 +1,17 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
 	"os"
 	"path/filepath"
 
-	. "github.com/containers/podman/v2/test/utils"
-	. "github.com/onsi/ginkgo"
+	. "github.com/containers/podman/v5/test/utils"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
 var _ = Describe("Podman export", func() {
-	var (
-		tempdir    string
-		err        error
-		podmanTest *PodmanTestIntegration
-	)
-
-	BeforeEach(func() {
-		tempdir, err = CreateTempDirInTempDir()
-		if err != nil {
-			os.Exit(1)
-		}
-		podmanTest = PodmanTestCreate(tempdir)
-		podmanTest.Setup()
-		podmanTest.SeedImages()
-	})
-
-	AfterEach(func() {
-		podmanTest.Cleanup()
-		f := CurrentGinkgoTestDescription()
-		processTestResult(f)
-
-	})
 
 	It("podman export output flag", func() {
 		_, ec, cid := podmanTest.RunLsContainer("")
@@ -40,12 +20,12 @@ var _ = Describe("Podman export", func() {
 		outfile := filepath.Join(podmanTest.TempDir, "container.tar")
 		result := podmanTest.Podman([]string{"export", "-o", outfile, cid})
 		result.WaitWithDefaultTimeout()
-		Expect(result.ExitCode()).To(Equal(0))
+		Expect(result).Should(ExitCleanly())
 		_, err := os.Stat(outfile)
-		Expect(err).To(BeNil())
+		Expect(err).ToNot(HaveOccurred())
 
 		err = os.Remove(outfile)
-		Expect(err).To(BeNil())
+		Expect(err).ToNot(HaveOccurred())
 	})
 
 	It("podman container export output flag", func() {
@@ -55,12 +35,12 @@ var _ = Describe("Podman export", func() {
 		outfile := filepath.Join(podmanTest.TempDir, "container.tar")
 		result := podmanTest.Podman([]string{"container", "export", "-o", outfile, cid})
 		result.WaitWithDefaultTimeout()
-		Expect(result.ExitCode()).To(Equal(0))
+		Expect(result).Should(ExitCleanly())
 		_, err := os.Stat(outfile)
-		Expect(err).To(BeNil())
+		Expect(err).ToNot(HaveOccurred())
 
 		err = os.Remove(outfile)
-		Expect(err).To(BeNil())
+		Expect(err).ToNot(HaveOccurred())
 	})
 
 	It("podman export bad filename", func() {
@@ -70,6 +50,6 @@ var _ = Describe("Podman export", func() {
 		outfile := filepath.Join(podmanTest.TempDir, "container:with:colon.tar")
 		result := podmanTest.Podman([]string{"export", "-o", outfile, cid})
 		result.WaitWithDefaultTimeout()
-		Expect(result).To(ExitWithError())
+		Expect(result).To(ExitWithError(125, "invalid filename (should not contain ':')"))
 	})
 })

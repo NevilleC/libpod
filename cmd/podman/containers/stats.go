@@ -1,46 +1,45 @@
 package containers
 
 import (
+	"errors"
 	"fmt"
 	"os"
-	"strings"
-	"text/tabwriter"
-	"text/template"
+	"strconv"
 
 	tm "github.com/buger/goterm"
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/validate"
-	"github.com/containers/podman/v2/libpod/define"
-	"github.com/containers/podman/v2/pkg/cgroups"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/containers/podman/v2/pkg/rootless"
-	"github.com/containers/podman/v2/utils"
+	"github.com/containers/common/pkg/completion"
+	"github.com/containers/common/pkg/report"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	putils "github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/docker/go-units"
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 )
 
 var (
 	statsDescription = "Display percentage of CPU, memory, network I/O, block I/O and PIDs for one or more containers."
 	statsCommand     = &cobra.Command{
-		Use:   "stats [flags] [CONTAINER...]",
-		Short: "Display a live stream of container resource usage statistics",
-		Long:  statsDescription,
-		RunE:  stats,
-		Args:  checkStatOptions,
+		Use:               "stats [options] [CONTAINER...]",
+		Short:             "Display a live stream of container resource usage statistics",
+		Long:              statsDescription,
+		RunE:              stats,
+		Args:              checkStatOptions,
+		ValidArgsFunction: common.AutocompleteContainersRunning,
 		Example: `podman stats --all --no-stream
   podman stats ctrID
   podman stats --no-stream --format "table {{.ID}} {{.Name}} {{.MemUsage}}" ctrID`,
 	}
 
 	containerStatsCommand = &cobra.Command{
-		Use:   statsCommand.Use,
-		Short: statsCommand.Short,
-		Long:  statsCommand.Long,
-		RunE:  statsCommand.RunE,
-		Args:  checkStatOptions,
+		Use:               statsCommand.Use,
+		Short:             statsCommand.Short,
+		Long:              statsCommand.Long,
+		RunE:              statsCommand.RunE,
+		Args:              checkStatOptions,
+		ValidArgsFunction: statsCommand.ValidArgsFunction,
 		Example: `podman container stats --all --no-stream
   podman container stats ctrID
   podman container stats --no-stream --format "table {{.ID}} {{.Name}} {{.MemUsage}}" ctrID`,
@@ -55,35 +54,43 @@ type statsOptionsCLI struct {
 	Latest   bool
 	NoReset  bool
 	NoStream bool
+	Interval int
 }
 
 var (
-	statsOptions       statsOptionsCLI
-	defaultStatsRow    = "{{.ID}}\t{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}\t{{.PIDS}}\n"
-	defaultStatsHeader = "ID\tNAME\tCPU %\tMEM USAGE / LIMIT\tMEM %\tNET IO\tBLOCK IO\tPIDS\n"
+	statsOptions statsOptionsCLI
+	notrunc      bool
 )
 
-func statFlags(flags *pflag.FlagSet) {
+func statFlags(cmd *cobra.Command) {
+	flags := cmd.Flags()
+
 	flags.BoolVarP(&statsOptions.All, "all", "a", false, "Show all containers. Only running containers are shown by default. The default is false")
-	flags.StringVar(&statsOptions.Format, "format", "", "Pretty-print container statistics to JSON or using a Go template")
+
+	formatFlagName := "format"
+	flags.StringVar(&statsOptions.Format, formatFlagName, "", "Pretty-print container statistics to JSON or using a Go template")
+	_ = cmd.RegisterFlagCompletionFunc(formatFlagName, common.AutocompleteFormat(&containerStats{}))
+
+	flags.BoolVar(&notrunc, "no-trunc", false, "Do not truncate output")
 	flags.BoolVar(&statsOptions.NoReset, "no-reset", false, "Disable resetting the screen between intervals")
 	flags.BoolVar(&statsOptions.NoStream, "no-stream", false, "Disable streaming stats and only pull the first result, default setting is false")
+	intervalFlagName := "interval"
+	flags.IntVarP(&statsOptions.Interval, intervalFlagName, "i", 5, "Time in seconds between stats reports")
+	_ = cmd.RegisterFlagCompletionFunc(intervalFlagName, completion.AutocompleteNone)
 }
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: statsCommand,
 	})
-	statFlags(statsCommand.Flags())
+	statFlags(statsCommand)
 	validate.AddLatestFlag(statsCommand, &statsOptions.Latest)
 
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: containerStatsCommand,
 		Parent:  containerCmd,
 	})
-	statFlags(containerStatsCommand.Flags())
+	statFlags(containerStatsCommand)
 	validate.AddLatestFlag(containerStatsCommand, &statsOptions.Latest)
 }
 
@@ -101,28 +108,21 @@ func checkStatOptions(cmd *cobra.Command, args []string) error {
 		opts++
 	}
 	if opts > 1 {
-		return errors.Errorf("--all, --latest and containers cannot be used together")
+		return errors.New("--all, --latest and containers cannot be used together")
 	}
 	return nil
 }
 
 func stats(cmd *cobra.Command, args []string) error {
-	if rootless.IsRootless() {
-		unified, err := cgroups.IsCgroup2UnifiedMode()
-		if err != nil {
-			return err
-		}
-		if !unified {
-			return errors.New("stats is not supported in rootless mode without cgroups v2")
-		}
-	}
-
 	// Convert to the entities options.  We should not leak CLI-only
 	// options into the backend and separate concerns.
 	opts := entities.ContainerStatsOptions{
-		Latest: statsOptions.Latest,
-		Stream: !statsOptions.NoStream,
+		Latest:   statsOptions.Latest,
+		Stream:   !statsOptions.NoStream,
+		Interval: statsOptions.Interval,
+		All:      statsOptions.All,
 	}
+	args = putils.RemoveSlash(args)
 	statsChan, err := registry.ContainerEngine().ContainerStats(registry.Context(), args, opts)
 	if err != nil {
 		return err
@@ -131,15 +131,27 @@ func stats(cmd *cobra.Command, args []string) error {
 		if report.Error != nil {
 			return report.Error
 		}
-		if err := outputStats(report.Stats); err != nil {
-			logrus.Error(err)
+		if err := outputStats(cmd, report.Stats); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-func outputStats(reports []define.ContainerStats) error {
-	if len(statsOptions.Format) < 1 && !statsOptions.NoReset {
+func outputStats(cmd *cobra.Command, reports []define.ContainerStats) error {
+	headers := report.Headers(define.ContainerStats{}, map[string]string{
+		"ID":            "ID",
+		"UpTime":        "CPU TIME",
+		"CPUPerc":       "CPU %",
+		"AVGCPU":        "Avg CPU %",
+		"MemUsage":      "MEM USAGE / LIMIT",
+		"MemUsageBytes": "MEM USAGE / LIMIT",
+		"MemPerc":       "MEM %",
+		"NetIO":         "NET IO",
+		"BlockIO":       "BLOCK IO",
+		"PIDS":          "PIDS",
+	})
+	if !statsOptions.NoReset {
 		tm.Clear()
 		tm.MoveCursor(1, 1)
 		tm.Flush()
@@ -148,32 +160,30 @@ func outputStats(reports []define.ContainerStats) error {
 	for _, r := range reports {
 		stats = append(stats, containerStats{r})
 	}
-	if statsOptions.Format == "json" {
+	if report.IsJSON(statsOptions.Format) {
 		return outputJSON(stats)
 	}
-	format := defaultStatsRow
-	if len(statsOptions.Format) > 0 {
-		format = statsOptions.Format
-		if !strings.HasSuffix(format, "\n") {
-			format += "\n"
-		}
+
+	rpt := report.New(os.Stdout, cmd.Name())
+	defer rpt.Flush()
+
+	var err error
+	if cmd.Flags().Changed("format") {
+		rpt, err = rpt.Parse(report.OriginUser, statsOptions.Format)
+	} else {
+		format := "{{range .}}{{.ID}}\t{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}\t{{.PIDS}}\t{{.UpTime}}\t{{.AVGCPU}}\n{{end -}}"
+		rpt, err = rpt.Parse(report.OriginPodman, format)
 	}
-	format = "{{range . }}" + format + "{{end}}"
-	if len(statsOptions.Format) < 1 {
-		format = defaultStatsHeader + format
-	}
-	tmpl, err := template.New("stats").Parse(format)
 	if err != nil {
 		return err
 	}
-	w := tabwriter.NewWriter(os.Stdout, 8, 2, 2, ' ', 0)
-	if err := tmpl.Execute(w, stats); err != nil {
-		return err
+
+	if rpt.RenderHeaders {
+		if err := rpt.Execute(headers); err != nil {
+			return err
+		}
 	}
-	if err := w.Flush(); err != nil {
-		return err
-	}
-	return nil
+	return rpt.Execute(stats)
 }
 
 type containerStats struct {
@@ -181,6 +191,9 @@ type containerStats struct {
 }
 
 func (s *containerStats) ID() string {
+	if notrunc {
+		return s.ContainerID
+	}
 	return s.ContainerID[0:12]
 }
 
@@ -188,12 +201,28 @@ func (s *containerStats) CPUPerc() string {
 	return floatToPercentString(s.CPU)
 }
 
+func (s *containerStats) AVGCPU() string {
+	return floatToPercentString(s.AvgCPU)
+}
+
+func (s *containerStats) Up() string {
+	return s.UpTime.String()
+}
+
 func (s *containerStats) MemPerc() string {
 	return floatToPercentString(s.ContainerStats.MemPerc)
 }
 
 func (s *containerStats) NetIO() string {
-	return combineHumanValues(s.NetInput, s.NetOutput)
+	var netInput uint64
+	var netOutput uint64
+
+	for _, net := range s.Network {
+		netInput += net.RxBytes
+		netOutput += net.TxBytes
+	}
+
+	return combineHumanValues(netInput, netOutput)
 }
 
 func (s *containerStats) BlockIO() string {
@@ -201,37 +230,36 @@ func (s *containerStats) BlockIO() string {
 }
 
 func (s *containerStats) PIDS() string {
-	if s.PIDs == 0 {
-		// If things go bazinga, return a safe value
-		return "--"
-	}
-	return fmt.Sprintf("%d", s.PIDs)
+	return strconv.FormatUint(s.PIDs, 10)
 }
+
 func (s *containerStats) MemUsage() string {
 	return combineHumanValues(s.ContainerStats.MemUsage, s.ContainerStats.MemLimit)
 }
 
+func (s *containerStats) MemUsageBytes() string {
+	return combineBytesValues(s.ContainerStats.MemUsage, s.ContainerStats.MemLimit)
+}
+
 func floatToPercentString(f float64) string {
-	strippedFloat, err := utils.RemoveScientificNotationFromFloat(f)
-	if err != nil || strippedFloat == 0 {
-		// If things go bazinga, return a safe value
-		return "--"
-	}
-	return fmt.Sprintf("%.2f", strippedFloat) + "%"
+	return fmt.Sprintf("%.2f%%", f)
 }
 
 func combineHumanValues(a, b uint64) string {
-	if a == 0 && b == 0 {
-		return "-- / --"
-	}
 	return fmt.Sprintf("%s / %s", units.HumanSize(float64(a)), units.HumanSize(float64(b)))
+}
+
+func combineBytesValues(a, b uint64) string {
+	return fmt.Sprintf("%s / %s", units.BytesSize(float64(a)), units.BytesSize(float64(b)))
 }
 
 func outputJSON(stats []containerStats) error {
 	type jstat struct {
-		Id         string `json:"id"` //nolint
+		Id         string `json:"id"` //nolint:revive,stylecheck
 		Name       string `json:"name"`
-		CpuPercent string `json:"cpu_percent"` //nolint
+		CPUTime    string `json:"cpu_time"`
+		CpuPercent string `json:"cpu_percent"` //nolint:revive,stylecheck
+		AverageCPU string `json:"avg_cpu"`
 		MemUsage   string `json:"mem_usage"`
 		MemPerc    string `json:"mem_percent"`
 		NetIO      string `json:"net_io"`
@@ -243,7 +271,9 @@ func outputJSON(stats []containerStats) error {
 		jstats = append(jstats, jstat{
 			Id:         j.ID(),
 			Name:       j.Name,
+			CPUTime:    j.Up(),
 			CpuPercent: j.CPUPerc(),
+			AverageCPU: j.AVGCPU(),
 			MemUsage:   j.MemUsage(),
 			MemPerc:    j.MemPerc(),
 			NetIO:      j.NetIO(),

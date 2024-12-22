@@ -1,5 +1,3 @@
-// +build go1.13
-
 package mountinfo
 
 import (
@@ -7,18 +5,27 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+
+	"golang.org/x/sys/unix"
 )
 
-func parseInfoFile(r io.Reader, filter FilterFunc) ([]*Info, error) {
+// GetMountsFromReader retrieves a list of mounts from the
+// reader provided, with an optional filter applied (use nil
+// for no filter). This can be useful in tests or benchmarks
+// that provide fake mountinfo data, or when a source other
+// than /proc/thread-self/mountinfo needs to be read from.
+//
+// This function is Linux-specific.
+func GetMountsFromReader(r io.Reader, filter FilterFunc) ([]*Info, error) {
 	s := bufio.NewScanner(r)
 	out := []*Info{}
-	var err error
 	for s.Scan() {
-		if err = s.Err(); err != nil {
-			return nil, err
-		}
+		var err error
+
 		/*
 		   See http://man7.org/linux/man-pages/man5/proc.5.html
 
@@ -49,7 +56,7 @@ func parseInfoFile(r io.Reader, filter FilterFunc) ([]*Info, error) {
 		numFields := len(fields)
 		if numFields < 10 {
 			// should be at least 10 fields
-			return nil, fmt.Errorf("Parsing '%s' failed: not enough fields (%d)", text, numFields)
+			return nil, fmt.Errorf("parsing '%s' failed: not enough fields (%d)", text, numFields)
 		}
 
 		// separator field
@@ -64,29 +71,47 @@ func parseInfoFile(r io.Reader, filter FilterFunc) ([]*Info, error) {
 		for fields[sepIdx] != "-" {
 			sepIdx--
 			if sepIdx == 5 {
-				return nil, fmt.Errorf("Parsing '%s' failed: missing - separator", text)
+				return nil, fmt.Errorf("parsing '%s' failed: missing - separator", text)
 			}
 		}
 
 		p := &Info{}
 
-		// Fill in the fields that a filter might check
 		p.Mountpoint, err = unescape(fields[4])
 		if err != nil {
-			return nil, fmt.Errorf("Parsing '%s' failed: mount point: %w", fields[4], err)
+			return nil, fmt.Errorf("parsing '%s' failed: mount point: %w", fields[4], err)
 		}
-		p.Fstype, err = unescape(fields[sepIdx+1])
+		p.FSType, err = unescape(fields[sepIdx+1])
 		if err != nil {
-			return nil, fmt.Errorf("Parsing '%s' failed: fstype: %w", fields[sepIdx+1], err)
+			return nil, fmt.Errorf("parsing '%s' failed: fstype: %w", fields[sepIdx+1], err)
 		}
 		p.Source, err = unescape(fields[sepIdx+2])
 		if err != nil {
-			return nil, fmt.Errorf("Parsing '%s' failed: source: %w", fields[sepIdx+2], err)
+			return nil, fmt.Errorf("parsing '%s' failed: source: %w", fields[sepIdx+2], err)
 		}
-		p.VfsOpts = fields[sepIdx+3]
+		p.VFSOptions = fields[sepIdx+3]
 
-		// Run a filter soon so we can skip parsing/adding entries
-		// the caller is not interested in
+		// ignore any numbers parsing errors, as there should not be any
+		p.ID, _ = strconv.Atoi(fields[0])
+		p.Parent, _ = strconv.Atoi(fields[1])
+		mm := strings.SplitN(fields[2], ":", 3)
+		if len(mm) != 2 {
+			return nil, fmt.Errorf("parsing '%s' failed: unexpected major:minor pair %s", text, mm)
+		}
+		p.Major, _ = strconv.Atoi(mm[0])
+		p.Minor, _ = strconv.Atoi(mm[1])
+
+		p.Root, err = unescape(fields[3])
+		if err != nil {
+			return nil, fmt.Errorf("parsing '%s' failed: root: %w", fields[3], err)
+		}
+
+		p.Options = fields[5]
+
+		// zero or more optional fields
+		p.Optional = strings.Join(fields[6:sepIdx], " ")
+
+		// Run the filter after parsing all fields.
 		var skip, stop bool
 		if filter != nil {
 			skip, stop = filter(p)
@@ -95,58 +120,67 @@ func parseInfoFile(r io.Reader, filter FilterFunc) ([]*Info, error) {
 			}
 		}
 
-		// Fill in the rest of the fields
-
-		// ignore any numbers parsing errors, as there should not be any
-		p.ID, _ = strconv.Atoi(fields[0])
-		p.Parent, _ = strconv.Atoi(fields[1])
-		mm := strings.Split(fields[2], ":")
-		if len(mm) != 2 {
-			return nil, fmt.Errorf("Parsing '%s' failed: unexpected minor:major pair %s", text, mm)
-		}
-		p.Major, _ = strconv.Atoi(mm[0])
-		p.Minor, _ = strconv.Atoi(mm[1])
-
-		p.Root, err = unescape(fields[3])
-		if err != nil {
-			return nil, fmt.Errorf("Parsing '%s' failed: root: %w", fields[3], err)
-		}
-
-		p.Opts = fields[5]
-
-		// zero or more optional fields
-		switch {
-		case sepIdx == 6:
-			// zero, do nothing
-		case sepIdx == 7:
-			p.Optional = fields[6]
-		default:
-			p.Optional = strings.Join(fields[6:sepIdx-1], " ")
-		}
-
 		out = append(out, p)
 		if stop {
 			break
 		}
 	}
+	if err := s.Err(); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
-// Parse /proc/self/mountinfo because comparing Dev and ino does not work from
-// bind mounts
-func parseMountTable(filter FilterFunc) ([]*Info, error) {
-	f, err := os.Open("/proc/self/mountinfo")
+var (
+	haveProcThreadSelf     bool
+	haveProcThreadSelfOnce sync.Once
+)
+
+func parseMountTable(filter FilterFunc) (_ []*Info, err error) {
+	haveProcThreadSelfOnce.Do(func() {
+		_, err := os.Stat("/proc/thread-self/mountinfo")
+		haveProcThreadSelf = err == nil
+	})
+
+	// We need to lock ourselves to the current OS thread in order to make sure
+	// that the thread referenced by /proc/thread-self stays alive until we
+	// finish parsing the file.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	var f *os.File
+	if haveProcThreadSelf {
+		f, err = os.Open("/proc/thread-self/mountinfo")
+	} else {
+		// On pre-3.17 kernels (such as CentOS 7), we don't have
+		// /proc/thread-self/ so we need to manually construct
+		// /proc/self/task/<tid>/ as a fallback.
+		f, err = os.Open("/proc/self/task/" + strconv.Itoa(unix.Gettid()) + "/mountinfo")
+		if os.IsNotExist(err) {
+			// If /proc/self/task/... failed, it means that our active pid
+			// namespace doesn't match the pid namespace of the /proc mount. In
+			// this case we just have to make do with /proc/self, since there
+			// is no other way of figuring out our tid in a parent pid
+			// namespace on pre-3.17 kernels.
+			f, err = os.Open("/proc/self/mountinfo")
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	return parseInfoFile(f, filter)
+	return GetMountsFromReader(f, filter)
 }
 
-// PidMountInfo collects the mounts for a specific process ID. If the process
-// ID is unknown, it is better to use `GetMounts` which will inspect
-// "/proc/self/mountinfo" instead.
+// PidMountInfo retrieves the list of mounts from a given process' mount
+// namespace. Unless there is a need to get mounts from a mount namespace
+// different from that of a calling process, use GetMounts.
+//
+// This function is Linux-specific.
+//
+// Deprecated: this will be removed before v1; use GetMountsFromReader with
+// opened /proc/<pid>/mountinfo as an argument instead.
 func PidMountInfo(pid int) ([]*Info, error) {
 	f, err := os.Open(fmt.Sprintf("/proc/%d/mountinfo", pid))
 	if err != nil {
@@ -154,16 +188,16 @@ func PidMountInfo(pid int) ([]*Info, error) {
 	}
 	defer f.Close()
 
-	return parseInfoFile(f, nil)
+	return GetMountsFromReader(f, nil)
 }
 
 // A few specific characters in mountinfo path entries (root and mountpoint)
 // are escaped using a backslash followed by a character's ascii code in octal.
 //
-//   space              -- as \040
-//   tab (aka \t)       -- as \011
-//   newline (aka \n)   -- as \012
-//   backslash (aka \\) -- as \134
+//	space              -- as \040
+//	tab (aka \t)       -- as \011
+//	newline (aka \n)   -- as \012
+//	backslash (aka \\) -- as \134
 //
 // This function converts path from mountinfo back, i.e. it unescapes the above sequences.
 func unescape(path string) (string, error) {
@@ -173,7 +207,7 @@ func unescape(path string) (string, error) {
 	}
 
 	// The following code is UTF-8 transparent as it only looks for some
-	// specific characters (backslach and 0..7) with values < utf8.RuneSelf,
+	// specific characters (backslash and 0..7) with values < utf8.RuneSelf,
 	// and everything else is passed through as is.
 	buf := make([]byte, len(path))
 	bufLen := 0

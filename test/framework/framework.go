@@ -3,11 +3,11 @@ package framework
 import (
 	"fmt"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 )
 
-// TestFramework is used to support commonnly used test features
+// TestFramework is used to support commonly used test features
 type TestFramework struct {
 	setup     func(*TestFramework) error
 	teardown  func(*TestFramework) error
@@ -27,7 +27,7 @@ func NewTestFramework(
 	}
 }
 
-// NilFn is a convenience function which simply does nothing
+// NilFunc is a convenience function which simply does nothing
 func NilFunc(f *TestFramework) error {
 	return nil
 }
@@ -37,7 +37,7 @@ func NilFunc(f *TestFramework) error {
 func (t *TestFramework) Setup() {
 	// Global initialization for the whole framework goes in here
 
-	// Setup the actual test suite
+	// Set up the actual test suite
 	gomega.Expect(t.setup(t)).To(gomega.Succeed())
 }
 

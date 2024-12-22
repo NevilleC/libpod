@@ -1,17 +1,15 @@
 package images
 
 import (
+	"errors"
 	"fmt"
 	"os"
-	"text/tabwriter"
-	"text/template"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/utils"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/pkg/errors"
+	"github.com/containers/common/pkg/report"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 )
 
 var (
@@ -23,18 +21,20 @@ var (
 `
 
 	mountCommand = &cobra.Command{
-		Use:   "mount [flags] [IMAGE...]",
-		Short: "Mount an images's root filesystem",
-		Long:  mountDescription,
-		RunE:  mount,
+		Annotations: map[string]string{
+			registry.UnshareNSRequired: "",
+			registry.ParentNSRequired:  "",
+			registry.EngineMode:        registry.ABIMode,
+		},
+		Use:               "mount [options] [IMAGE...]",
+		Short:             "Mount an image's root filesystem",
+		Long:              mountDescription,
+		RunE:              mount,
+		ValidArgsFunction: common.AutocompleteImages,
 		Example: `podman image mount imgID
   podman image mount imgID1 imgID2 imgID3
   podman image mount
   podman image mount --all`,
-		Annotations: map[string]string{
-			registry.UnshareNSRequired: "",
-			registry.ParentNSRequired:  "",
-		},
 	}
 )
 
@@ -42,64 +42,62 @@ var (
 	mountOpts entities.ImageMountOptions
 )
 
-func mountFlags(flags *pflag.FlagSet) {
+func mountFlags(cmd *cobra.Command) {
+	flags := cmd.Flags()
+
 	flags.BoolVarP(&mountOpts.All, "all", "a", false, "Mount all images")
-	flags.StringVar(&mountOpts.Format, "format", "", "Print the mounted images in specified format (json)")
+
+	formatFlagName := "format"
+	flags.StringVar(&mountOpts.Format, formatFlagName, "", "Print the mounted images in specified format (json)")
+	_ = cmd.RegisterFlagCompletionFunc(formatFlagName, common.AutocompleteFormat(nil))
 }
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode},
 		Command: mountCommand,
 		Parent:  imageCmd,
 	})
-	mountFlags(mountCommand.Flags())
+	mountFlags(mountCommand)
 }
 
-func mount(_ *cobra.Command, args []string) error {
-	var (
-		errs utils.OutputErrors
-	)
+func mount(cmd *cobra.Command, args []string) error {
 	if len(args) > 0 && mountOpts.All {
 		return errors.New("when using the --all switch, you may not pass any image names or IDs")
 	}
+
 	reports, err := registry.ImageEngine().Mount(registry.GetContext(), args, mountOpts)
 	if err != nil {
 		return err
 	}
-	if len(args) > 0 || mountOpts.All {
-		for _, r := range reports {
-			if r.Err == nil {
-				fmt.Println(r.Path)
-				continue
-			}
-			errs = append(errs, r.Err)
+
+	if len(args) == 1 && mountOpts.Format == "" && !mountOpts.All {
+		if len(reports) != 1 {
+			return fmt.Errorf("internal error: expected 1 report but got %d", len(reports))
 		}
-		return errs.PrintErrors()
+		fmt.Println(reports[0].Path)
+		return nil
 	}
 
-	switch mountOpts.Format {
-	case "json":
+	switch {
+	case report.IsJSON(mountOpts.Format):
 		return printJSON(reports)
-	case "":
-		// do nothing
+	case mountOpts.Format == "":
+		break // see default format below
 	default:
-		return errors.Errorf("unknown --format argument: %s", mountOpts.Format)
+		return fmt.Errorf("unknown --format argument: %q", mountOpts.Format)
 	}
 
 	mrs := make([]mountReporter, 0, len(reports))
 	for _, r := range reports {
 		mrs = append(mrs, mountReporter{r})
 	}
-	row := "{{.ID}} {{.Path}}\n"
-	format := "{{range . }}" + row + "{{end}}"
-	tmpl, err := template.New("mounts").Parse(format)
+
+	rpt, err := report.New(os.Stdout, cmd.Name()).Parse(report.OriginPodman, "{{range . }}{{.ID}}\t{{.Path}}\n{{end -}}")
 	if err != nil {
 		return err
 	}
-	w := tabwriter.NewWriter(os.Stdout, 8, 2, 2, ' ', 0)
-	defer w.Flush()
-	return tmpl.Execute(w, mrs)
+	defer rpt.Flush()
+	return rpt.Execute(mrs)
 }
 
 func printJSON(reports []*entities.ImageMountReport) error {

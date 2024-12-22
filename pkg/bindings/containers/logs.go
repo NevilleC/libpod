@@ -1,61 +1,50 @@
 package containers
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 
-	"github.com/containers/podman/v2/pkg/bindings"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/pkg/bindings"
 )
 
 // Logs obtains a container's logs given the options provided.  The logs are then sent to the
 // stdout|stderr channels as strings.
-func Logs(ctx context.Context, nameOrID string, opts LogOptions, stdoutChan, stderrChan chan string) error {
+func Logs(ctx context.Context, nameOrID string, options *LogOptions, stdoutChan, stderrChan chan string) error {
+	if options == nil {
+		options = new(LogOptions)
+	}
 	conn, err := bindings.GetClient(ctx)
 	if err != nil {
 		return err
 	}
-	params := url.Values{}
-	if opts.Follow != nil {
-		params.Set("follow", strconv.FormatBool(*opts.Follow))
-	}
-	if opts.Since != nil {
-		params.Set("since", *opts.Since)
-	}
-	if opts.Stderr != nil {
-		params.Set("stderr", strconv.FormatBool(*opts.Stderr))
-	}
-	if opts.Stdout != nil {
-		params.Set("stdout", strconv.FormatBool(*opts.Stdout))
-	}
-	if opts.Tail != nil {
-		params.Set("tail", *opts.Tail)
-	}
-	if opts.Timestamps != nil {
-		params.Set("timestamps", strconv.FormatBool(*opts.Timestamps))
-	}
-	if opts.Until != nil {
-		params.Set("until", *opts.Until)
-	}
-	// The API requires either stdout|stderr be used. If neither are specified, we specify stdout
-	if opts.Stdout == nil && opts.Stderr == nil {
-		params.Set("stdout", strconv.FormatBool(true))
-	}
-	response, err := conn.DoRequest(nil, http.MethodGet, "/containers/%s/logs", params, nil, nameOrID)
+	params, err := options.ToParams()
 	if err != nil {
 		return err
+	}
+	// The API requires either stdout|stderr be used. If neither are specified, we specify stdout
+	if options.Stdout == nil && options.Stderr == nil {
+		params.Set("stdout", strconv.FormatBool(true))
+	}
+	response, err := conn.DoRequest(ctx, nil, http.MethodGet, "/containers/%s/logs", params, nil, nameOrID)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+
+	// if not success handle and return possible error message
+	if !(response.IsSuccess() || response.IsInformational()) {
+		return response.Process(nil)
 	}
 
 	buffer := make([]byte, 1024)
 	for {
 		fd, l, err := DemuxHeader(response.Body, buffer)
 		if err != nil {
-			if errors.Is(err, io.EOF) {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				return nil
 			}
 			return err
@@ -64,7 +53,6 @@ func Logs(ctx context.Context, nameOrID string, opts LogOptions, stdoutChan, std
 		if err != nil {
 			return err
 		}
-		frame = bytes.Replace(frame[0:l], []byte{13}, []byte{10}, -1)
 
 		switch fd {
 		case 0:
@@ -74,7 +62,7 @@ func Logs(ctx context.Context, nameOrID string, opts LogOptions, stdoutChan, std
 		case 2:
 			stderrChan <- string(frame)
 		case 3:
-			return errors.New("error from service in stream: " + string(frame))
+			return errors.New("from service in stream: " + string(frame))
 		default:
 			return fmt.Errorf("unrecognized input header: %d", fd)
 		}

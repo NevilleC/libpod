@@ -2,10 +2,7 @@ package dbus
 
 import (
 	"context"
-	"errors"
 )
-
-var errSignature = errors.New("dbus: mismatched signature")
 
 // Call represents a pending or completed method call.
 type Call struct {
@@ -23,6 +20,15 @@ type Call struct {
 
 	// Holds the response once the call is done.
 	Body []interface{}
+
+	// ResponseSequence stores the sequence number of the DBus message containing
+	// the call response (or error). This can be compared to the sequence number
+	// of other call responses and signals on this connection to determine their
+	// relative ordering on the underlying DBus connection.
+	// For errors, ResponseSequence is populated only if the error came from a
+	// DBusMessage that was received or if there was an error receiving. In case of
+	// failure to make the call, ResponseSequence will be NoSequence.
+	ResponseSequence Sequence
 
 	// tracks context and canceler
 	ctx         context.Context

@@ -6,17 +6,18 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
+	"time"
 
-	"github.com/containers/podman/v2/libpod/define"
 	"github.com/containers/storage/pkg/archive"
-	"github.com/pkg/errors"
+	"github.com/containers/storage/pkg/chrootarchive"
 	"github.com/sirupsen/logrus"
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 )
 
 // ExecCmd executes a command with args and returns its output as a string along
-// with an error, if any
+// with an error, if any.
 func ExecCmd(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
 	var stdout bytes.Buffer
@@ -38,9 +39,7 @@ func ExecCmdWithStdStreams(stdin io.Reader, stdout, stderr io.Writer, env []stri
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	if env != nil {
-		cmd.Env = env
-	}
+	cmd.Env = env
 
 	err := cmd.Run()
 	if err != nil {
@@ -50,61 +49,20 @@ func ExecCmdWithStdStreams(stdin io.Reader, stdout, stderr io.Writer, env []stri
 	return nil
 }
 
-// ErrDetach is an error indicating that the user manually detached from the
-// container.
-var ErrDetach = define.ErrDetach
-
-// CopyDetachable is similar to io.Copy but support a detach key sequence to break out.
-func CopyDetachable(dst io.Writer, src io.Reader, keys []byte) (written int64, err error) {
-	buf := make([]byte, 32*1024)
-	for {
-		nr, er := src.Read(buf)
-		if nr > 0 {
-			preservBuf := []byte{}
-			for i, key := range keys {
-				preservBuf = append(preservBuf, buf[0:nr]...)
-				if nr != 1 || buf[0] != key {
-					break
-				}
-				if i == len(keys)-1 {
-					return 0, ErrDetach
-				}
-				nr, er = src.Read(buf)
-			}
-			var nw int
-			var ew error
-			if len(preservBuf) > 0 {
-				nw, ew = dst.Write(preservBuf)
-				nr = len(preservBuf)
-			} else {
-				nw, ew = dst.Write(buf[0:nr])
-			}
-			if nw > 0 {
-				written += int64(nw)
-			}
-			if ew != nil {
-				err = ew
-				break
-			}
-			if nr != nw {
-				err = io.ErrShortWrite
-				break
-			}
-		}
-		if er != nil {
-			if er != io.EOF {
-				err = er
-			}
-			break
-		}
-	}
-	return written, err
-}
-
 // UntarToFileSystem untars an os.file of a tarball to a destination in the filesystem
 func UntarToFileSystem(dest string, tarball *os.File, options *archive.TarOptions) error {
 	logrus.Debugf("untarring %s", tarball.Name())
 	return archive.Untar(tarball, dest, options)
+}
+
+// Creates a new tar file and writes bytes from io.ReadCloser
+func CreateTarFromSrc(source string, dest string) error {
+	file, err := os.Create(dest)
+	if err != nil {
+		return fmt.Errorf("could not create tarball file '%s': %w", dest, err)
+	}
+	defer file.Close()
+	return TarChrootToFilesystem(source, file)
 }
 
 // TarToFilesystem creates a tarball from source and writes to an os.file
@@ -114,6 +72,7 @@ func TarToFilesystem(source string, tarball *os.File) error {
 	if err != nil {
 		return err
 	}
+	defer tb.Close()
 	_, err = io.Copy(tarball, tb)
 	if err != nil {
 		return err
@@ -128,20 +87,56 @@ func Tar(source string) (io.ReadCloser, error) {
 	return archive.Tar(source, archive.Uncompressed)
 }
 
-// RemoveScientificNotationFromFloat returns a float without any
-// scientific notation if the number has any.
-// golang does not handle conversion of float64s that have scientific
-// notation in them and otherwise stinks.  please replace this if you have
-// a better implementation.
-func RemoveScientificNotationFromFloat(x float64) (float64, error) {
-	bigNum := strconv.FormatFloat(x, 'g', -1, 64)
-	breakPoint := strings.IndexAny(bigNum, "Ee")
-	if breakPoint > 0 {
-		bigNum = bigNum[:breakPoint]
-	}
-	result, err := strconv.ParseFloat(bigNum, 64)
+// TarChrootToFilesystem creates a tarball from source and writes to an os.file
+// provided while chrooted to the source.
+func TarChrootToFilesystem(source string, tarball *os.File) error {
+	tb, err := TarWithChroot(source)
 	if err != nil {
-		return x, errors.Wrapf(err, "unable to remove scientific number from calculations")
+		return err
 	}
-	return result, nil
+	defer tb.Close()
+	_, err = io.Copy(tarball, tb)
+	if err != nil {
+		return err
+	}
+	logrus.Debugf("wrote tarball file %s", tarball.Name())
+	return nil
+}
+
+// TarWithChroot creates a tarball from source and returns a readcloser of it
+// while chrooted to the source.
+func TarWithChroot(source string) (io.ReadCloser, error) {
+	logrus.Debugf("creating tarball of %s", source)
+	return chrootarchive.Tar(source, nil, source)
+}
+
+// GuardedRemoveAll functions much like os.RemoveAll but
+// will not delete certain catastrophic paths.
+func GuardedRemoveAll(path string) error {
+	if path == "" || path == "/" {
+		return fmt.Errorf("refusing to recursively delete `%s`", path)
+	}
+	return os.RemoveAll(path)
+}
+
+func ProgressBar(prefix string, size int64, onComplete string) (*mpb.Progress, *mpb.Bar) {
+	p := mpb.New(
+		mpb.WithWidth(80), // Do not go below 80, see bug #17718
+		mpb.WithRefreshRate(180*time.Millisecond),
+	)
+
+	bar := p.AddBar(size,
+		mpb.BarFillerClearOnComplete(),
+		mpb.PrependDecorators(
+			decor.OnComplete(decor.Name(prefix), onComplete),
+		),
+		mpb.AppendDecorators(
+			decor.OnComplete(decor.CountersKibiByte("%.1f / %.1f"), ""),
+		),
+	)
+	if size == 0 {
+		bar.SetTotal(0, true)
+	}
+
+	return p, bar
 }

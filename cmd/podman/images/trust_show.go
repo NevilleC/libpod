@@ -3,23 +3,26 @@ package images
 import (
 	"fmt"
 	"os"
-	"text/tabwriter"
-	"text/template"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/pkg/domain/entities"
+	"github.com/containers/common/pkg/report"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
 )
 
 var (
+	noHeading            bool
 	showTrustDescription = "Display trust policy for the system"
 	showTrustCommand     = &cobra.Command{
-		Use:     "show [flags] [REGISTRY]",
-		Short:   "Display trust policy for the system",
-		Long:    showTrustDescription,
-		RunE:    showTrust,
-		Args:    cobra.MaximumNArgs(1),
-		Example: "",
+		Annotations:       map[string]string{registry.EngineMode: registry.ABIMode},
+		Use:               "show [options] [REGISTRY]",
+		Short:             "Display trust policy for the system",
+		Long:              showTrustDescription,
+		RunE:              showTrust,
+		Args:              cobra.MaximumNArgs(1),
+		ValidArgsFunction: common.AutocompleteRegistries,
+		Example:           "",
 	}
 )
 
@@ -29,7 +32,6 @@ var (
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode},
 		Command: showTrustCommand,
 		Parent:  trustCmd,
 	})
@@ -39,40 +41,47 @@ func init() {
 	showFlags.BoolVar(&showTrustOptions.Raw, "raw", false, "Output raw policy file")
 	_ = showFlags.MarkHidden("policypath")
 	showFlags.StringVar(&showTrustOptions.RegistryPath, "registrypath", "", "")
+	showFlags.BoolVarP(&noHeading, "noheading", "n", false, "Do not print column headings")
 	_ = showFlags.MarkHidden("registrypath")
-
 }
 
 func showTrust(cmd *cobra.Command, args []string) error {
-	report, err := registry.ImageEngine().ShowTrust(registry.Context(), args, showTrustOptions)
+	trust, err := registry.ImageEngine().ShowTrust(registry.Context(), args, showTrustOptions)
 	if err != nil {
 		return err
 	}
-	if showTrustOptions.Raw {
-		fmt.Println(report.Raw)
+
+	switch {
+	case showTrustOptions.Raw:
+		fmt.Println(string(trust.Raw))
 		return nil
-	}
-	if showTrustOptions.JSON {
-		b, err := json.MarshalIndent(report.Policies, "", "  ")
+	case showTrustOptions.JSON:
+		b, err := json.MarshalIndent(trust.Policies, "", "  ")
 		if err != nil {
 			return err
 		}
 		fmt.Println(string(b))
 		return nil
 	}
+	rpt := report.New(os.Stdout, cmd.Name())
+	defer rpt.Flush()
 
-	row := "{{.RepoName}}\t{{.Type}}\t{{.GPGId}}\t{{.SignatureStore}}\n"
-	format := "{{range . }}" + row + "{{end}}"
-	tmpl, err := template.New("listContainers").Parse(format)
+	hdrs := report.Headers(imageReporter{}, map[string]string{
+		"Transport":      "Transport",
+		"RepoName":       "Name",
+		"Type":           "Type",
+		"GPGId":          "Id",
+		"SignatureStore": "Store",
+	})
+	rpt, err = rpt.Parse(report.OriginPodman,
+		"{{range . }}{{.Transport}}\t{{.RepoName}}\t{{.Type}}\t{{.GPGId}}\t{{.SignatureStore}}\n{{end -}}")
 	if err != nil {
 		return err
 	}
-	w := tabwriter.NewWriter(os.Stdout, 8, 2, 2, ' ', 0)
-	if err := tmpl.Execute(w, report.Policies); err != nil {
-		return err
+	if !noHeading {
+		if err := rpt.Execute(hdrs); err != nil {
+			return err
+		}
 	}
-	if err := w.Flush(); err != nil {
-		return err
-	}
-	return nil
+	return rpt.Execute(trust.Policies)
 }

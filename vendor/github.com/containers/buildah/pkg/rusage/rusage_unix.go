@@ -1,12 +1,11 @@
-// +build !windows
+//go:build !windows
 
 package rusage
 
 import (
+	"fmt"
 	"syscall"
 	"time"
-
-	"github.com/pkg/errors"
 )
 
 func mkduration(tv syscall.Timeval) time.Duration {
@@ -17,7 +16,7 @@ func get() (Rusage, error) {
 	var rusage syscall.Rusage
 	err := syscall.Getrusage(syscall.RUSAGE_CHILDREN, &rusage)
 	if err != nil {
-		return Rusage{}, errors.Wrapf(err, "error getting resource usage")
+		return Rusage{}, fmt.Errorf("getting resource usage: %w", err)
 	}
 	r := Rusage{
 		Date:     time.Now(),

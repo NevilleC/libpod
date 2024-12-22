@@ -1,15 +1,16 @@
+//go:build !remote
+
 package server
 
 import (
 	"net/http"
 
-	"github.com/containers/podman/v2/pkg/api/handlers/compat"
-	"github.com/containers/podman/v2/pkg/api/handlers/libpod"
+	"github.com/containers/podman/v5/pkg/api/handlers/compat"
 	"github.com/gorilla/mux"
 )
 
-func (s *APIServer) registerAchiveHandlers(r *mux.Router) error {
-	// swagger:operation PUT /containers/{name}/archive compat putArchive
+func (s *APIServer) registerArchiveHandlers(r *mux.Router) error {
+	// swagger:operation PUT /containers/{name}/archive compat PutContainerArchive
 	// ---
 	//  summary: Put files into a container
 	//  description: Put a tar archive of files into a container
@@ -45,15 +46,15 @@ func (s *APIServer) registerAchiveHandlers(r *mux.Router) error {
 	//    200:
 	//      description: no error
 	//    400:
-	//      $ref: "#/responses/BadParamError"
+	//      $ref: "#/responses/badParamError"
 	//    403:
 	//      description: the container rootfs is read-only
 	//    404:
-	//      $ref: "#/responses/NoSuchContainer"
+	//      $ref: "#/responses/containerNotFound"
 	//    500:
-	//      $ref: "#/responses/InternalError"
+	//      $ref: "#/responses/internalError"
 
-	// swagger:operation GET /containers/{name}/archive compat getArchive
+	// swagger:operation GET /containers/{name}/archive compat ContainerArchive
 	// ---
 	//  summary: Get files from a container
 	//  description: Get a tar archive of files from a container
@@ -79,11 +80,11 @@ func (s *APIServer) registerAchiveHandlers(r *mux.Router) error {
 	//       type: string
 	//       format: binary
 	//    400:
-	//      $ref: "#/responses/BadParamError"
+	//      $ref: "#/responses/badParamError"
 	//    404:
-	//      $ref: "#/responses/NoSuchContainer"
+	//      $ref: "#/responses/containerNotFound"
 	//    500:
-	//      $ref: "#/responses/InternalError"
+	//      $ref: "#/responses/internalError"
 	r.HandleFunc(VersionedPath("/containers/{name}/archive"), s.APIHandler(compat.Archive)).Methods(http.MethodGet, http.MethodPut, http.MethodHead)
 	// Added non version path to URI to support docker non versioned paths
 	r.HandleFunc("/containers/{name}/archive", s.APIHandler(compat.Archive)).Methods(http.MethodGet, http.MethodPut, http.MethodHead)
@@ -92,7 +93,7 @@ func (s *APIServer) registerAchiveHandlers(r *mux.Router) error {
 		Libpod
 	*/
 
-	// swagger:operation POST /libpod/containers/{name}/copy libpod libpodPutArchive
+	// swagger:operation PUT /libpod/containers/{name}/archive libpod PutContainerArchiveLibpod
 	// ---
 	//  summary: Copy files into a container
 	//  description: Copy a tar archive of files into a container
@@ -125,15 +126,15 @@ func (s *APIServer) registerAchiveHandlers(r *mux.Router) error {
 	//    200:
 	//      description: no error
 	//    400:
-	//      $ref: "#/responses/BadParamError"
+	//      $ref: "#/responses/badParamError"
 	//    403:
 	//      description: the container rootfs is read-only
 	//    404:
-	//      $ref: "#/responses/NoSuchContainer"
+	//      $ref: "#/responses/containerNotFound"
 	//    500:
-	//      $ref: "#/responses/InternalError"
+	//      $ref: "#/responses/internalError"
 
-	// swagger:operation GET /libpod/containers/{name}/copy libpod libpodGetArchive
+	// swagger:operation GET /libpod/containers/{name}/archive libpod ContainerArchiveLibpod
 	// ---
 	//  summary: Copy files from a container
 	//  description: Copy a tar archive of files from a container
@@ -152,6 +153,10 @@ func (s *APIServer) registerAchiveHandlers(r *mux.Router) error {
 	//     type: string
 	//     description: Path to a directory in the container to extract
 	//     required: true
+	//   - in: query
+	//     name: rename
+	//     type: string
+	//     description: JSON encoded map[string]string to translate paths
 	//  responses:
 	//    200:
 	//      description: no error
@@ -159,13 +164,12 @@ func (s *APIServer) registerAchiveHandlers(r *mux.Router) error {
 	//       type: string
 	//       format: binary
 	//    400:
-	//      $ref: "#/responses/BadParamError"
+	//      $ref: "#/responses/badParamError"
 	//    404:
-	//      $ref: "#/responses/NoSuchContainer"
+	//      $ref: "#/responses/containerNotFound"
 	//    500:
-	//      $ref: "#/responses/InternalError"
-	r.HandleFunc(VersionedPath("/libpod/containers/{name}/copy"), s.APIHandler(libpod.Archive)).Methods(http.MethodGet, http.MethodPost)
-	r.HandleFunc(VersionedPath("/libpod/containers/{name}/archive"), s.APIHandler(libpod.Archive)).Methods(http.MethodGet, http.MethodPost)
+	//      $ref: "#/responses/internalError"
+	r.HandleFunc(VersionedPath("/libpod/containers/{name}/archive"), s.APIHandler(compat.Archive)).Methods(http.MethodGet, http.MethodPut, http.MethodHead)
 
 	return nil
 }

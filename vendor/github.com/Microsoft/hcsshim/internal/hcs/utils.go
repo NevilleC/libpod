@@ -1,3 +1,5 @@
+//go:build windows
+
 package hcs
 
 import (
@@ -7,18 +9,19 @@ import (
 
 	"github.com/Microsoft/go-winio"
 	diskutil "github.com/Microsoft/go-winio/vhd"
+	"github.com/Microsoft/hcsshim/computestorage"
 	"github.com/pkg/errors"
 	"golang.org/x/sys/windows"
 )
 
-// makeOpenFiles calls winio.MakeOpenFile for each handle in a slice but closes all the handles
+// makeOpenFiles calls winio.NewOpenFile for each handle in a slice but closes all the handles
 // if there is an error.
 func makeOpenFiles(hs []syscall.Handle) (_ []io.ReadWriteCloser, err error) {
 	fs := make([]io.ReadWriteCloser, len(hs))
 	for i, h := range hs {
 		if h != syscall.Handle(0) {
 			if err == nil {
-				fs[i], err = winio.MakeOpenFile(h)
+				fs[i], err = winio.NewOpenFile(windows.Handle(h))
 			}
 			if err != nil {
 				syscall.Close(h)
@@ -36,7 +39,7 @@ func makeOpenFiles(hs []syscall.Handle) (_ []io.ReadWriteCloser, err error) {
 	return fs, nil
 }
 
-// creates a VHD formatted with NTFS of size `sizeGB` at the given `vhdPath`.
+// CreateNTFSVHD creates a VHD formatted with NTFS of size `sizeGB` at the given `vhdPath`.
 func CreateNTFSVHD(ctx context.Context, vhdPath string, sizeGB uint32) (err error) {
 	if err := diskutil.CreateVhdx(vhdPath, sizeGB, 1); err != nil {
 		return errors.Wrap(err, "failed to create VHD")
@@ -53,7 +56,7 @@ func CreateNTFSVHD(ctx context.Context, vhdPath string, sizeGB uint32) (err erro
 		}
 	}()
 
-	if err := hcsFormatWritableLayerVhd(uintptr(vhd)); err != nil {
+	if err := computestorage.FormatWritableLayerVhd(ctx, windows.Handle(vhd)); err != nil {
 		return errors.Wrap(err, "failed to format VHD")
 	}
 

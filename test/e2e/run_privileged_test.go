@@ -1,3 +1,5 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
@@ -5,10 +7,10 @@ import (
 	"strconv"
 	"strings"
 
-	. "github.com/containers/podman/v2/test/utils"
-	. "github.com/onsi/ginkgo"
+	. "github.com/containers/podman/v5/test/utils"
+	"github.com/moby/sys/capability"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"github.com/syndtr/gocapability/capability"
 )
 
 // helper function for confirming that container capabilities are equal
@@ -16,124 +18,140 @@ import (
 // know about at compile time. That is: the kernel may have more caps
 // available than we are aware of, leading to host=FFF... and ctr=3FF...
 // because the latter is all we request. Accept that.
-func containerCapMatchesHost(ctr_cap string, host_cap string) {
-	ctr_cap_n, err := strconv.ParseUint(ctr_cap, 16, 64)
-	Expect(err).NotTo(HaveOccurred(), "Error parsing %q as hex", ctr_cap)
+func containerCapMatchesHost(ctrCap string, hostCap string) {
+	if isRootless() {
+		return
+	}
+	ctrCapN, err := strconv.ParseUint(ctrCap, 16, 64)
+	Expect(err).NotTo(HaveOccurred(), "Error parsing %q as hex", ctrCap)
 
-	host_cap_n, err := strconv.ParseUint(host_cap, 16, 64)
-	Expect(err).NotTo(HaveOccurred(), "Error parsing %q as hex", host_cap)
+	hostCapN, err := strconv.ParseUint(hostCap, 16, 64)
+	Expect(err).NotTo(HaveOccurred(), "Error parsing %q as hex", hostCap)
 
-	// host caps can never be zero (except rootless, which we don't test).
+	// host caps can never be zero (except rootless).
 	// and host caps must always be a superset (inclusive) of container
-	Expect(host_cap_n).To(BeNumerically(">", 0), "host cap %q should be nonzero", host_cap)
-	Expect(host_cap_n).To(BeNumerically(">=", ctr_cap_n), "host cap %q should never be less than container cap %q", host_cap, ctr_cap)
-
-	host_cap_masked := host_cap_n & (1<<len(capability.List()) - 1)
-	Expect(ctr_cap_n).To(Equal(host_cap_masked), "container cap %q is not a subset of host cap %q", ctr_cap, host_cap)
+	Expect(hostCapN).To(BeNumerically(">", 0), "host cap %q should be nonzero", hostCap)
+	Expect(hostCapN).To(BeNumerically(">=", ctrCapN), "host cap %q should never be less than container cap %q", hostCap, ctrCap)
+	hostCapMasked := hostCapN & (1<<len(capability.ListKnown()) - 1)
+	Expect(ctrCapN).To(Equal(hostCapMasked), "container cap %q is not a subset of host cap %q", ctrCap, hostCap)
 }
 
 var _ = Describe("Podman privileged container tests", func() {
-	var (
-		tempdir    string
-		err        error
-		podmanTest *PodmanTestIntegration
-	)
-
-	BeforeEach(func() {
-		tempdir, err = CreateTempDirInTempDir()
-		if err != nil {
-			os.Exit(1)
-		}
-		podmanTest = PodmanTestCreate(tempdir)
-		podmanTest.Setup()
-		podmanTest.SeedImages()
-	})
-
-	AfterEach(func() {
-		podmanTest.Cleanup()
-		f := CurrentGinkgoTestDescription()
-		processTestResult(f)
-
-	})
 
 	It("podman privileged make sure sys is mounted rw", func() {
-		session := podmanTest.Podman([]string{"run", "--privileged", "busybox", "mount"})
+		session := podmanTest.Podman([]string{"run", "--privileged", BB, "mount"})
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
-		ok, lines := session.GrepString("sysfs")
-		Expect(ok).To(BeTrue())
-		Expect(lines[0]).To(ContainSubstring("sysfs (rw,"))
+		Expect(session).Should(ExitCleanly())
+		Expect(session.OutputToString()).To(ContainSubstring("sysfs (rw,"))
 	})
 
 	It("podman privileged CapEff", func() {
-		SkipIfRootless()
-		host_cap := SystemExec("awk", []string{"/^CapEff/ { print $2 }", "/proc/self/status"})
-		Expect(host_cap.ExitCode()).To(Equal(0))
+		hostCap := SystemExec("awk", []string{"/^CapEff/ { print $2 }", "/proc/self/status"})
+		Expect(hostCap).Should(ExitCleanly())
 
-		session := podmanTest.Podman([]string{"run", "--privileged", "busybox", "awk", "/^CapEff/ { print $2 }", "/proc/self/status"})
+		session := podmanTest.Podman([]string{"run", "--privileged", BB, "awk", "/^CapEff/ { print $2 }", "/proc/self/status"})
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
-		containerCapMatchesHost(session.OutputToString(), host_cap.OutputToString())
+		containerCapMatchesHost(session.OutputToString(), hostCap.OutputToString())
 	})
 
 	It("podman cap-add CapEff", func() {
-		SkipIfRootless()
 		// Get caps of current process
-		host_cap := SystemExec("awk", []string{"/^CapEff/ { print $2 }", "/proc/self/status"})
-		Expect(host_cap.ExitCode()).To(Equal(0))
+		hostCap := SystemExec("awk", []string{"/^CapEff/ { print $2 }", "/proc/self/status"})
+		Expect(hostCap).Should(ExitCleanly())
 
-		session := podmanTest.Podman([]string{"run", "--cap-add", "all", "busybox", "awk", "/^CapEff/ { print $2 }", "/proc/self/status"})
+		session := podmanTest.Podman([]string{"run", "--cap-add", "all", BB, "awk", "/^CapEff/ { print $2 }", "/proc/self/status"})
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
-		containerCapMatchesHost(session.OutputToString(), host_cap.OutputToString())
+		containerCapMatchesHost(session.OutputToString(), hostCap.OutputToString())
+	})
+
+	It("podman cap-add CapEff with --user", func() {
+		// Get caps of current process
+		hostCap := SystemExec("awk", []string{"/^CapEff/ { print $2 }", "/proc/self/status"})
+		Expect(hostCap).Should(ExitCleanly())
+
+		session := podmanTest.Podman([]string{"run", "--user=bin", "--cap-add", "all", BB, "awk", "/^CapEff/ { print $2 }", "/proc/self/status"})
+		session.WaitWithDefaultTimeout()
+		Expect(session).Should(ExitCleanly())
+
+		containerCapMatchesHost(session.OutputToString(), hostCap.OutputToString())
 	})
 
 	It("podman cap-drop CapEff", func() {
-		session := podmanTest.Podman([]string{"run", "--cap-drop", "all", "busybox", "grep", "CapEff", "/proc/self/status"})
+		session := podmanTest.Podman([]string{"run", "--cap-drop", "all", BB, "grep", "CapEff", "/proc/self/status"})
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 		capEff := strings.Split(session.OutputToString(), " ")
 		Expect("0000000000000000").To(Equal(capEff[1]))
 	})
 
-	It("podman non-privileged should have very few devices", func() {
-		session := podmanTest.Podman([]string{"run", "-t", "busybox", "ls", "-l", "/dev"})
+	It("podman privileged should disable seccomp by default", func() {
+		hostSeccomp := SystemExec("grep", []string{"-Ei", "^Seccomp:\\s+0$", "/proc/self/status"})
+		Expect(hostSeccomp).Should(ExitCleanly())
+
+		session := podmanTest.Podman([]string{"run", "--privileged", ALPINE, "grep", "-Ei", "^Seccomp:\\s+0$", "/proc/self/status"})
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
-		Expect(len(session.OutputToStringArray())).To(Equal(17))
+		Expect(session).Should(ExitCleanly())
+	})
+
+	It("podman non-privileged should have very few devices", func() {
+		session := podmanTest.Podman([]string{"run", "-t", BB, "ls", "-l", "/dev"})
+		session.WaitWithDefaultTimeout()
+		Expect(session).Should(ExitCleanly())
+		Expect(session.OutputToStringArray()).To(HaveLen(17))
 	})
 
 	It("podman privileged should inherit host devices", func() {
-		SkipIfRootless()
 		session := podmanTest.Podman([]string{"run", "--privileged", ALPINE, "ls", "-l", "/dev"})
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 		Expect(len(session.OutputToStringArray())).To(BeNumerically(">", 20))
 	})
 
-	It("run no-new-privileges test", func() {
-		// Check if our kernel is new enough
-		k, err := IsKernelNewerThan("4.14")
-		Expect(err).To(BeNil())
-		if !k {
-			Skip("Kernel is not new enough to test this feature")
-		}
+	It("podman privileged should restart after host devices change", func() {
+		containerName := "privileged-restart-test"
+		SkipIfRootless("Cannot create devices in /dev in rootless mode")
+		// path must be unique to this test, not used anywhere else
+		devdir := "/dev/devdirprivrestart"
+		Expect(os.MkdirAll(devdir, os.ModePerm)).To(Succeed())
+		defer os.RemoveAll(devdir)
 
+		mknod := SystemExec("mknod", []string{devdir + "/null", "c", "1", "3"})
+		mknod.WaitWithDefaultTimeout()
+		Expect(mknod).Should(ExitCleanly())
+
+		session := podmanTest.Podman([]string{"run", "--name=" + containerName, "--privileged", fedoraMinimal, "ls", "/dev"})
+		session.WaitWithDefaultTimeout()
+		Expect(session).Should(ExitCleanly())
+
+		deviceFiles := session.OutputToStringArray()
+
+		os.RemoveAll(devdir)
+		session = podmanTest.Podman([]string{"start", "--attach", containerName})
+		session.WaitWithDefaultTimeout()
+		Expect(session).Should(ExitCleanly())
+
+		deviceFilesAfterRemoval := session.OutputToStringArray()
+		Expect(deviceFiles).To(Not(Equal(deviceFilesAfterRemoval)))
+	})
+
+	It("run no-new-privileges test", func() {
 		cap := SystemExec("grep", []string{"NoNewPrivs", "/proc/self/status"})
 		if cap.ExitCode() != 0 {
 			Skip("Can't determine NoNewPrivs")
 		}
 
-		session := podmanTest.Podman([]string{"run", "busybox", "grep", "NoNewPrivs", "/proc/self/status"})
+		session := podmanTest.Podman([]string{"run", BB, "grep", "NoNewPrivs", "/proc/self/status"})
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
 		privs := strings.Split(session.OutputToString(), ":")
-		session = podmanTest.Podman([]string{"run", "--security-opt", "no-new-privileges", "busybox", "grep", "NoNewPrivs", "/proc/self/status"})
+		session = podmanTest.Podman([]string{"run", "--security-opt", "no-new-privileges", BB, "grep", "NoNewPrivs", "/proc/self/status"})
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
 		noprivs := strings.Split(session.OutputToString(), ":")
 		Expect(privs[1]).To(Not(Equal(noprivs[1])))

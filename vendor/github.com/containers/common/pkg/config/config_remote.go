@@ -1,4 +1,4 @@
-// +build remote
+//go:build remote
 
 package config
 
@@ -17,6 +17,10 @@ func (c *EngineConfig) validatePaths() error {
 }
 
 func (c *ContainersConfig) validateDevices() error {
+	return nil
+}
+
+func (c *ContainersConfig) validateInterfaceName() error {
 	return nil
 }
 

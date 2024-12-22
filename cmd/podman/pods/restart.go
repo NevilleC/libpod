@@ -4,10 +4,11 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/utils"
-	"github.com/containers/podman/v2/cmd/podman/validate"
-	"github.com/containers/podman/v2/pkg/domain/entities"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
 )
 
@@ -16,15 +17,15 @@ var (
 
   All of the containers within each of the specified pods will be restarted. If a container in a pod is not currently running it will be started.`
 	restartCommand = &cobra.Command{
-		Use:   "restart [flags] POD [POD...]",
+		Use:   "restart [options] POD [POD...]",
 		Short: "Restart one or more pods",
 		Long:  podRestartDescription,
 		RunE:  restart,
 		Args: func(cmd *cobra.Command, args []string) error {
-			return validate.CheckAllLatestAndCIDFile(cmd, args, false, false)
+			return validate.CheckAllLatestAndIDFile(cmd, args, false, "")
 		},
+		ValidArgsFunction: common.AutocompletePods,
 		Example: `podman pod restart podID1 podID2
-  podman pod restart --latest
   podman pod restart --all`,
 	}
 )
@@ -35,7 +36,6 @@ var (
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: restartCommand,
 		Parent:  podCmd,
 	})

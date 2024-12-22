@@ -1,10 +1,10 @@
-// +build !seccomp
+//go:build !linux || !seccomp
 
 // SPDX-License-Identifier: Apache-2.0
 
 // Copyright 2013-2018 Docker, Inc.
 
-package seccomp 
+package seccomp
 
 import (
 	"errors"
@@ -14,12 +14,12 @@ import (
 
 var errNotSupported = errors.New("seccomp not enabled in this build")
 
-// LoadProfile returns an error on unsuppored systems
+// LoadProfile returns an error on unsupported systems
 func LoadProfile(body string, rs *specs.Spec) (*specs.LinuxSeccomp, error) {
 	return nil, errNotSupported
 }
 
-// GetDefaultProfile returns an error on unsuppored systems
+// GetDefaultProfile returns an error on unsupported systems
 func GetDefaultProfile(rs *specs.Spec) (*specs.LinuxSeccomp, error) {
 	return nil, errNotSupported
 }
@@ -36,5 +36,11 @@ func LoadProfileFromConfig(config *Seccomp, specgen *specs.Spec) (*specs.LinuxSe
 
 // IsEnabled returns true if seccomp is enabled for the host.
 func IsEnabled() bool {
+	return false
+}
+
+// IsSupported returns true if the system has been configured to support
+// seccomp.
+func IsSupported() bool {
 	return false
 }

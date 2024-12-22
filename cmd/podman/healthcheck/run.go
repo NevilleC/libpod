@@ -4,28 +4,28 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/pkg/domain/entities"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
 )
 
 var (
-	healthcheckRunDescription = "run the health check of a container"
-	healthcheckrunCommand     = &cobra.Command{
-		Use:                   "run CONTAINER",
-		Short:                 "run the health check of a container",
-		Long:                  healthcheckRunDescription,
-		Example:               `podman healthcheck run mywebapp`,
-		RunE:                  run,
-		Args:                  cobra.ExactArgs(1),
-		DisableFlagsInUseLine: true,
+	runCmd = &cobra.Command{
+		Use:               "run CONTAINER",
+		Short:             "Run the health check of a container",
+		Long:              "Run the health check of a container",
+		Example:           `podman healthcheck run mywebapp`,
+		RunE:              run,
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: common.AutocompleteContainersRunning,
 	}
 )
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
-		Command: healthcheckrunCommand,
+		Command: runCmd,
 		Parent:  healthCmd,
 	})
 }
@@ -35,9 +35,9 @@ func run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	if response.Status == "unhealthy" {
+	if response.Status == define.HealthCheckUnhealthy || response.Status == define.HealthCheckStarting {
 		registry.SetExitCode(1)
+		fmt.Println(response.Status)
 	}
-	fmt.Println(response.Status)
 	return err
 }

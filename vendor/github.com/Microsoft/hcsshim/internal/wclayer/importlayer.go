@@ -1,8 +1,9 @@
+//go:build windows
+
 package wclayer
 
 import (
 	"context"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,7 +21,7 @@ import (
 // be present on the system at the paths provided in parentLayerPaths.
 func ImportLayer(ctx context.Context, path string, importFolderPath string, parentLayerPaths []string) (err error) {
 	title := "hcsshim::ImportLayer"
-	ctx, span := trace.StartSpan(ctx, title)
+	ctx, span := oc.StartSpan(ctx, title)
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 	span.AddAttributes(
@@ -36,7 +37,7 @@ func ImportLayer(ctx context.Context, path string, importFolderPath string, pare
 
 	err = importLayer(&stdDriverInfo, path, importFolderPath, layers)
 	if err != nil {
-		return hcserror.New(err, title+" - failed", "")
+		return hcserror.New(err, title, "")
 	}
 	return nil
 }
@@ -93,6 +94,19 @@ func (r *legacyLayerWriterWrapper) Close() (err error) {
 			return err
 		}
 	}
+
+	// The reapplyDirectoryTimes must be called AFTER we are done with Tombstone
+	// deletion and hard link creation. This is because Tombstone deletion and hard link
+	// creation updates the directory last write timestamps so that will change the
+	// timestamps added by the `Add` call. Some container applications depend on the
+	// correctness of these timestamps and so we should change the timestamps back to
+	// the original value (i.e the value provided in the Add call) after this
+	// processing is done.
+	err = reapplyDirectoryTimes(r.destRoot, r.changedDi)
+	if err != nil {
+		return err
+	}
+
 	// Prepare the utility VM for use if one is present in the layer.
 	if r.HasUtilityVM {
 		err := safefile.EnsureNotReparsePointRelative("UtilityVM", r.destRoot)
@@ -111,7 +125,7 @@ func (r *legacyLayerWriterWrapper) Close() (err error) {
 // The caller must have taken the SeBackupPrivilege and SeRestorePrivilege privileges
 // to call this and any methods on the resulting LayerWriter.
 func NewLayerWriter(ctx context.Context, path string, parentLayerPaths []string) (_ LayerWriter, err error) {
-	ctx, span := trace.StartSpan(ctx, "hcsshim::NewLayerWriter")
+	ctx, span := oc.StartSpan(ctx, "hcsshim::NewLayerWriter")
 	defer func() {
 		if err != nil {
 			oc.SetSpanStatus(span, err)
@@ -135,7 +149,7 @@ func NewLayerWriter(ctx context.Context, path string, parentLayerPaths []string)
 		}, nil
 	}
 
-	importPath, err := ioutil.TempDir("", "hcs")
+	importPath, err := os.MkdirTemp("", "hcs")
 	if err != nil {
 		return nil, err
 	}

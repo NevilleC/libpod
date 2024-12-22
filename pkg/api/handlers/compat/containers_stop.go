@@ -1,60 +1,85 @@
+//go:build !remote
+
 package compat
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 
-	"github.com/containers/podman/v2/libpod"
-	"github.com/containers/podman/v2/libpod/define"
-	"github.com/containers/podman/v2/pkg/api/handlers/utils"
-	"github.com/gorilla/schema"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/infra/abi"
+	"github.com/containers/podman/v5/pkg/util"
 )
 
 func StopContainer(w http.ResponseWriter, r *http.Request) {
-	runtime := r.Context().Value("runtime").(*libpod.Runtime)
-	decoder := r.Context().Value("decoder").(*schema.Decoder)
+	runtime := r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
+	decoder := utils.GetDecoder(r)
+	// Now use the ABI implementation to prevent us from having duplicate
+	// code.
+	containerEngine := abi.ContainerEngine{Libpod: runtime}
 
 	// /{version}/containers/(name)/stop
 	query := struct {
-		Timeout int `schema:"t"`
+		Ignore        bool `schema:"ignore"`
+		DockerTimeout int  `schema:"t"`
+		LibpodTimeout uint `schema:"timeout"`
 	}{
 		// override any golang type defaults
 	}
 	if err := decoder.Decode(&query, r.URL.Query()); err != nil {
-		utils.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest,
-			errors.Wrapf(err, "Failed to parse parameters for %s", r.URL.String()))
+		utils.Error(w, http.StatusBadRequest, fmt.Errorf("failed to parse parameters for %s: %w", r.URL.String(), err))
 		return
 	}
-
 	name := utils.GetName(r)
+	options := entities.StopOptions{
+		Ignore: query.Ignore,
+	}
+	if utils.IsLibpodRequest(r) {
+		if _, found := r.URL.Query()["timeout"]; found {
+			options.Timeout = &query.LibpodTimeout
+		}
+	} else {
+		if _, found := r.URL.Query()["t"]; found {
+			// -1 is allowed in Docker API, meaning wait infinite long, translate -1 to math.MaxInt value seconds to wait.
+			timeout := util.ConvertTimeout(query.DockerTimeout)
+			options.Timeout = &timeout
+		}
+	}
 	con, err := runtime.LookupContainer(name)
 	if err != nil {
 		utils.ContainerNotFound(w, name, err)
 		return
 	}
-
 	state, err := con.State()
 	if err != nil {
-		utils.InternalServerError(w, errors.Wrapf(err, "unable to get state for Container %s", name))
+		utils.InternalServerError(w, err)
 		return
 	}
-	// If the Container is stopped already, send a 304
 	if state == define.ContainerStateStopped || state == define.ContainerStateExited {
-		utils.WriteResponse(w, http.StatusNotModified, "")
+		utils.WriteResponse(w, http.StatusNotModified, nil)
+		return
+	}
+	report, err := containerEngine.ContainerStop(r.Context(), []string{name}, options)
+	if err != nil {
+		if errors.Is(err, define.ErrNoSuchCtr) {
+			utils.ContainerNotFound(w, name, err)
+			return
+		}
+
+		utils.InternalServerError(w, err)
 		return
 	}
 
-	var stopError error
-	if query.Timeout > 0 {
-		stopError = con.StopWithTimeout(uint(query.Timeout))
-	} else {
-		stopError = con.Stop()
-	}
-	if stopError != nil {
-		utils.InternalServerError(w, errors.Wrapf(stopError, "failed to stop %s", name))
+	if len(report) > 0 && report[0].Err != nil {
+		utils.InternalServerError(w, report[0].Err)
 		return
 	}
 
 	// Success
-	utils.WriteResponse(w, http.StatusNoContent, "")
+	utils.WriteResponse(w, http.StatusNoContent, nil)
 }

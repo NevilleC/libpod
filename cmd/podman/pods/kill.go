@@ -4,10 +4,11 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/utils"
-	"github.com/containers/podman/v2/cmd/podman/validate"
-	"github.com/containers/podman/v2/pkg/domain/entities"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
 )
 
@@ -16,16 +17,16 @@ var (
 
   The default signal is SIGKILL, or any signal specified with option --signal.`
 	killCommand = &cobra.Command{
-		Use:   "kill [flags] POD [POD...]",
+		Use:   "kill [options] POD [POD...]",
 		Short: "Send the specified signal or SIGKILL to containers in pod",
 		Long:  podKillDescription,
 		RunE:  kill,
 		Args: func(cmd *cobra.Command, args []string) error {
-			return validate.CheckAllLatestAndCIDFile(cmd, args, false, false)
+			return validate.CheckAllLatestAndIDFile(cmd, args, false, "")
 		},
+		ValidArgsFunction: common.AutocompletePodsRunning,
 		Example: `podman pod kill podID
-  podman pod kill --signal TERM mywebserver
-  podman pod kill --latest`,
+  podman pod kill --signal TERM mywebserver`,
 	}
 )
 
@@ -35,13 +36,16 @@ var (
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: killCommand,
 		Parent:  podCmd,
 	})
 	flags := killCommand.Flags()
 	flags.BoolVarP(&killOpts.All, "all", "a", false, "Kill all containers in all pods")
-	flags.StringVarP(&killOpts.Signal, "signal", "s", "KILL", "Signal to send to the containers in the pod")
+
+	signalFlagName := "signal"
+	flags.StringVarP(&killOpts.Signal, signalFlagName, "s", "KILL", "Signal to send to the containers in the pod")
+	_ = killCommand.RegisterFlagCompletionFunc(signalFlagName, common.AutocompleteStopSignal)
+
 	validate.AddLatestFlag(killCommand, &killOpts.Latest)
 }
 

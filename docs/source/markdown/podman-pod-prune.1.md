@@ -1,4 +1,4 @@
-% podman-pod-prune(1)
+% podman-pod-prune 1
 
 ## NAME
 podman-pod-prune - Remove all stopped pods and their containers
@@ -11,11 +11,12 @@ podman-pod-prune - Remove all stopped pods and their containers
 
 ## OPTIONS
 
-**--force**, **-f**
+#### **--force**, **-f**
 Force removal of all running pods and their containers. The default is false.
 
 ## EXAMPLES
-Remove all stopped pods and their containers from local storage
+
+Remove all stopped pods and their containers from local storage.
 ```
 $ sudo podman pod prune
 22b8813332948064b6566370088c5e0230eeaf15a58b1c5646859fd9fc364fe7
@@ -26,7 +27,7 @@ $ sudo podman pod prune
 ```
 
 ## SEE ALSO
-podman-pod(1), podman-pod-ps(1), podman-pod-rm(1)
+**[podman(1)](podman.1.md)**, **[podman-pod(1)](podman-pod.1.md)**
 
 ## HISTORY
 April 2019, Originally compiled by Peter Hunt (pehunt at redhat dot com)

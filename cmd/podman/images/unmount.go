@@ -1,12 +1,13 @@
 package images
 
 import (
+	"errors"
 	"fmt"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/utils"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -19,11 +20,13 @@ var (
   An unmount can be forced with the --force flag.
 `
 	unmountCommand = &cobra.Command{
-		Use:     "unmount [flags] IMAGE [IMAGE...]",
-		Aliases: []string{"umount"},
-		Short:   "Unmount an image's root filesystem",
-		Long:    description,
-		RunE:    unmount,
+		Annotations:       map[string]string{registry.EngineMode: registry.ABIMode},
+		Use:               "unmount [options] IMAGE [IMAGE...]",
+		Aliases:           []string{"umount"},
+		Short:             "Unmount an image's root filesystem",
+		Long:              description,
+		RunE:              unmount,
+		ValidArgsFunction: common.AutocompleteImages,
 		Example: `podman unmount imgID
   podman unmount imgID1 imgID2 imgID3
   podman unmount --all`,
@@ -41,7 +44,6 @@ func unmountFlags(flags *pflag.FlagSet) {
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode},
 		Parent:  imageCmd,
 		Command: unmountCommand,
 	})

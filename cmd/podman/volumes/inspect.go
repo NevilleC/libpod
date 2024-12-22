@@ -1,17 +1,14 @@
 package volumes
 
 import (
-	"fmt"
-	"os"
-	"strings"
-	"text/template"
+	"errors"
 
-	"github.com/containers/buildah/pkg/formats"
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/inspect"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
-	"golang.org/x/net/context"
 )
 
 var (
@@ -19,10 +16,11 @@ var (
 
   Use a Go template to change the format from JSON.`
 	inspectCommand = &cobra.Command{
-		Use:   "inspect [flags] VOLUME [VOLUME...]",
-		Short: "Display detailed information on one or more volumes",
-		Long:  volumeInspectDescription,
-		RunE:  inspect,
+		Use:               "inspect [options] VOLUME [VOLUME...]",
+		Short:             "Display detailed information on one or more volumes",
+		Long:              volumeInspectDescription,
+		RunE:              volumeInspect,
+		ValidArgsFunction: common.AutocompleteVolumes,
 		Example: `podman volume inspect myvol
   podman volume inspect --all
   podman volume inspect --format "{{.Driver}} {{.Scope}}" myvol`,
@@ -30,49 +28,27 @@ var (
 )
 
 var (
-	inspectOpts   = entities.VolumeInspectOptions{}
-	inspectFormat string
+	inspectOpts *entities.InspectOptions
 )
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: inspectCommand,
 		Parent:  volumeCmd,
 	})
+	inspectOpts = new(entities.InspectOptions)
 	flags := inspectCommand.Flags()
 	flags.BoolVarP(&inspectOpts.All, "all", "a", false, "Inspect all volumes")
-	flags.StringVarP(&inspectFormat, "format", "f", "json", "Format volume output using Go template")
+
+	formatFlagName := "format"
+	flags.StringVarP(&inspectOpts.Format, formatFlagName, "f", "json", "Format volume output using Go template")
+	_ = inspectCommand.RegisterFlagCompletionFunc(formatFlagName, common.AutocompleteFormat(&define.InspectVolumeData{}))
 }
 
-func inspect(cmd *cobra.Command, args []string) error {
+func volumeInspect(cmd *cobra.Command, args []string) error {
 	if (inspectOpts.All && len(args) > 0) || (!inspectOpts.All && len(args) < 1) {
 		return errors.New("provide one or more volume names or use --all")
 	}
-	responses, err := registry.ContainerEngine().VolumeInspect(context.Background(), args, inspectOpts)
-	if err != nil {
-		return err
-	}
-	switch inspectFormat {
-	case "", formats.JSONString:
-		jsonOut, err := json.MarshalIndent(responses, "", "     ")
-		if err != nil {
-			return errors.Wrapf(err, "error marshalling inspect JSON")
-		}
-		fmt.Println(string(jsonOut))
-	default:
-		if !strings.HasSuffix(inspectFormat, "\n") {
-			inspectFormat += "\n"
-		}
-		format := "{{range . }}" + inspectFormat + "{{end}}"
-		tmpl, err := template.New("volumeInspect").Parse(format)
-		if err != nil {
-			return err
-		}
-		if err := tmpl.Execute(os.Stdout, responses); err != nil {
-			return err
-		}
-	}
-	return nil
-
+	inspectOpts.Type = common.VolumeType
+	return inspect.Inspect(args, *inspectOpts)
 }

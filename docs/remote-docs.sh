@@ -6,11 +6,24 @@ PLATFORM=$1                         ## linux, windows or darwin
 TARGET=${2}                         ## where to output files
 SOURCES=${@:3}                      ## directories to find markdown files
 
-PODMAN=${PODMAN:-bin/podman-remote} ## location overridden for testing
+# This is a *native* binary, one we can run on this host. (This script can be
+# invoked in a cross-compilation environment, so even if PLATFORM=windows
+# we need an actual executable that we can invoke).
+if [[ -z "$PODMAN" ]]; then
+    DETECTED_OS=$(env -i HOME="$HOME" PATH="$PATH" GOROOT="$GOROOT" go env GOOS)
+    case $DETECTED_OS in
+        windows)
+            PODMAN=bin/windows/podman.exe ;;
+        darwin)
+            PODMAN=bin/darwin/podman ;;
+        *)  # Assume "linux"
+            PODMAN=bin/podman-remote ;;
+    esac
+fi
 
 function usage() {
     echo >&2 "$0 PLATFORM TARGET SOURCES..."
-    echo >&2 "PLATFORM: Is either linux, darwin or windows."
+    echo >&2 "PLATFORM: Is either linux, darwin, windows or freebsd."
     echo >&2 "TARGET: Is the directory where files will be staged. eg, docs/build/remote/linux"
     echo >&2 "SOURCES: Are the directories of source files. eg, docs/source/markdown"
 }
@@ -21,7 +34,7 @@ function fail() {
 }
 
 case $PLATFORM in
-darwin|linux)
+darwin|linux|freebsd)
     PUBLISHER=man_fn
     ext=1
     ;;
@@ -70,7 +83,20 @@ function html_fn() {
         local link=$(sed -e 's?.so man1/\(.*\)?\1?' <$dir/links/${file%.md})
         markdown=$dir/$link.md
     fi
-    pandoc --ascii --lua-filter=docs/links-to-html.lua -o $TARGET/${file%%.*}.html $markdown
+    pandoc --ascii --standalone --from markdown-smart \
+        --lua-filter=docs/links-to-html.lua \
+        --lua-filter=docs/use-pagetitle.lua \
+        -o $TARGET/${file%%.*}.html $markdown
+}
+
+function html_standalone() {
+    local markdown=$1
+    local title=$2
+    local file=$(basename $markdown)
+    local dir=$(dirname $markdown)
+    (cd $dir; pandoc --ascii --from markdown-smart -c ../standalone-styling.css \
+           --standalone --self-contained --metadata title="$2" -V title= \
+           $file)  > $TARGET/${file%%.*}.html
 }
 
 # Run 'podman help' (possibly against a subcommand, e.g. 'podman help image')
@@ -78,7 +104,7 @@ function html_fn() {
 # the command name but not its description.
 function podman_commands() {
     $PODMAN help "$@" |\
-        awk '/^Available Commands:/{ok=1;next}/^Flags:/{ok=0}ok { print $1 }' |\
+        awk '/^Available Commands:/{ok=1;next}/^Options:/{ok=0}ok { print $1 }' |\
         grep .
 }
 
@@ -152,3 +178,6 @@ for s in $SOURCES; do
     fi
 done
 rename
+if [[ "$PLATFORM" == "windows" ]]; then
+    html_standalone docs/tutorials/podman-for-windows.md 'Podman for Windows'
+fi

@@ -60,9 +60,10 @@ type HealthConfig struct {
 	Test []string `json:",omitempty"`
 
 	// Zero means to inherit. Durations are expressed as integer nanoseconds.
-	Interval    time.Duration `json:",omitempty"` // Interval is the time to wait between checks.
-	Timeout     time.Duration `json:",omitempty"` // Timeout is the time to wait before considering the check to have hung.
-	StartPeriod time.Duration `json:",omitempty"` // Time to wait after the container starts before running the first check.
+	Interval      time.Duration `json:",omitempty"` // Interval is the time to wait between checks.
+	Timeout       time.Duration `json:",omitempty"` // Timeout is the time to wait before considering the check to have hung.
+	StartPeriod   time.Duration `json:",omitempty"` // Time to wait after the container starts before running the first check.
+	StartInterval time.Duration `json:",omitempty"` // Time to wait between checks during the StartPeriod.
 
 	// Retries is the number of consecutive failures needed to consider a container as unhealthy.
 	// Zero means inherit.
@@ -151,6 +152,8 @@ type V1Image struct {
 	Config *Config `json:"config,omitempty"`
 	// Architecture is the hardware that the image is build and runs on
 	Architecture string `json:"architecture,omitempty"`
+	// Variant is a variant of the CPU that the image is built and runs on
+	Variant string `json:"variant,omitempty"`
 	// OS is the operating system used to build and run the image
 	OS string `json:"os,omitempty"`
 	// Size is the total size of the image including all layers it is composed of

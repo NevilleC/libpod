@@ -1,22 +1,15 @@
 approvers:
   - TomSweeneyRedHat
-  - cevich
-  - giuseppe
-  - nalind
-  - rhatdan
-  - vrothberg
-reviewers:
-  - QiWang19
-  - TomSweeneyRedHat
-  - baude
-  - cevich
-  - edsantiago
-  - giuseppe
-  - haircommander
-  - jwhonce
-  - mheon
-  - mrunalp
+  - lsm5
   - nalind
   - rhatdan
   - umohnani8
+reviewers:
+  - ashley-cui
+  - baude
+  - edsantiago
+  - flouthoc
+  - giuseppe
+  - Honny1
+  - mheon
   - vrothberg

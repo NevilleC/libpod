@@ -3,10 +3,11 @@ package containers
 import (
 	"fmt"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/utils"
-	"github.com/containers/podman/v2/cmd/podman/validate"
-	"github.com/containers/podman/v2/pkg/domain/entities"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -19,28 +20,32 @@ var (
   An unmount can be forced with the --force flag.
 `
 	unmountCommand = &cobra.Command{
-		Use:     "unmount [flags] CONTAINER [CONTAINER...]",
-		Aliases: []string{"umount"},
-		Short:   "Unmounts working container's root filesystem",
-		Long:    description,
-		RunE:    unmount,
+		Annotations: map[string]string{registry.EngineMode: registry.ABIMode},
+		Use:         "unmount [options] CONTAINER [CONTAINER...]",
+		Aliases:     []string{"umount"},
+		Short:       "Unmount working container's root filesystem",
+		Long:        description,
+		RunE:        unmount,
 		Args: func(cmd *cobra.Command, args []string) error {
-			return validate.CheckAllLatestAndCIDFile(cmd, args, false, false)
+			return validate.CheckAllLatestAndIDFile(cmd, args, false, "")
 		},
+		ValidArgsFunction: common.AutocompleteContainers,
 		Example: `podman unmount ctrID
   podman unmount ctrID1 ctrID2 ctrID3
   podman unmount --all`,
 	}
 
 	containerUnmountCommand = &cobra.Command{
-		Use:     unmountCommand.Use,
-		Short:   unmountCommand.Short,
-		Aliases: unmountCommand.Aliases,
-		Long:    unmountCommand.Long,
-		RunE:    unmountCommand.RunE,
+		Annotations: unmountCommand.Annotations,
+		Use:         unmountCommand.Use,
+		Short:       unmountCommand.Short,
+		Aliases:     unmountCommand.Aliases,
+		Long:        unmountCommand.Long,
+		RunE:        unmountCommand.RunE,
 		Args: func(cmd *cobra.Command, args []string) error {
-			return validate.CheckAllLatestAndCIDFile(cmd, args, false, false)
+			return validate.CheckAllLatestAndIDFile(cmd, args, false, "")
 		},
+		ValidArgsFunction: common.AutocompleteContainers,
 		Example: `podman container unmount ctrID
   podman container unmount ctrID1 ctrID2 ctrID3
   podman container unmount --all`,
@@ -58,14 +63,12 @@ func unmountFlags(flags *pflag.FlagSet) {
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode},
 		Command: unmountCommand,
 	})
 	unmountFlags(unmountCommand.Flags())
 	validate.AddLatestFlag(unmountCommand, &unmountOpts.Latest)
 
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode},
 		Command: containerUnmountCommand,
 		Parent:  containerCmd,
 	})
@@ -75,6 +78,7 @@ func init() {
 
 func unmount(cmd *cobra.Command, args []string) error {
 	var errs utils.OutputErrors
+	args = utils.RemoveSlash(args)
 	reports, err := registry.ContainerEngine().ContainerUnmount(registry.GetContext(), args, unmountOpts)
 	if err != nil {
 		return err

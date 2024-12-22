@@ -1,16 +1,14 @@
-package test_bindings
+package bindings_test
 
 import (
-	"io/ioutil"
 	"os"
 	"time"
 
 	"github.com/containers/common/pkg/auth"
 	"github.com/containers/image/v5/types"
-	podmanRegistry "github.com/containers/podman/v2/hack/podman-registry-go"
-	"github.com/containers/podman/v2/pkg/bindings/images"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	. "github.com/onsi/ginkgo"
+	podmanRegistry "github.com/containers/podman/v5/hack/podman-registry-go"
+	"github.com/containers/podman/v5/pkg/bindings/images"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/gexec"
 )
@@ -24,56 +22,58 @@ var _ = Describe("Podman images", func() {
 	)
 
 	BeforeEach(func() {
+		registryOptions := &podmanRegistry.Options{
+			PodmanPath: getPodmanBinary(),
+		}
+
 		// Note: we need to start the registry **before** setting up
 		// the test. Otherwise, the registry is not reachable for
 		// currently unknown reasons.
-		registry, err = podmanRegistry.Start()
-		Expect(err).To(BeNil())
+		registry, err = podmanRegistry.StartWithOptions(registryOptions)
+		Expect(err).ToNot(HaveOccurred())
 
 		bt = newBindingTest()
 		bt.RestoreImagesFromCache()
 		s = bt.startAPIService()
 		time.Sleep(1 * time.Second)
 		err := bt.NewConnection()
-		Expect(err).To(BeNil())
+		Expect(err).ToNot(HaveOccurred())
 	})
 
 	AfterEach(func() {
 		s.Kill()
 		bt.cleanup()
-		registry.Stop()
+		err := registry.Stop()
+		Expect(err).ToNot(HaveOccurred())
 	})
 
 	// Test using credentials.
-	It("tag + push + pull (with credentials)", func() {
+	It("tag + push + pull + search (with credentials)", func() {
 
 		imageRep := "localhost:" + registry.Port + "/test"
 		imageTag := "latest"
 		imageRef := imageRep + ":" + imageTag
 
 		// Tag the alpine image and verify it has worked.
-		err = images.Tag(bt.conn, alpine.shortName, imageTag, imageRep)
-		Expect(err).To(BeNil())
+		err = images.Tag(bt.conn, alpine.shortName, imageTag, imageRep, nil)
+		Expect(err).ToNot(HaveOccurred())
 		_, err = images.GetImage(bt.conn, imageRef, nil)
-		Expect(err).To(BeNil())
+		Expect(err).ToNot(HaveOccurred())
 
 		// Now push the image.
-		pushOpts := entities.ImagePushOptions{
-			Username:      registry.User,
-			Password:      registry.Password,
-			SkipTLSVerify: types.OptionalBoolTrue,
-		}
-		err = images.Push(bt.conn, imageRef, imageRef, pushOpts)
-		Expect(err).To(BeNil())
+		pushOpts := new(images.PushOptions)
+		err = images.Push(bt.conn, imageRef, imageRef, pushOpts.WithUsername(registry.User).WithPassword(registry.Password).WithSkipTLSVerify(true))
+		Expect(err).ToNot(HaveOccurred())
 
 		// Now pull the image.
-		pullOpts := entities.ImagePullOptions{
-			Username:      registry.User,
-			Password:      registry.Password,
-			SkipTLSVerify: types.OptionalBoolTrue,
-		}
-		_, err = images.Pull(bt.conn, imageRef, pullOpts)
-		Expect(err).To(BeNil())
+		pullOpts := new(images.PullOptions)
+		_, err = images.Pull(bt.conn, imageRef, pullOpts.WithSkipTLSVerify(true).WithPassword(registry.Password).WithUsername(registry.User))
+		Expect(err).ToNot(HaveOccurred())
+
+		// Last, but not least, exercise search.
+		searchOptions := new(images.SearchOptions)
+		_, err = images.Search(bt.conn, imageRef, searchOptions.WithSkipTLSVerify(true).WithPassword(registry.Password).WithUsername(registry.User))
+		Expect(err).ToNot(HaveOccurred())
 	})
 
 	// Test using authfile.
@@ -84,12 +84,12 @@ var _ = Describe("Podman images", func() {
 		imageRef := imageRep + ":" + imageTag
 
 		// Create a temporary authentication file.
-		tmpFile, err := ioutil.TempFile("", "auth.json.")
-		Expect(err).To(BeNil())
+		tmpFile, err := os.CreateTemp("", "auth.json.")
+		Expect(err).ToNot(HaveOccurred())
 		_, err = tmpFile.Write([]byte{'{', '}'})
-		Expect(err).To(BeNil())
+		Expect(err).ToNot(HaveOccurred())
 		err = tmpFile.Close()
-		Expect(err).To(BeNil())
+		Expect(err).ToNot(HaveOccurred())
 
 		authFilePath := tmpFile.Name()
 
@@ -107,37 +107,28 @@ var _ = Describe("Podman images", func() {
 			Stdout:   os.Stdout,
 		}
 		err = auth.Login(bt.conn, &sys, &loginOptions, []string{imageRep})
-		Expect(err).To(BeNil())
+		Expect(err).ToNot(HaveOccurred())
 
 		// Tag the alpine image and verify it has worked.
-		err = images.Tag(bt.conn, alpine.shortName, imageTag, imageRep)
-		Expect(err).To(BeNil())
+		err = images.Tag(bt.conn, alpine.shortName, imageTag, imageRep, nil)
+		Expect(err).ToNot(HaveOccurred())
 		_, err = images.GetImage(bt.conn, imageRef, nil)
-		Expect(err).To(BeNil())
+		Expect(err).ToNot(HaveOccurred())
 
 		// Now push the image.
-		pushOpts := entities.ImagePushOptions{
-			Authfile:      authFilePath,
-			SkipTLSVerify: types.OptionalBoolTrue,
-		}
-		err = images.Push(bt.conn, imageRef, imageRef, pushOpts)
-		Expect(err).To(BeNil())
+		pushOpts := new(images.PushOptions)
+		err = images.Push(bt.conn, imageRef, imageRef, pushOpts.WithAuthfile(authFilePath).WithSkipTLSVerify(true))
+		Expect(err).ToNot(HaveOccurred())
 
 		// Now pull the image.
-		pullOpts := entities.ImagePullOptions{
-			Authfile:      authFilePath,
-			SkipTLSVerify: types.OptionalBoolTrue,
-		}
-		_, err = images.Pull(bt.conn, imageRef, pullOpts)
-		Expect(err).To(BeNil())
+		pullOpts := new(images.PullOptions)
+		_, err = images.Pull(bt.conn, imageRef, pullOpts.WithAuthfile(authFilePath).WithSkipTLSVerify(true))
+		Expect(err).ToNot(HaveOccurred())
 
 		// Last, but not least, exercise search.
-		searchOptions := entities.ImageSearchOptions{
-			Authfile:      authFilePath,
-			SkipTLSVerify: types.OptionalBoolTrue,
-		}
-		_, err = images.Search(bt.conn, imageRef, searchOptions)
-		Expect(err).To(BeNil())
+		searchOptions := new(images.SearchOptions)
+		_, err = images.Search(bt.conn, imageRef, searchOptions.WithSkipTLSVerify(true).WithAuthfile(authFilePath))
+		Expect(err).ToNot(HaveOccurred())
 	})
 
 })

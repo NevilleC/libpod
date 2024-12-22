@@ -1,109 +1,190 @@
 package system
 
 import (
-	"bufio"
 	"context"
+	"fmt"
 	"os"
-	"strings"
-	"text/template"
 
-	"github.com/containers/buildah/pkg/formats"
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/validate"
-	"github.com/containers/podman/v2/libpod/events"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/pkg/errors"
+	"github.com/containers/common/pkg/completion"
+	"github.com/containers/common/pkg/report"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/libpod/events"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
 
 var (
-	eventsDescription = `Monitor podman events.
+	eventsDescription = `Monitor podman system events.
 
   By default, streaming mode is used, printing new events as they occur.  Previous events can be listed via --since and --until.`
 	eventsCommand = &cobra.Command{
-		Use:   "events",
-		Args:  validate.NoArgs,
-		Short: "Show podman events",
-		Long:  eventsDescription,
-		RunE:  eventsCmd,
+		Use:               "events [options]",
+		Args:              validate.NoArgs,
+		Short:             "Show podman system events",
+		Long:              eventsDescription,
+		RunE:              eventsCmd,
+		ValidArgsFunction: completion.AutocompleteNone,
 		Example: `podman events
   podman events --filter event=create
+  podman events --format {{.Image}}
   podman events --since 1h30s`,
+	}
+
+	systemEventsCommand = &cobra.Command{
+		Args:              eventsCommand.Args,
+		Use:               eventsCommand.Use,
+		Short:             eventsCommand.Short,
+		Long:              eventsCommand.Long,
+		RunE:              eventsCommand.RunE,
+		ValidArgsFunction: eventsCommand.ValidArgsFunction,
+		Example:           `podman system events`,
 	}
 )
 
 var (
 	eventOptions entities.EventsOptions
 	eventFormat  string
+	noTrunc      bool
 )
+
+type Event struct {
+	// containerExitCode is for storing the exit code of a container which can
+	// be used for "internal" event notification
+	ContainerExitCode *int `json:",omitempty"`
+	// ID can be for the container, image, volume, etc
+	ID string `json:",omitempty"`
+	// Image used where applicable
+	Image string `json:",omitempty"`
+	// Name where applicable
+	Name string `json:",omitempty"`
+	// Network is the network name in a network event
+	Network string `json:"network,omitempty"`
+	// Status describes the event that occurred
+	Status events.Status
+	// Time the event occurred
+	Time int64 `json:"time,omitempty"`
+	// timeNano the event occurred in nanoseconds
+	TimeNano int64 `json:"timeNano,omitempty"`
+	// Type of event that occurred
+	Type events.Type
+	// Health status of the current container
+	HealthStatus string `json:"health_status,omitempty"`
+	// Error code for certain events involving errors.
+	Error string `json:",omitempty"`
+
+	events.Details
+}
+
+func newEventFromLibpodEvent(e *events.Event) Event {
+	return Event{
+		ContainerExitCode: e.ContainerExitCode,
+		ID:                e.ID,
+		Image:             e.Image,
+		Name:              e.Name,
+		Network:           e.Network,
+		Status:            e.Status,
+		Time:              e.Time.Unix(),
+		Type:              e.Type,
+		HealthStatus:      e.HealthStatus,
+		Details:           e.Details,
+		TimeNano:          e.Time.UnixNano(),
+		Error:             e.Error,
+	}
+}
+
+func (e *Event) ToJSONString() (string, error) {
+	b, err := json.Marshal(e)
+	return string(b), err
+}
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
+		Command: systemEventsCommand,
+		Parent:  systemCmd,
+	})
+	eventsFlags(systemEventsCommand)
+	registry.Commands = append(registry.Commands, registry.CliCommand{
 		Command: eventsCommand,
 	})
-	flags := eventsCommand.Flags()
-	flags.StringArrayVar(&eventOptions.Filter, "filter", []string{}, "filter output")
-	flags.StringVar(&eventFormat, "format", "", "format the output using a Go template")
-	flags.BoolVar(&eventOptions.Stream, "stream", true, "stream new events; for testing only")
-	flags.StringVar(&eventOptions.Since, "since", "", "show all events created since timestamp")
-	flags.StringVar(&eventOptions.Until, "until", "", "show all events until timestamp")
-	_ = flags.MarkHidden("stream")
+	eventsFlags(eventsCommand)
 }
 
-func eventsCmd(cmd *cobra.Command, args []string) error {
-	var (
-		err         error
-		eventsError error
-		tmpl        *template.Template
-	)
-	if strings.Join(strings.Fields(eventFormat), "") == "{{json.}}" {
-		eventFormat = formats.JSONString
-	}
-	if eventFormat != formats.JSONString {
-		tmpl, err = template.New("events").Parse(eventFormat)
-		if err != nil {
-			return err
-		}
-	}
+func eventsFlags(cmd *cobra.Command) {
+	flags := cmd.Flags()
+
+	filterFlagName := "filter"
+	flags.StringArrayVarP(&eventOptions.Filter, filterFlagName, "f", []string{}, "filter output")
+	_ = cmd.RegisterFlagCompletionFunc(filterFlagName, common.AutocompleteEventFilter)
+
+	formatFlagName := "format"
+	flags.StringVar(&eventFormat, formatFlagName, "", "format the output using a Go template")
+	_ = cmd.RegisterFlagCompletionFunc(formatFlagName, common.AutocompleteFormat(&Event{}))
+
+	flags.BoolVar(&eventOptions.Stream, "stream", true, "stream events and do not exit when returning the last known event")
+
+	sinceFlagName := "since"
+	flags.StringVar(&eventOptions.Since, sinceFlagName, "", "show all events created since timestamp")
+	_ = cmd.RegisterFlagCompletionFunc(sinceFlagName, completion.AutocompleteNone)
+
+	flags.BoolVar(&noTrunc, "no-trunc", true, "do not truncate the output")
+
+	untilFlagName := "until"
+	flags.StringVar(&eventOptions.Until, untilFlagName, "", "show all events until timestamp")
+	_ = cmd.RegisterFlagCompletionFunc(untilFlagName, completion.AutocompleteNone)
+}
+
+func eventsCmd(cmd *cobra.Command, _ []string) error {
 	if len(eventOptions.Since) > 0 || len(eventOptions.Until) > 0 {
 		eventOptions.FromStart = true
 	}
-	eventChannel := make(chan *events.Event)
+	eventChannel := make(chan events.ReadResult, 1)
 	eventOptions.EventChan = eventChannel
 
-	go func() {
-		eventsError = registry.ContainerEngine().Events(context.Background(), eventOptions)
-	}()
-	if eventsError != nil {
-		return eventsError
-	}
+	var (
+		rpt    *report.Formatter
+		doJSON bool
+	)
 
-	w := bufio.NewWriter(os.Stdout)
-	for event := range eventChannel {
-		switch {
-		case eventFormat == formats.JSONString:
-			jsonStr, err := event.ToJSONString()
+	if cmd.Flags().Changed("format") {
+		doJSON = report.IsJSON(eventFormat)
+		if !doJSON {
+			var err error
+			// Use OriginUnknown so it does not add an extra range since it
+			// will only be called for each single element and not a slice.
+			rpt, err = report.New(os.Stdout, cmd.Name()).Parse(report.OriginUnknown, eventFormat)
 			if err != nil {
-				return errors.Wrapf(err, "unable to format json")
-			}
-			if _, err := w.Write([]byte(jsonStr)); err != nil {
 				return err
 			}
-		case len(eventFormat) > 0:
-			if err := tmpl.Execute(w, event); err != nil {
+		}
+	}
+
+	err := registry.ContainerEngine().Events(context.Background(), eventOptions)
+	if err != nil {
+		return err
+	}
+
+	for evt := range eventChannel {
+		if evt.Error != nil {
+			logrus.Errorf("Failed to read event: %v", evt.Error)
+			continue
+		}
+		switch {
+		case doJSON:
+			e := newEventFromLibpodEvent(evt.Event)
+			jsonStr, err := e.ToJSONString()
+			if err != nil {
+				return err
+			}
+			fmt.Println(jsonStr)
+		case cmd.Flags().Changed("format"):
+			if err := rpt.Execute(newEventFromLibpodEvent(evt.Event)); err != nil {
 				return err
 			}
 		default:
-			if _, err := w.Write([]byte(event.ToHumanReadable())); err != nil {
-				return err
-			}
-		}
-		if _, err := w.Write([]byte("\n")); err != nil {
-			return err
-		}
-		if err := w.Flush(); err != nil {
-			return err
+			fmt.Println(evt.Event.ToHumanReadable(!noTrunc))
 		}
 	}
 	return nil

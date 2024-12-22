@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containers/podman/v2/cmd/podman/common"
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/utils"
-	"github.com/containers/podman/v2/cmd/podman/validate"
-	"github.com/containers/podman/v2/pkg/domain/entities"
+	"github.com/containers/common/pkg/completion"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/specgenutil"
 	"github.com/spf13/cobra"
 )
 
@@ -24,42 +26,41 @@ var (
 
   All containers defined in the pod will be started.`
 	startCommand = &cobra.Command{
-		Use:   "start [flags] POD [POD...]",
+		Use:   "start [options] POD [POD...]",
 		Short: "Start one or more pods",
 		Long:  podStartDescription,
 		RunE:  start,
 		Args: func(cmd *cobra.Command, args []string) error {
-			return validate.CheckAllLatestAndPodIDFile(cmd, args, false, true)
+			return validate.CheckAllLatestAndIDFile(cmd, args, false, "pod-id-file")
 		},
+		ValidArgsFunction: common.AutocompletePods,
 		Example: `podman pod start podID
-  podman pod start --latest
   podman pod start --all`,
 	}
 )
 
-var (
-	startOptions = podStartOptionsWrapper{}
-)
+var startOptions = podStartOptionsWrapper{}
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: startCommand,
 		Parent:  podCmd,
 	})
 
 	flags := startCommand.Flags()
 	flags.BoolVarP(&startOptions.All, "all", "a", false, "Restart all running pods")
-	flags.StringArrayVarP(&startOptions.PodIDFiles, "pod-id-file", "", nil, "Read the pod ID from the file")
+
+	podIDFileFlagName := "pod-id-file"
+	flags.StringArrayVarP(&startOptions.PodIDFiles, podIDFileFlagName, "", nil, "Read the pod ID from the file")
+	_ = startCommand.RegisterFlagCompletionFunc(podIDFileFlagName, completion.AutocompleteDefault)
+
 	validate.AddLatestFlag(startCommand, &startOptions.Latest)
 }
 
 func start(cmd *cobra.Command, args []string) error {
-	var (
-		errs utils.OutputErrors
-	)
+	var errs utils.OutputErrors
 
-	ids, err := common.ReadPodIDFiles(startOptions.PodIDFiles)
+	ids, err := specgenutil.ReadPodIDFiles(startOptions.PodIDFiles)
 	if err != nil {
 		return err
 	}
@@ -72,7 +73,7 @@ func start(cmd *cobra.Command, args []string) error {
 	// in the cli, first we print out all the successful attempts
 	for _, r := range responses {
 		if len(r.Errs) == 0 {
-			fmt.Println(r.Id)
+			fmt.Println(r.RawInput)
 		} else {
 			errs = append(errs, r.Errs...)
 		}

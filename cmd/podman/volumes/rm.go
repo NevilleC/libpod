@@ -2,12 +2,16 @@ package volumes
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/utils"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/pkg/errors"
+	"github.com/containers/common/pkg/completion"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
 )
 
@@ -16,11 +20,12 @@ var (
 
   By default only volumes that are not being used by any containers will be removed. To remove the volumes anyways, use the --force flag.`
 	rmCommand = &cobra.Command{
-		Use:     "rm [flags] VOLUME [VOLUME...]",
-		Aliases: []string{"remove"},
-		Short:   "Remove one or more volumes",
-		Long:    volumeRmDescription,
-		RunE:    rm,
+		Use:               "rm [options] VOLUME [VOLUME...]",
+		Aliases:           []string{"remove"},
+		Short:             "Remove one or more volumes",
+		Long:              volumeRmDescription,
+		RunE:              rm,
+		ValidArgsFunction: common.AutocompleteVolumes,
 		Example: `podman volume rm myvol1 myvol2
   podman volume rm --all
   podman volume rm --force myvol`,
@@ -28,18 +33,21 @@ var (
 )
 
 var (
-	rmOptions = entities.VolumeRmOptions{}
+	rmOptions   = entities.VolumeRmOptions{}
+	stopTimeout int
 )
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: rmCommand,
 		Parent:  volumeCmd,
 	})
 	flags := rmCommand.Flags()
 	flags.BoolVarP(&rmOptions.All, "all", "a", false, "Remove all volumes")
 	flags.BoolVarP(&rmOptions.Force, "force", "f", false, "Remove a volume by force, even if it is being used by a container")
+	timeFlagName := "time"
+	flags.IntVarP(&stopTimeout, timeFlagName, "t", int(containerConfig.Engine.StopTimeout), "Seconds to wait for running containers to stop before killing the container")
+	_ = rmCommand.RegisterFlagCompletionFunc(timeFlagName, completion.AutocompleteNone)
 }
 
 func rm(cmd *cobra.Command, args []string) error {
@@ -49,16 +57,39 @@ func rm(cmd *cobra.Command, args []string) error {
 	if (len(args) > 0 && rmOptions.All) || (len(args) < 1 && !rmOptions.All) {
 		return errors.New("choose either one or more volumes or all")
 	}
+	if cmd.Flag("time").Changed {
+		if !rmOptions.Force {
+			return errors.New("--force option must be specified to use the --time option")
+		}
+		timeout := uint(stopTimeout)
+		rmOptions.Timeout = &timeout
+	}
 	responses, err := registry.ContainerEngine().VolumeRm(context.Background(), args, rmOptions)
 	if err != nil {
+		if rmOptions.Force && strings.Contains(err.Error(), define.ErrNoSuchVolume.Error()) {
+			return nil
+		}
+		setExitCode(err)
 		return err
 	}
 	for _, r := range responses {
 		if r.Err == nil {
 			fmt.Println(r.Id)
 		} else {
+			if rmOptions.Force && strings.Contains(r.Err.Error(), define.ErrNoSuchVolume.Error()) {
+				continue
+			}
+			setExitCode(r.Err)
 			errs = append(errs, r.Err)
 		}
 	}
 	return errs.PrintErrors()
+}
+
+func setExitCode(err error) {
+	if errors.Is(err, define.ErrNoSuchVolume) || strings.Contains(err.Error(), define.ErrNoSuchVolume.Error()) {
+		registry.SetExitCode(1)
+	} else if errors.Is(err, define.ErrVolumeBeingUsed) || strings.Contains(err.Error(), define.ErrVolumeBeingUsed.Error()) {
+		registry.SetExitCode(2)
+	}
 }

@@ -2,67 +2,75 @@ package containers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/utils"
-	"github.com/containers/podman/v2/cmd/podman/validate"
-	"github.com/containers/podman/v2/libpod/define"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/pkg/errors"
+	"github.com/containers/common/pkg/completion"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 )
 
 var (
 	waitDescription = `Block until one or more containers stop and then print their exit codes.
 `
 	waitCommand = &cobra.Command{
-		Use:   "wait [flags] CONTAINER [CONTAINER...]",
-		Short: "Block on one or more containers",
-		Long:  waitDescription,
-		RunE:  wait,
-		Example: `podman wait --interval 5000 ctrID
+		Use:               "wait [options] CONTAINER [CONTAINER...]",
+		Short:             "Block on one or more containers",
+		Long:              waitDescription,
+		RunE:              wait,
+		ValidArgsFunction: common.AutocompleteContainers,
+		Example: `podman wait --interval 5s ctrID
   podman wait ctrID1 ctrID2`,
 	}
 
 	containerWaitCommand = &cobra.Command{
-		Use:   waitCommand.Use,
-		Short: waitCommand.Short,
-		Long:  waitCommand.Long,
-		RunE:  waitCommand.RunE,
-		Example: `podman container wait --interval 5000 ctrID
+		Use:               waitCommand.Use,
+		Short:             waitCommand.Short,
+		Long:              waitCommand.Long,
+		RunE:              waitCommand.RunE,
+		ValidArgsFunction: waitCommand.ValidArgsFunction,
+		Example: `podman container wait --interval 5s ctrID
   podman container wait ctrID1 ctrID2`,
 	}
 )
 
 var (
-	waitOptions   = entities.WaitOptions{}
-	waitCondition string
+	waitOptions  = entities.WaitOptions{}
+	waitInterval string
 )
 
-func waitFlags(flags *pflag.FlagSet) {
-	flags.DurationVarP(&waitOptions.Interval, "interval", "i", time.Duration(250), "Milliseconds to wait before polling for completion")
-	flags.StringVar(&waitCondition, "condition", "stopped", "Condition to wait on")
+func waitFlags(cmd *cobra.Command) {
+	flags := cmd.Flags()
+
+	intervalFlagName := "interval"
+	flags.StringVarP(&waitInterval, intervalFlagName, "i", "250ms", "Time Interval to wait before polling for completion")
+	_ = cmd.RegisterFlagCompletionFunc(intervalFlagName, completion.AutocompleteNone)
+
+	flags.BoolVarP(&waitOptions.Ignore, "ignore", "", false, "Ignore if a container does not exist")
+
+	conditionFlagName := "condition"
+	flags.StringSliceVar(&waitOptions.Conditions, conditionFlagName, []string{}, "Condition to wait on")
+	_ = cmd.RegisterFlagCompletionFunc(conditionFlagName, common.AutocompleteWaitCondition)
 }
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: waitCommand,
 	})
-	waitFlags(waitCommand.Flags())
+	waitFlags(waitCommand)
 	validate.AddLatestFlag(waitCommand, &waitOptions.Latest)
 
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: containerWaitCommand,
 		Parent:  containerCmd,
 	})
-	waitFlags(containerWaitCommand.Flags())
+	waitFlags(containerWaitCommand)
 	validate.AddLatestFlag(containerWaitCommand, &waitOptions.Latest)
-
 }
 
 func wait(cmd *cobra.Command, args []string) error {
@@ -70,20 +78,19 @@ func wait(cmd *cobra.Command, args []string) error {
 		err  error
 		errs utils.OutputErrors
 	)
-	if waitOptions.Interval == 0 {
-		return errors.New("interval must be greater then 0")
+	args = utils.RemoveSlash(args)
+	if waitOptions.Interval, err = time.ParseDuration(waitInterval); err != nil {
+		var err1 error
+		if waitOptions.Interval, err1 = time.ParseDuration(waitInterval + "ms"); err1 != nil {
+			return err
+		}
 	}
 
 	if !waitOptions.Latest && len(args) == 0 {
-		return errors.Errorf("%q requires a name, id, or the \"--latest\" flag", cmd.CommandPath())
+		return fmt.Errorf("%q requires a name, id, or the \"--latest\" flag", cmd.CommandPath())
 	}
 	if waitOptions.Latest && len(args) > 0 {
 		return errors.New("--latest and containers cannot be used together")
-	}
-
-	waitOptions.Condition, err = define.StringToContainerStatus(waitCondition)
-	if err != nil {
-		return err
 	}
 
 	responses, err := registry.ContainerEngine().ContainerWait(context.Background(), args, waitOptions)

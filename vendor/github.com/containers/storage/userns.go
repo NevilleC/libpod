@@ -1,17 +1,21 @@
+//go:build linux
+
 package storage
 
 import (
+	"fmt"
 	"os"
 	"os/user"
-	"path/filepath"
 	"strconv"
 
 	drivers "github.com/containers/storage/drivers"
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/containers/storage/pkg/unshare"
-	libcontainerUser "github.com/opencontainers/runc/libcontainer/user"
-	"github.com/pkg/errors"
+	"github.com/containers/storage/types"
+	securejoin "github.com/cyphar/filepath-securejoin"
+	libcontainerUser "github.com/moby/sys/user"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 // getAdditionalSubIDs looks up the additional IDs configured for
@@ -20,8 +24,8 @@ import (
 // possible to use an arbitrary entry in /etc/sub*id.
 // Differently, if the username is not specified for root users, a
 // default name is used.
-func getAdditionalSubIDs(username string) ([]idtools.IDMap, []idtools.IDMap, error) {
-	var uids, gids []idtools.IDMap
+func getAdditionalSubIDs(username string) (*idSet, *idSet, error) {
+	var uids, gids *idSet
 
 	if unshare.IsRootless() {
 		username = os.Getenv("USER")
@@ -42,90 +46,101 @@ func getAdditionalSubIDs(username string) ([]idtools.IDMap, []idtools.IDMap, err
 	}
 	mappings, err := idtools.NewIDMappings(username, username)
 	if err != nil {
-		logrus.Errorf("cannot find mappings for user %q: %v", username, err)
+		logrus.Errorf("Cannot find mappings for user %q: %v", username, err)
 	} else {
-		uids = mappings.UIDs()
-		gids = mappings.GIDs()
+		uids = getHostIDs(mappings.UIDs())
+		gids = getHostIDs(mappings.GIDs())
 	}
 	return uids, gids, nil
 }
 
-// getAvailableMappings returns the list of ranges that are usable by the current user.
+// getAvailableIDs returns the list of ranges that are usable by the current user.
 // When running as root, it looks up the additional IDs assigned to the specified user.
 // When running as rootless, the mappings assigned to the unprivileged user are converted
 // to the IDs inside of the initial rootless user namespace.
-func (s *store) getAvailableMappings() ([]idtools.IDMap, []idtools.IDMap, error) {
-	if s.autoUIDMap == nil {
+func (s *store) getAvailableIDs() (*idSet, *idSet, error) {
+	if s.additionalUIDs == nil {
 		uids, gids, err := getAdditionalSubIDs(s.autoUsernsUser)
 		if err != nil {
 			return nil, nil, err
 		}
 		// Store the result so we don't need to look it up again next time
-		s.autoUIDMap, s.autoGIDMap = uids, gids
+		s.additionalUIDs, s.additionalGIDs = uids, gids
 	}
-
-	uids := s.autoUIDMap
-	gids := s.autoGIDMap
 
 	if !unshare.IsRootless() {
 		// No mapping to inner namespace needed
-		return copyIDMap(uids), copyIDMap(gids), nil
+		return s.additionalUIDs, s.additionalGIDs, nil
 	}
 
 	// We are already inside of the rootless user namespace.
 	// We need to remap the configured mappings to what is available
 	// inside of the rootless userns.
-	totaluid := 0
-	totalgid := 0
-	for _, u := range uids {
-		totaluid += u.Size
-	}
-	for _, g := range gids {
-		totalgid += g.Size
-	}
-
-	u := []idtools.IDMap{{ContainerID: 0, HostID: 1, Size: totaluid}}
-	g := []idtools.IDMap{{ContainerID: 0, HostID: 1, Size: totalgid}}
+	u := newIDSet([]interval{{start: 1, end: s.additionalUIDs.size() + 1}})
+	g := newIDSet([]interval{{start: 1, end: s.additionalGIDs.size() + 1}})
 	return u, g, nil
 }
+
+// nobodyUser returns the UID and GID of the "nobody" user.  Hardcode its value
+// for simplicity.
+const nobodyUser = 65534
 
 // parseMountedFiles returns the maximum UID and GID found in the /etc/passwd and
 // /etc/group files.
 func parseMountedFiles(containerMount, passwdFile, groupFile string) uint32 {
+	var (
+		passwd *os.File
+		group  *os.File
+		size   int
+		err    error
+	)
 	if passwdFile == "" {
-		passwdFile = filepath.Join(containerMount, "etc/passwd")
+		passwd, err = secureOpen(containerMount, "/etc/passwd")
+	} else {
+		// User-specified override from a volume. Will not be in
+		// container root.
+		passwd, err = os.Open(passwdFile)
 	}
-	if groupFile == "" {
-		groupFile = filepath.Join(groupFile, "etc/group")
-	}
-
-	size := 0
-
-	users, err := libcontainerUser.ParsePasswdFile(passwdFile)
 	if err == nil {
-		for _, u := range users {
-			// Skip the "nobody" user otherwise we end up with 65536
-			// ids with most images
-			if u.Name == "nobody" {
-				continue
-			}
-			if u.Uid > size {
-				size = u.Uid
-			}
-			if u.Gid > size {
-				size = u.Gid
+		defer passwd.Close()
+
+		users, err := libcontainerUser.ParsePasswd(passwd)
+		if err == nil {
+			for _, u := range users {
+				// Skip the "nobody" user otherwise we end up with 65536
+				// ids with most images
+				if u.Name == "nobody" || u.Name == "nogroup" {
+					continue
+				}
+				if u.Uid > size && u.Uid != nobodyUser {
+					size = u.Uid + 1
+				}
+				if u.Gid > size && u.Gid != nobodyUser {
+					size = u.Gid + 1
+				}
 			}
 		}
 	}
 
-	groups, err := libcontainerUser.ParseGroupFile(groupFile)
+	if groupFile == "" {
+		group, err = secureOpen(containerMount, "/etc/group")
+	} else {
+		// User-specified override from a volume. Will not be in
+		// container root.
+		group, err = os.Open(groupFile)
+	}
 	if err == nil {
-		for _, g := range groups {
-			if g.Name == "nobody" {
-				continue
-			}
-			if g.Gid > size {
-				size = g.Gid
+		defer group.Close()
+
+		groups, err := libcontainerUser.ParseGroup(group)
+		if err == nil {
+			for _, g := range groups {
+				if g.Name == "nobody" || g.Name == "nogroup" {
+					continue
+				}
+				if g.Gid > size && g.Gid != nobodyUser {
+					size = g.Gid + 1
+				}
 			}
 		}
 	}
@@ -134,16 +149,9 @@ func parseMountedFiles(containerMount, passwdFile, groupFile string) uint32 {
 }
 
 // getMaxSizeFromImage returns the maximum ID used by the specified image.
-// The layer stores must be already locked.
-func (s *store) getMaxSizeFromImage(id string, image *Image, passwdFile, groupFile string) (uint32, error) {
-	lstore, err := s.LayerStore()
-	if err != nil {
-		return 0, err
-	}
-	lstores, err := s.ROLayerStores()
-	if err != nil {
-		return 0, err
-	}
+// On entry, rlstore must be locked for writing, and lstores must be locked for reading.
+func (s *store) getMaxSizeFromImage(image *Image, rlstore rwLayerStore, lstores []roLayerStore, passwdFile, groupFile string) (_ uint32, retErr error) {
+	layerStores := append([]roLayerStore{rlstore}, lstores...)
 
 	size := uint32(0)
 
@@ -151,7 +159,7 @@ func (s *store) getMaxSizeFromImage(id string, image *Image, passwdFile, groupFi
 	layerName := image.TopLayer
 outer:
 	for {
-		for _, ls := range append([]ROLayerStore{lstore}, lstores...) {
+		for _, ls := range layerStores {
 			layer, err := ls.Get(layerName)
 			if err != nil {
 				continue
@@ -175,16 +183,11 @@ outer:
 			}
 			continue outer
 		}
-		return 0, errors.Errorf("cannot find layer %q", layerName)
-	}
-
-	rlstore, err := s.LayerStore()
-	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("cannot find layer %q", layerName)
 	}
 
 	layerOptions := &LayerOptions{
-		IDMappingOptions: IDMappingOptions{
+		IDMappingOptions: types.IDMappingOptions{
 			HostUIDMapping: true,
 			HostGIDMapping: true,
 			UIDMap:         nil,
@@ -194,11 +197,19 @@ outer:
 
 	// We need to create a temporary layer so we can mount it and lookup the
 	// maximum IDs used.
-	clayer, err := rlstore.Create(id, topLayer, nil, "", nil, layerOptions, false)
+	clayer, _, err := rlstore.create("", topLayer, nil, "", nil, layerOptions, false, nil, nil)
 	if err != nil {
 		return 0, err
 	}
-	defer rlstore.Delete(clayer.ID)
+	defer func() {
+		if err2 := rlstore.Delete(clayer.ID); err2 != nil {
+			if retErr == nil {
+				retErr = fmt.Errorf("deleting temporary layer %#v: %w", clayer.ID, err2)
+			} else {
+				logrus.Errorf("Error deleting temporary layer %#v: %v", clayer.ID, err2)
+			}
+		}
+	}()
 
 	mountOptions := drivers.MountOpts{
 		MountLabel: "",
@@ -211,7 +222,15 @@ outer:
 	if err != nil {
 		return 0, err
 	}
-	defer rlstore.Unmount(clayer.ID, true)
+	defer func() {
+		if _, err2 := rlstore.unmount(clayer.ID, true, false); err2 != nil {
+			if retErr == nil {
+				retErr = fmt.Errorf("unmounting temporary layer %#v: %w", clayer.ID, err2)
+			} else {
+				logrus.Errorf("Error unmounting temporary layer %#v: %v", clayer.ID, err2)
+			}
+		}
+	}()
 
 	userFilesSize := parseMountedFiles(mountpoint, passwdFile, groupFile)
 	if userFilesSize > size {
@@ -221,166 +240,9 @@ outer:
 	return size, nil
 }
 
-// subtractHostIDs return the subtraction of the range USED from AVAIL.  The range is specified
-// by [HostID, HostID+Size).
-// ContainerID is ignored.
-func subtractHostIDs(avail idtools.IDMap, used idtools.IDMap) []idtools.IDMap {
-	switch {
-	case used.HostID <= avail.HostID && used.HostID+used.Size >= avail.HostID+avail.Size:
-		return nil
-	case used.HostID <= avail.HostID && used.HostID+used.Size > avail.HostID && used.HostID+used.Size < avail.HostID+avail.Size:
-		newContainerID := avail.ContainerID + used.Size
-		newHostID := used.HostID + used.Size
-		r := idtools.IDMap{
-			ContainerID: newContainerID,
-			HostID:      newHostID,
-			Size:        avail.Size + avail.HostID - newHostID,
-		}
-		return []idtools.IDMap{r}
-	case used.HostID > avail.HostID && used.HostID < avail.HostID+avail.Size && used.HostID+used.Size >= avail.HostID+avail.Size:
-		r := idtools.IDMap{
-			ContainerID: avail.ContainerID,
-			HostID:      avail.HostID,
-			Size:        used.HostID - avail.HostID,
-		}
-		return []idtools.IDMap{r}
-	case used.HostID > avail.HostID && used.HostID < avail.HostID+avail.Size && used.HostID+used.Size < avail.HostID+avail.Size:
-		r1 := idtools.IDMap{
-			ContainerID: avail.ContainerID,
-			HostID:      avail.HostID,
-			Size:        used.HostID - avail.HostID,
-		}
-		r2 := idtools.IDMap{
-			ContainerID: used.ContainerID + used.Size,
-			HostID:      avail.HostID + (used.HostID - avail.HostID),
-			Size:        avail.HostID + avail.Size - used.HostID - used.Size,
-		}
-		return []idtools.IDMap{r1, r2}
-	default:
-		r := idtools.IDMap{
-			ContainerID: 0,
-			HostID:      avail.HostID,
-			Size:        avail.Size,
-		}
-		return []idtools.IDMap{r}
-	}
-}
-
-// subtractContainerIDs return the subtraction of the range USED from AVAIL.  The range is specified
-// by [ContainerID, ContainerID+Size).
-// HostID is ignored.
-func subtractContainerIDs(avail idtools.IDMap, used idtools.IDMap) []idtools.IDMap {
-	switch {
-	case used.ContainerID <= avail.ContainerID && used.ContainerID+used.Size >= avail.ContainerID+avail.Size:
-		return nil
-	case used.ContainerID <= avail.ContainerID && used.ContainerID+used.Size > avail.ContainerID && used.ContainerID+used.Size < avail.ContainerID+avail.Size:
-		newContainerID := used.ContainerID + used.Size
-		newHostID := avail.HostID + used.Size
-		r := idtools.IDMap{
-			ContainerID: newContainerID,
-			HostID:      newHostID,
-			Size:        avail.Size + avail.ContainerID - newContainerID,
-		}
-		return []idtools.IDMap{r}
-	case used.ContainerID > avail.ContainerID && used.ContainerID < avail.ContainerID+avail.Size && used.ContainerID+used.Size >= avail.ContainerID+avail.Size:
-		r := idtools.IDMap{
-			ContainerID: avail.ContainerID,
-			HostID:      avail.HostID,
-			Size:        used.ContainerID - avail.ContainerID,
-		}
-		return []idtools.IDMap{r}
-	case used.ContainerID > avail.ContainerID && used.ContainerID < avail.ContainerID+avail.Size && used.ContainerID+used.Size < avail.ContainerID+avail.Size:
-		r1 := idtools.IDMap{
-			ContainerID: avail.ContainerID,
-			HostID:      avail.HostID,
-			Size:        used.ContainerID - avail.ContainerID,
-		}
-		r2 := idtools.IDMap{
-			ContainerID: used.ContainerID + used.Size,
-			HostID:      avail.HostID + (used.ContainerID - avail.ContainerID),
-			Size:        avail.ContainerID + avail.Size - used.ContainerID - used.Size,
-		}
-		return []idtools.IDMap{r1, r2}
-	default:
-		r := idtools.IDMap{
-			ContainerID: avail.ContainerID,
-			HostID:      avail.HostID,
-			Size:        avail.Size,
-		}
-		return []idtools.IDMap{r}
-	}
-}
-
-// subtractAll subtracts all usedIDs from the available IDs.
-func subtractAll(availableIDs, usedIDs []idtools.IDMap, host bool) []idtools.IDMap {
-	for _, u := range usedIDs {
-		var newAvailableIDs []idtools.IDMap
-		for _, cur := range availableIDs {
-			var newRanges []idtools.IDMap
-			if host {
-				newRanges = subtractHostIDs(cur, u)
-			} else {
-				newRanges = subtractContainerIDs(cur, u)
-			}
-			newAvailableIDs = append(newAvailableIDs, newRanges...)
-		}
-		availableIDs = newAvailableIDs
-	}
-	return availableIDs
-}
-
-// findAvailableIDRange returns the list of IDs that are not used by existing containers.
-// This function is used to lookup both UIDs and GIDs.
-func findAvailableIDRange(size uint32, availableIDs, usedIDs []idtools.IDMap) ([]idtools.IDMap, error) {
-	var avail []idtools.IDMap
-
-	// ContainerID will be adjusted later.
-	for _, i := range availableIDs {
-		n := idtools.IDMap{
-			ContainerID: 0,
-			HostID:      i.HostID,
-			Size:        i.Size,
-		}
-		avail = append(avail, n)
-	}
-	avail = subtractAll(avail, usedIDs, true)
-
-	currentID := 0
-	remaining := size
-	// We know the size for each intervals, let's adjust the ContainerID for each
-	// of them.
-	for i := 0; i < len(avail); i++ {
-		avail[i].ContainerID = currentID
-		if uint32(avail[i].Size) >= remaining {
-			avail[i].Size = int(remaining)
-			return avail[:i+1], nil
-		}
-		remaining -= uint32(avail[i].Size)
-		currentID += avail[i].Size
-	}
-
-	return nil, errors.New("could not find enough available IDs")
-}
-
-// findAvailableRange returns both the list of UIDs and GIDs ranges that are not
-// currently used by other containers.
-// It is a wrapper for findAvailableIDRange.
-func findAvailableRange(sizeUID, sizeGID uint32, availableUIDs, availableGIDs, usedUIDs, usedGIDs []idtools.IDMap) ([]idtools.IDMap, []idtools.IDMap, error) {
-	UIDMap, err := findAvailableIDRange(sizeUID, availableUIDs, usedUIDs)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	GIDMap, err := findAvailableIDRange(sizeGID, availableGIDs, usedGIDs)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return UIDMap, GIDMap, nil
-}
-
 // getAutoUserNS creates an automatic user namespace
-func (s *store) getAutoUserNS(id string, options *AutoUserNsOptions, image *Image) ([]idtools.IDMap, []idtools.IDMap, error) {
+// If image != nil, On entry, rlstore must be locked for writing, and lstores must be locked for reading.
+func (s *store) getAutoUserNS(options *types.AutoUserNsOptions, image *Image, rlstore rwLayerStore, lstores []roLayerStore) ([]idtools.IDMap, []idtools.IDMap, error) {
 	requestedSize := uint32(0)
 	initialSize := uint32(1)
 	if options.Size > 0 {
@@ -390,12 +252,12 @@ func (s *store) getAutoUserNS(id string, options *AutoUserNsOptions, image *Imag
 		initialSize = options.InitialSize
 	}
 
-	availableUIDs, availableGIDs, err := s.getAvailableMappings()
+	availableUIDs, availableGIDs, err := s.getAvailableIDs()
 	if err != nil {
-		return nil, nil, errors.Wrapf(err, "cannot read mappings")
+		return nil, nil, fmt.Errorf("cannot read mappings: %w", err)
 	}
 
-	// Look every container that is using a user namespace and store
+	// Look at every container that is using a user namespace and store
 	// the intervals that are already used.
 	containers, err := s.Containers()
 	if err != nil {
@@ -419,7 +281,7 @@ func (s *store) getAutoUserNS(id string, options *AutoUserNsOptions, image *Imag
 			size = s.autoNsMinSize
 		}
 		if image != nil {
-			sizeFromImage, err := s.getMaxSizeFromImage(id, image, options.PasswdFile, options.GroupFile)
+			sizeFromImage, err := s.getMaxSizeFromImage(image, rlstore, lstores, options.PasswdFile, options.GroupFile)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -428,25 +290,55 @@ func (s *store) getAutoUserNS(id string, options *AutoUserNsOptions, image *Imag
 			}
 		}
 		if s.autoNsMaxSize > 0 && size > s.autoNsMaxSize {
-			return nil, nil, errors.Errorf("the container needs a user namespace with size %q that is bigger than the maximum value allowed with userns=auto %q", size, s.autoNsMaxSize)
+			return nil, nil, fmt.Errorf("the container needs a user namespace with size %v that is bigger than the maximum value allowed with userns=auto %v", size, s.autoNsMaxSize)
 		}
 	}
+
+	return getAutoUserNSIDMappings(
+		int(size),
+		availableUIDs, availableGIDs,
+		usedUIDs, usedGIDs,
+		options.AdditionalUIDMappings, options.AdditionalGIDMappings,
+	)
+}
+
+// getAutoUserNSIDMappings computes the user/group id mappings for the automatic user namespace.
+func getAutoUserNSIDMappings(
+	size int,
+	availableUIDs, availableGIDs *idSet,
+	usedUIDMappings, usedGIDMappings, additionalUIDMappings, additionalGIDMappings []idtools.IDMap,
+) ([]idtools.IDMap, []idtools.IDMap, error) {
+	usedUIDs := getHostIDs(append(usedUIDMappings, additionalUIDMappings...))
+	usedGIDs := getHostIDs(append(usedGIDMappings, additionalGIDMappings...))
+
+	// Exclude additional uids and gids from requested range.
+	targetIDs := newIDSet([]interval{{start: 0, end: size}})
+	requestedContainerUIDs := targetIDs.subtract(getContainerIDs(additionalUIDMappings))
+	requestedContainerGIDs := targetIDs.subtract(getContainerIDs(additionalGIDMappings))
+
 	// Make sure the specified additional IDs are not used as part of the automatic
 	// mapping
-	usedUIDs = append(usedUIDs, options.AdditionalUIDMappings...)
-	usedGIDs = append(usedGIDs, options.AdditionalGIDMappings...)
-	availableUIDs, availableGIDs, err = findAvailableRange(size, size, availableUIDs, availableGIDs, usedUIDs, usedGIDs)
+	availableUIDs, err := availableUIDs.subtract(usedUIDs).findAvailable(requestedContainerUIDs.size())
+	if err != nil {
+		return nil, nil, err
+	}
+	availableGIDs, err = availableGIDs.subtract(usedGIDs).findAvailable(requestedContainerGIDs.size())
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// We need to make sure the specified container IDs are also dropped from the automatic
-	// namespaces we have found.
-	if len(options.AdditionalUIDMappings) > 0 {
-		availableUIDs = subtractAll(availableUIDs, options.AdditionalUIDMappings, false)
+	uidMap := append(availableUIDs.zip(requestedContainerUIDs), additionalUIDMappings...)
+	gidMap := append(availableGIDs.zip(requestedContainerGIDs), additionalGIDMappings...)
+	return uidMap, gidMap, nil
+}
+
+// Securely open (read-only) a file in a container mount.
+func secureOpen(containerMount, file string) (*os.File, error) {
+	tmpFile, err := securejoin.OpenInRoot(containerMount, file)
+	if err != nil {
+		return nil, err
 	}
-	if len(options.AdditionalGIDMappings) > 0 {
-		availableGIDs = subtractAll(availableGIDs, options.AdditionalGIDMappings, false)
-	}
-	return append(availableUIDs, options.AdditionalUIDMappings...), append(availableGIDs, options.AdditionalGIDMappings...), nil
+	defer tmpFile.Close()
+
+	return securejoin.Reopen(tmpFile, unix.O_RDONLY)
 }

@@ -2,40 +2,44 @@ package containers
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"os"
+	"strings"
+	"time"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/validate"
-	"github.com/containers/podman/v2/libpod/define"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	envLib "github.com/containers/podman/v2/pkg/env"
-	"github.com/containers/podman/v2/pkg/rootless"
-	"github.com/pkg/errors"
+	"github.com/containers/common/pkg/completion"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	envLib "github.com/containers/podman/v5/pkg/env"
+	"github.com/containers/podman/v5/pkg/rootless"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 )
 
 var (
 	execDescription = `Execute the specified command inside a running container.
 `
 	execCommand = &cobra.Command{
-		Use:                   "exec [flags] CONTAINER [COMMAND [ARG...]]",
-		Short:                 "Run a process in a running container",
-		Long:                  execDescription,
-		RunE:                  exec,
-		DisableFlagsInUseLine: true,
+		Use:               "exec [options] CONTAINER COMMAND [ARG...]",
+		Short:             "Run a process in a running container",
+		Long:              execDescription,
+		RunE:              exec,
+		ValidArgsFunction: common.AutocompleteExecCommand,
 		Example: `podman exec -it ctrID ls
   podman exec -it -w /tmp myCtr pwd
   podman exec --user root ctrID ls`,
 	}
 
 	containerExecCommand = &cobra.Command{
-		Use:                   execCommand.Use,
-		Short:                 execCommand.Short,
-		Long:                  execCommand.Long,
-		RunE:                  execCommand.RunE,
-		DisableFlagsInUseLine: true,
+		Use:               execCommand.Use,
+		Short:             execCommand.Short,
+		Long:              execCommand.Long,
+		RunE:              execCommand.RunE,
+		ValidArgsFunction: execCommand.ValidArgsFunction,
 		Example: `podman container exec -it ctrID ls
   podman container exec -it -w /tmp myCtr pwd
   podman container exec --user root ctrID ls`,
@@ -48,18 +52,48 @@ var (
 	execDetach        bool
 )
 
-func execFlags(flags *pflag.FlagSet) {
+func execFlags(cmd *cobra.Command) {
+	podmanConfig := registry.PodmanConfig()
+	flags := cmd.Flags()
+
 	flags.SetInterspersed(false)
 	flags.BoolVarP(&execDetach, "detach", "d", false, "Run the exec session in detached mode (backgrounded)")
-	flags.StringVar(&execOpts.DetachKeys, "detach-keys", containerConfig.DetachKeys(), "Select the key sequence for detaching a container. Format is a single character [a-Z] or ctrl-<value> where <value> is one of: a-z, @, ^, [, , or _")
-	flags.StringArrayVarP(&envInput, "env", "e", []string{}, "Set environment variables")
-	flags.StringSliceVar(&envFile, "env-file", []string{}, "Read in a file of environment variables")
-	flags.BoolVarP(&execOpts.Interactive, "interactive", "i", false, "Keep STDIN open even if not attached")
-	flags.BoolVar(&execOpts.Privileged, "privileged", false, "Give the process extended Linux capabilities inside the container.  The default is false")
+
+	detachKeysFlagName := "detach-keys"
+	flags.StringVar(&execOpts.DetachKeys, detachKeysFlagName, containerConfig.DetachKeys(), "Select the key sequence for detaching a container. Format is a single character [a-Z] or ctrl-<value> where <value> is one of: a-z, @, ^, [, , or _")
+	_ = cmd.RegisterFlagCompletionFunc(detachKeysFlagName, common.AutocompleteDetachKeys)
+
+	envFlagName := "env"
+	flags.StringArrayVarP(&envInput, envFlagName, "e", []string{}, "Set environment variables")
+	_ = cmd.RegisterFlagCompletionFunc(envFlagName, completion.AutocompleteNone)
+
+	envFileFlagName := "env-file"
+	flags.StringArrayVar(&envFile, envFileFlagName, []string{}, "Read in a file of environment variables")
+	_ = cmd.RegisterFlagCompletionFunc(envFileFlagName, completion.AutocompleteDefault)
+
+	flags.BoolVarP(&execOpts.Interactive, "interactive", "i", false, "Make STDIN available to the contained process")
+	flags.BoolVar(&execOpts.Privileged, "privileged", podmanConfig.ContainersConfDefaultsRO.Containers.Privileged, "Give the process extended Linux capabilities inside the container.  The default is false")
 	flags.BoolVarP(&execOpts.Tty, "tty", "t", false, "Allocate a pseudo-TTY. The default is false")
-	flags.StringVarP(&execOpts.User, "user", "u", "", "Sets the username or UID used and optionally the groupname or GID for the specified command")
-	flags.UintVar(&execOpts.PreserveFDs, "preserve-fds", 0, "Pass N additional file descriptors to the container")
-	flags.StringVarP(&execOpts.WorkDir, "workdir", "w", "", "Working directory inside the container")
+
+	userFlagName := "user"
+	flags.StringVarP(&execOpts.User, userFlagName, "u", "", "Sets the username or UID used and optionally the groupname or GID for the specified command")
+	_ = cmd.RegisterFlagCompletionFunc(userFlagName, common.AutocompleteUserFlag)
+
+	preserveFdsFlagName := "preserve-fds"
+	flags.UintVar(&execOpts.PreserveFDs, preserveFdsFlagName, 0, "Pass N additional file descriptors to the container")
+	_ = cmd.RegisterFlagCompletionFunc(preserveFdsFlagName, completion.AutocompleteNone)
+
+	preserveFdFlagName := "preserve-fd"
+	flags.UintSliceVar(&execOpts.PreserveFD, preserveFdFlagName, nil, "Pass a list of additional file descriptors to the container")
+	_ = cmd.RegisterFlagCompletionFunc(preserveFdFlagName, completion.AutocompleteNone)
+
+	workdirFlagName := "workdir"
+	flags.StringVarP(&execOpts.WorkDir, workdirFlagName, "w", "", "Working directory inside the container")
+	_ = cmd.RegisterFlagCompletionFunc(workdirFlagName, completion.AutocompleteDefault)
+
+	waitFlagName := "wait"
+	flags.Int32(waitFlagName, 0, "Total seconds to wait for container to start")
+	_ = flags.MarkHidden(waitFlagName)
 
 	if registry.IsRemote() {
 		_ = flags.MarkHidden("preserve-fds")
@@ -68,22 +102,20 @@ func execFlags(flags *pflag.FlagSet) {
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: execCommand,
 	})
-	execFlags(execCommand.Flags())
+	execFlags(execCommand)
 	validate.AddLatestFlag(execCommand, &execOpts.Latest)
 
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: containerExecCommand,
 		Parent:  containerCmd,
 	})
-	execFlags(containerExecCommand.Flags())
+	execFlags(containerExecCommand)
 	validate.AddLatestFlag(containerExecCommand, &execOpts.Latest)
 }
 
-func exec(_ *cobra.Command, args []string) error {
+func exec(cmd *cobra.Command, args []string) error {
 	var nameOrID string
 
 	if len(args) == 0 && !execOpts.Latest {
@@ -92,7 +124,7 @@ func exec(_ *cobra.Command, args []string) error {
 	execOpts.Cmd = args
 	if !execOpts.Latest {
 		execOpts.Cmd = args[1:]
-		nameOrID = args[0]
+		nameOrID = strings.TrimPrefix(args[0], "/")
 	}
 	// Validate given environment variables
 	execOpts.Envs = make(map[string]string)
@@ -106,14 +138,32 @@ func exec(_ *cobra.Command, args []string) error {
 
 	cliEnv, err := envLib.ParseSlice(envInput)
 	if err != nil {
-		return errors.Wrap(err, "error parsing environment variables")
+		return fmt.Errorf("parsing environment variables: %w", err)
 	}
 
 	execOpts.Envs = envLib.Join(execOpts.Envs, cliEnv)
 
+	for _, fd := range execOpts.PreserveFD {
+		if !rootless.IsFdInherited(int(fd)) {
+			return fmt.Errorf("file descriptor %d is not available - the preserve-fd option requires that file descriptors must be passed", fd)
+		}
+	}
+
 	for fd := 3; fd < int(3+execOpts.PreserveFDs); fd++ {
 		if !rootless.IsFdInherited(fd) {
-			return errors.Errorf("file descriptor %d is not available - the preserve-fds option requires that file descriptors must be passed", fd)
+			return fmt.Errorf("file descriptor %d is not available - the preserve-fds option requires that file descriptors must be passed", fd)
+		}
+	}
+
+	if cmd.Flags().Changed("wait") {
+		seconds, err := cmd.Flags().GetInt32("wait")
+		if err != nil {
+			return err
+		}
+		if err := execWait(nameOrID, seconds); err != nil {
+			if errors.Is(err, define.ErrCanceled) {
+				return fmt.Errorf("timed out waiting for container: %s", nameOrID)
+			}
 		}
 	}
 
@@ -139,4 +189,34 @@ func exec(_ *cobra.Command, args []string) error {
 	}
 	fmt.Println(id)
 	return nil
+}
+
+func execWait(ctr string, seconds int32) error {
+	maxDuration := time.Duration(seconds) * time.Second
+	interval := 100 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(registry.Context(), maxDuration)
+	defer cancel()
+
+	waitOptions.Conditions = []string{define.ContainerStateRunning.String()}
+
+	startTime := time.Now()
+	for time.Since(startTime) < maxDuration {
+		_, err := registry.ContainerEngine().ContainerWait(ctx, []string{ctr}, waitOptions)
+		if err == nil {
+			return nil
+		}
+
+		if !errors.Is(err, define.ErrNoSuchCtr) {
+			return err
+		}
+
+		interval *= 2
+		since := time.Since(startTime)
+		if since+interval > maxDuration {
+			interval = maxDuration - since
+		}
+		time.Sleep(interval)
+	}
+	return define.ErrCanceled
 }

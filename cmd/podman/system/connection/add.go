@@ -1,232 +1,265 @@
 package connection
 
 import (
-	"bytes"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"net"
 	"net/url"
 	"os"
-	"os/user"
 	"regexp"
+	"strings"
 
+	"github.com/containers/common/pkg/completion"
 	"github.com/containers/common/pkg/config"
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/system"
-	"github.com/containers/podman/v2/libpod/define"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/containers/podman/v2/pkg/terminal"
-	"github.com/pkg/errors"
+	"github.com/containers/common/pkg/ssh"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/system"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
 )
-
-const schemaPattern = "^[A-Za-z][A-Za-z0-9+.-]*:"
 
 var (
 	addCmd = &cobra.Command{
-		Use:   "add [flags] NAME DESTINATION",
+		Use:   "add [options] NAME DESTINATION",
 		Args:  cobra.ExactArgs(2),
 		Short: "Record destination for the Podman service",
 		Long: `Add destination to podman configuration.
-  "destination" is of the form [user@]hostname or
-  an URI of the form ssh://[user@]hostname[:port]
+  "destination" is one of the form:
+    [user@]hostname (will default to ssh)
+    ssh://[user@]hostname[:port][/path] (will obtain socket path from service, if not given.)
+    tcp://hostname:port (not secured)
+    unix://path (absolute path required)
 `,
-		RunE: add,
+		RunE:              add,
+		ValidArgsFunction: completion.AutocompleteNone,
 		Example: `podman system connection add laptop server.fubar.com
   podman system connection add --identity ~/.ssh/dev_rsa testing ssh://root@server.fubar.com:2222
   podman system connection add --identity ~/.ssh/dev_rsa --port 22 production root@server.fubar.com
+  podman system connection add debug tcp://localhost:8080
   `,
 	}
+
+	createCmd = &cobra.Command{
+		Use:               "create [options] NAME DESTINATION",
+		Args:              cobra.ExactArgs(1),
+		Short:             addCmd.Short,
+		Long:              addCmd.Long,
+		RunE:              create,
+		ValidArgsFunction: completion.AutocompleteNone,
+	}
+
+	dockerPath string
 
 	cOpts = struct {
 		Identity string
 		Port     int
 		UDSPath  string
 		Default  bool
+		Farm     string
 	}{}
 )
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: addCmd,
 		Parent:  system.ConnectionCmd,
 	})
-
 	flags := addCmd.Flags()
-	flags.IntVarP(&cOpts.Port, "port", "p", 22, "SSH port number for destination")
-	flags.StringVar(&cOpts.Identity, "identity", "", "path to SSH identity file")
-	flags.StringVar(&cOpts.UDSPath, "socket-path", "", "path to podman socket on remote host. (default '/run/podman/podman.sock' or '/run/user/{uid}/podman/podman.sock)")
+
+	portFlagName := "port"
+	flags.IntVarP(&cOpts.Port, portFlagName, "p", 22, "SSH port number for destination")
+	_ = addCmd.RegisterFlagCompletionFunc(portFlagName, completion.AutocompleteNone)
+
+	identityFlagName := "identity"
+	flags.StringVar(&cOpts.Identity, identityFlagName, "", "path to SSH identity file")
+	_ = addCmd.RegisterFlagCompletionFunc(identityFlagName, completion.AutocompleteDefault)
+
+	socketPathFlagName := "socket-path"
+	flags.StringVar(&cOpts.UDSPath, socketPathFlagName, "", "path to podman socket on remote host. (default '/run/podman/podman.sock' or '/run/user/{uid}/podman/podman.sock)")
+	_ = addCmd.RegisterFlagCompletionFunc(socketPathFlagName, completion.AutocompleteDefault)
+
+	farmFlagName := "farm"
+	flags.StringVarP(&cOpts.Farm, farmFlagName, "f", "", "Add the new connection to the given farm")
+	_ = addCmd.RegisterFlagCompletionFunc(farmFlagName, common.AutoCompleteFarms)
+	_ = flags.MarkHidden(farmFlagName)
+
 	flags.BoolVarP(&cOpts.Default, "default", "d", false, "Set connection to be default")
+
+	registry.Commands = append(registry.Commands, registry.CliCommand{
+		Command: createCmd,
+		Parent:  system.ContextCmd,
+	})
+
+	flags = createCmd.Flags()
+	dockerFlagName := "docker"
+	flags.StringVar(&dockerPath, dockerFlagName, "", "Description of the context")
+
+	_ = createCmd.RegisterFlagCompletionFunc(dockerFlagName, completion.AutocompleteNone)
+	flags.String("description", "", "Ignored.  Just for script compatibility")
+	flags.String("from", "", "Ignored.  Just for script compatibility")
+	flags.String("kubernetes", "", "Ignored.  Just for script compatibility")
+	flags.String("default-stack-orchestrator", "", "Ignored.  Just for script compatibility")
 }
 
 func add(cmd *cobra.Command, args []string) error {
-	// Default to ssh: schema if none given
+	// Default to ssh schema if none given
+
+	entities := &ssh.ConnectionCreateOptions{
+		Port:     cOpts.Port,
+		Path:     args[1],
+		Identity: cOpts.Identity,
+		Name:     args[0],
+		Socket:   cOpts.UDSPath,
+		Default:  cOpts.Default,
+		Farm:     cOpts.Farm,
+	}
 	dest := args[1]
-	if match, err := regexp.Match(schemaPattern, []byte(dest)); err != nil {
-		return errors.Wrapf(err, "internal regex error %q", schemaPattern)
+	if match, err := regexp.MatchString("^[A-Za-z][A-Za-z0-9+.-]*://", dest); err != nil {
+		return fmt.Errorf("invalid destination: %w", err)
 	} else if !match {
 		dest = "ssh://" + dest
 	}
-
 	uri, err := url.Parse(dest)
 	if err != nil {
-		return errors.Wrapf(err, "failed to parse %q", dest)
-	}
-
-	if uri.User.Username() == "" {
-		if uri.User, err = getUserInfo(uri); err != nil {
-			return err
-		}
+		return err
 	}
 
 	if cmd.Flags().Changed("socket-path") {
 		uri.Path = cmd.Flag("socket-path").Value.String()
 	}
 
-	if cmd.Flags().Changed("port") {
-		uri.Host = net.JoinHostPort(uri.Hostname(), cmd.Flag("port").Value.String())
+	var sshMode ssh.EngineMode
+	containerConfig := registry.PodmanConfig()
+
+	flag := containerConfig.SSHMode
+
+	sshMode = ssh.DefineMode(flag)
+
+	if sshMode == ssh.InvalidMode {
+		return fmt.Errorf("invalid ssh mode")
 	}
 
-	if uri.Port() == "" {
-		uri.Host = net.JoinHostPort(uri.Hostname(), cmd.Flag("port").DefValue)
-	}
-
-	if uri.Path == "" || uri.Path == "/" {
-		if uri.Path, err = getUDS(cmd, uri); err != nil {
-			return errors.Wrapf(err, "failed to connect to  %q", uri.String())
+	switch uri.Scheme {
+	case "ssh":
+		return ssh.Create(entities, sshMode)
+	case "unix":
+		if cmd.Flags().Changed("identity") {
+			return errors.New("--identity option not supported for unix scheme")
 		}
+
+		if cmd.Flags().Changed("socket-path") {
+			uri.Path = cmd.Flag("socket-path").Value.String()
+		}
+
+		info, err := os.Stat(uri.Path)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			logrus.Warnf("%q does not exist", uri.Path)
+		case errors.Is(err, os.ErrPermission):
+			logrus.Warnf("You do not have permission to read %q", uri.Path)
+		case err != nil:
+			return err
+		case info.Mode()&os.ModeSocket == 0:
+			return fmt.Errorf("%q exists and is not a unix domain socket", uri.Path)
+		}
+	case "tcp":
+		if cmd.Flags().Changed("socket-path") {
+			return errors.New("--socket-path option not supported for tcp scheme")
+		}
+		if cmd.Flags().Changed("identity") {
+			return errors.New("--identity option not supported for tcp scheme")
+		}
+		if uri.Port() == "" {
+			return errors.New("tcp scheme requires a port either via --port or in destination URL")
+		}
+	default:
+		logrus.Warnf("%q unknown scheme, no validation provided", uri.Scheme)
 	}
 
-	cfg, err := config.ReadCustomConfig()
+	dst := config.Destination{
+		URI:      uri.String(),
+		Identity: cOpts.Identity,
+	}
+
+	connection := args[0]
+	return config.EditConnectionConfig(func(cfg *config.ConnectionsFile) error {
+		if cOpts.Default {
+			cfg.Connection.Default = connection
+		}
+
+		if cfg.Connection.Connections == nil {
+			cfg.Connection.Connections = map[string]config.Destination{
+				connection: dst,
+			}
+			cfg.Connection.Default = connection
+		} else {
+			cfg.Connection.Connections[connection] = dst
+		}
+
+		// Create or update an existing farm with the connection being added
+		if cOpts.Farm != "" {
+			if len(cfg.Farm.List) == 0 {
+				cfg.Farm.Default = cOpts.Farm
+			}
+			if val, ok := cfg.Farm.List[cOpts.Farm]; ok {
+				cfg.Farm.List[cOpts.Farm] = append(val, connection)
+			} else {
+				cfg.Farm.List[cOpts.Farm] = []string{connection}
+			}
+		}
+		return nil
+	})
+}
+
+func create(cmd *cobra.Command, args []string) error {
+	dest, err := translateDest(dockerPath)
 	if err != nil {
 		return err
 	}
+	if match, err := regexp.MatchString("^[A-Za-z][A-Za-z0-9+.-]*://", dest); err != nil {
+		return fmt.Errorf("invalid destination: %w", err)
+	} else if !match {
+		dest = "ssh://" + dest
+	}
 
-	if cmd.Flags().Changed("default") {
-		if cOpts.Default {
-			cfg.Engine.ActiveService = args[0]
-		}
+	uri, err := url.Parse(dest)
+	if err != nil {
+		return err
 	}
 
 	dst := config.Destination{
 		URI: uri.String(),
 	}
 
-	if cmd.Flags().Changed("identity") {
-		dst.Identity = cOpts.Identity
-	}
-
-	if cfg.Engine.ServiceDestinations == nil {
-		cfg.Engine.ServiceDestinations = map[string]config.Destination{
-			args[0]: dst,
+	return config.EditConnectionConfig(func(cfg *config.ConnectionsFile) error {
+		if cfg.Connection.Connections == nil {
+			cfg.Connection.Connections = map[string]config.Destination{
+				args[0]: dst,
+			}
+			cfg.Connection.Default = args[0]
+		} else {
+			cfg.Connection.Connections[args[0]] = dst
 		}
-		cfg.Engine.ActiveService = args[0]
-	} else {
-		cfg.Engine.ServiceDestinations[args[0]] = dst
-	}
-	return cfg.Write()
+		return nil
+	})
 }
 
-func getUserInfo(uri *url.URL) (*url.Userinfo, error) {
-	var (
-		usr *user.User
-		err error
-	)
-	if u, found := os.LookupEnv("_CONTAINERS_ROOTLESS_UID"); found {
-		usr, err = user.LookupId(u)
-		if err != nil {
-			return nil, errors.Wrapf(err, "failed to find user %q", u)
-		}
-	} else {
-		usr, err = user.Current()
-		if err != nil {
-			return nil, errors.Wrapf(err, "failed to obtain current user")
-		}
+func translateDest(path string) (string, error) {
+	if path == "" {
+		return "", nil
 	}
-
-	pw, set := uri.User.Password()
-	if set {
-		return url.UserPassword(usr.Username, pw), nil
+	key, val, hasVal := strings.Cut(path, "=")
+	if !hasVal {
+		return key, nil
 	}
-	return url.User(usr.Username), nil
-}
-
-func getUDS(cmd *cobra.Command, uri *url.URL) (string, error) {
-	var authMethods []ssh.AuthMethod
-	passwd, set := uri.User.Password()
-	if set {
-		authMethods = append(authMethods, ssh.Password(passwd))
+	if key != "host" {
+		return "", fmt.Errorf("\"host\" is required for --docker option")
 	}
-
-	if cmd.Flags().Changed("identity") {
-		value := cmd.Flag("identity").Value.String()
-		auth, err := terminal.PublicKey(value, []byte(passwd))
-		if err != nil {
-			return "", errors.Wrapf(err, "Failed to read identity %q", value)
-		}
-		authMethods = append(authMethods, auth)
+	// "host=tcp://myserver:2376,ca=~/ca-file,cert=~/cert-file,key=~/key-file"
+	vals := strings.Split(val, ",")
+	if len(vals) > 1 {
+		return "", fmt.Errorf("--docker additional options %q not supported", strings.Join(vals[1:], ","))
 	}
-
-	if sock, found := os.LookupEnv("SSH_AUTH_SOCK"); found {
-		logrus.Debugf("Found SSH_AUTH_SOCK %q, ssh-agent signer enabled", sock)
-
-		c, err := net.Dial("unix", sock)
-		if err != nil {
-			return "", err
-		}
-		a := agent.NewClient(c)
-		authMethods = append(authMethods, ssh.PublicKeysCallback(a.Signers))
-	}
-
-	if len(authMethods) == 0 {
-		pass, err := terminal.ReadPassword(fmt.Sprintf("%s's login password:", uri.User.Username()))
-		if err != nil {
-			return "", err
-		}
-		authMethods = append(authMethods, ssh.Password(string(pass)))
-	}
-
-	cfg := &ssh.ClientConfig{
-		User:            uri.User.Username(),
-		Auth:            authMethods,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-	}
-	dial, err := ssh.Dial("tcp", uri.Host, cfg)
-	if err != nil {
-		return "", errors.Wrapf(err, "failed to connect to %q", uri.Host)
-	}
-	defer dial.Close()
-
-	session, err := dial.NewSession()
-	if err != nil {
-		return "", errors.Wrapf(err, "failed to create new ssh session on %q", uri.Host)
-	}
-	defer session.Close()
-
-	// Override podman binary for testing etc
-	podman := "podman"
-	if v, found := os.LookupEnv("PODMAN_BINARY"); found {
-		podman = v
-	}
-	run := podman + " info --format=json"
-
-	var buffer bytes.Buffer
-	session.Stdout = &buffer
-	if err := session.Run(run); err != nil {
-		return "", errors.Wrapf(err, "failed to run %q", run)
-	}
-
-	var info define.Info
-	if err := json.Unmarshal(buffer.Bytes(), &info); err != nil {
-		return "", errors.Wrapf(err, "failed to parse 'podman info' results")
-	}
-
-	if info.Host.RemoteSocket == nil || len(info.Host.RemoteSocket.Path) == 0 {
-		return "", fmt.Errorf("remote podman %q failed to report its UDS socket", uri.Host)
-	}
-	return info.Host.RemoteSocket.Path, nil
+	// for now we ignore other fields specified on command line
+	return vals[0], nil
 }

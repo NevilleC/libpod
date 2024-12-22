@@ -1,9 +1,8 @@
 package volumes
 
 import (
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/validate"
-	"github.com/containers/podman/v2/pkg/domain/entities"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/validate"
 	"github.com/spf13/cobra"
 )
 
@@ -18,11 +17,11 @@ var (
 		Long:  "Volumes are created in and can be shared between containers",
 		RunE:  validate.SubCommandExists,
 	}
+	containerConfig = registry.PodmanConfig().ContainersConfDefaultsRO
 )
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: volumeCmd,
 	})
 }

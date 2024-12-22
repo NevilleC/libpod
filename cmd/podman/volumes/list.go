@@ -2,17 +2,17 @@ package volumes
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io"
 	"os"
-	"strings"
-	"text/tabwriter"
-	"text/template"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/validate"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/pkg/errors"
+	"github.com/containers/common/pkg/completion"
+	"github.com/containers/common/pkg/report"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/parse"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
 )
 
@@ -23,12 +23,13 @@ podman volume ls
 List all available volumes. The output of the volumes can be filtered
 and the output format can be changed to JSON or a user specified Go template.`
 	lsCommand = &cobra.Command{
-		Use:     "ls",
-		Aliases: []string{"list"},
-		Args:    validate.NoArgs,
-		Short:   "List volumes",
-		Long:    volumeLsDescription,
-		RunE:    list,
+		Use:               "ls [options]",
+		Aliases:           []string{"list"},
+		Args:              validate.NoArgs,
+		Short:             "List volumes",
+		Long:              volumeLsDescription,
+		RunE:              list,
+		ValidArgsFunction: completion.AutocompleteNone,
 	}
 )
 
@@ -44,69 +45,78 @@ var (
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: lsCommand,
 		Parent:  volumeCmd,
 	})
 	flags := lsCommand.Flags()
-	flags.StringSliceVarP(&cliOpts.Filter, "filter", "f", []string{}, "Filter volume output")
-	flags.StringVar(&cliOpts.Format, "format", "{{.Driver}}\t{{.Name}}\n", "Format volume output using Go template")
+
+	filterFlagName := "filter"
+	flags.StringArrayVarP(&cliOpts.Filter, filterFlagName, "f", []string{}, "Filter volume output")
+	_ = lsCommand.RegisterFlagCompletionFunc(filterFlagName, common.AutocompleteVolumeFilters)
+
+	formatFlagName := "format"
+	flags.StringVar(&cliOpts.Format, formatFlagName, "{{range .}}{{.Driver}}\t{{.Name}}\n{{end -}}", "Format volume output using Go template")
+	_ = lsCommand.RegisterFlagCompletionFunc(formatFlagName, common.AutocompleteFormat(&entities.VolumeListReport{}))
+
+	flags.BoolP("noheading", "n", false, "Do not print headers")
 	flags.BoolVarP(&cliOpts.Quiet, "quiet", "q", false, "Print volume output in quiet mode")
 }
 
 func list(cmd *cobra.Command, args []string) error {
-	var w io.Writer = os.Stdout
+	var err error
 	if cliOpts.Quiet && cmd.Flag("format").Changed {
 		return errors.New("quiet and format flags cannot be used together")
 	}
 	if len(cliOpts.Filter) > 0 {
 		lsOpts.Filter = make(map[string][]string)
 	}
-	for _, f := range cliOpts.Filter {
-		filterSplit := strings.Split(f, "=")
-		if len(filterSplit) < 2 {
-			return errors.Errorf("filter input must be in the form of filter=value: %s is invalid", f)
-		}
-		lsOpts.Filter[filterSplit[0]] = append(lsOpts.Filter[filterSplit[0]], filterSplit[1:]...)
+	lsOpts.Filter, err = parse.FilterArgumentsIntoFilters(cliOpts.Filter)
+	if err != nil {
+		return err
 	}
+
 	responses, err := registry.ContainerEngine().VolumeList(context.Background(), lsOpts)
 	if err != nil {
 		return err
 	}
-	if cliOpts.Format == "json" {
-		return outputJSON(responses)
-	}
 
-	if len(responses) < 1 {
+	switch {
+	case report.IsJSON(cliOpts.Format):
+		return outputJSON(responses)
+	case len(responses) < 1:
 		return nil
 	}
-	// "\t" from the command line is not being recognized as a tab
-	// replacing the string "\t" to a tab character if the user passes in "\t"
-	cliOpts.Format = strings.Replace(cliOpts.Format, `\t`, "\t", -1)
-	if cliOpts.Quiet {
-		cliOpts.Format = "{{.Name}}\n"
+	return outputTemplate(cmd, responses)
+}
+
+func outputTemplate(cmd *cobra.Command, responses []*entities.VolumeListReport) error {
+	noHeading, _ := cmd.Flags().GetBool("noheading")
+	headers := report.Headers(entities.VolumeListReport{}, map[string]string{
+		"Name": "VOLUME NAME",
+	})
+
+	rpt := report.New(os.Stdout, cmd.Name())
+	defer rpt.Flush()
+
+	var err error
+	switch {
+	case cmd.Flag("format").Changed:
+		rpt, err = rpt.Parse(report.OriginUser, cliOpts.Format)
+	case cliOpts.Quiet:
+		rpt, err = rpt.Parse(report.OriginUser, "{{.Name}}\n")
+	default:
+		rpt, err = rpt.Parse(report.OriginPodman, cliOpts.Format)
 	}
-	headers := "DRIVER\tVOLUME NAME\n"
-	row := cliOpts.Format
-	if !strings.HasSuffix(cliOpts.Format, "\n") {
-		row += "\n"
-	}
-	format := "{{range . }}" + row + "{{end}}"
-	if !cliOpts.Quiet && !cmd.Flag("format").Changed {
-		w = tabwriter.NewWriter(os.Stdout, 12, 2, 2, ' ', 0)
-		format = headers + format
-	}
-	tmpl, err := template.New("listVolume").Parse(format)
 	if err != nil {
 		return err
 	}
-	if err := tmpl.Execute(w, responses); err != nil {
-		return err
+
+	if (rpt.RenderHeaders) && !noHeading {
+		if err := rpt.Execute(headers); err != nil {
+			return fmt.Errorf("failed to write report column headers: %w", err)
+		}
 	}
-	if flusher, ok := w.(interface{ Flush() error }); ok {
-		return flusher.Flush()
-	}
-	return nil
+	return rpt.Execute(responses)
 }
 
 func outputJSON(vols []*entities.VolumeListReport) error {

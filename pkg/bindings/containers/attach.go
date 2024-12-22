@@ -4,28 +4,42 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
-	"os/signal"
 	"reflect"
 	"strconv"
 	"time"
 
-	"github.com/containers/podman/v2/libpod/define"
-	"github.com/containers/podman/v2/pkg/bindings"
-	sig "github.com/containers/podman/v2/pkg/signal"
-	"github.com/containers/podman/v2/utils"
-	"github.com/pkg/errors"
+	"github.com/containers/common/pkg/detach"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/bindings"
+	"github.com/moby/term"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/crypto/ssh/terminal"
+	terminal "golang.org/x/term"
 )
 
-// Attach attaches to a running container
-func Attach(ctx context.Context, nameOrID string, detachKeys *string, logs, stream *bool, stdin io.Reader, stdout io.Writer, stderr io.Writer, attachReady chan bool) error {
+// The CloseWriter interface is used to determine whether we can do a  one-sided
+// close of a hijacked connection.
+type CloseWriter interface {
+	CloseWrite() error
+}
+
+// Attach attaches to a running container.
+//
+// NOTE: When stdin is provided, this function currently leaks a goroutine reading from that stream
+// even if the ctx is cancelled. The goroutine will only exit if the input stream is closed. For example,
+// if stdin is `os.Stdin` attached to a tty, the goroutine will consume a chunk of user input from the
+// terminal even after the container has exited. In this scenario the os.Stdin stream will not be expected
+// to be closed.
+func Attach(ctx context.Context, nameOrID string, stdin io.Reader, stdout io.Writer, stderr io.Writer, attachReady chan bool, options *AttachOptions) error {
+	if options == nil {
+		options = new(AttachOptions)
+	}
 	isSet := struct {
 		stdin  bool
 		stdout bool
@@ -46,28 +60,29 @@ func Attach(ctx context.Context, nameOrID string, detachKeys *string, logs, stre
 		stderr = (io.Writer)(nil)
 	}
 
-	logrus.Infof("Going to attach to container %q", nameOrID)
-
 	conn, err := bindings.GetClient(ctx)
 	if err != nil {
 		return err
 	}
 
 	// Do we need to wire in stdin?
-	ctnr, err := Inspect(ctx, nameOrID, bindings.PFalse)
+	ctnr, err := Inspect(ctx, nameOrID, new(InspectOptions).WithSize(false))
 	if err != nil {
 		return err
 	}
 
-	params := url.Values{}
-	if detachKeys != nil {
-		params.Add("detachKeys", *detachKeys)
+	params, err := options.ToParams()
+	if err != nil {
+		return err
 	}
-	if logs != nil {
-		params.Add("logs", fmt.Sprintf("%t", *logs))
-	}
-	if stream != nil {
-		params.Add("stream", fmt.Sprintf("%t", *stream))
+	detachKeysInBytes := []byte{}
+	if options.Changed("DetachKeys") {
+		params.Add("detachKeys", options.GetDetachKeys())
+
+		detachKeysInBytes, err = term.ToBytes(options.GetDetachKeys())
+		if err != nil {
+			return fmt.Errorf("invalid detach keys: %w", err)
+		}
 	}
 	if isSet.stdin {
 		params.Add("stdin", "true")
@@ -81,7 +96,8 @@ func Attach(ctx context.Context, nameOrID string, detachKeys *string, logs, stre
 
 	// Unless all requirements are met, don't use "stdin" is a terminal
 	file, ok := stdin.(*os.File)
-	needTTY := ok && terminal.IsTerminal(int(file.Fd())) && ctnr.Config.Tty
+	outFile, outOk := stdout.(*os.File)
+	needTTY := ok && outOk && terminal.IsTerminal(int(file.Fd())) && ctnr.Config.Tty
 	if needTTY {
 		state, err := setRawTerminal(file)
 		if err != nil {
@@ -89,15 +105,15 @@ func Attach(ctx context.Context, nameOrID string, detachKeys *string, logs, stre
 		}
 		defer func() {
 			if err := terminal.Restore(int(file.Fd()), state); err != nil {
-				logrus.Errorf("unable to restore terminal: %q", err)
+				logrus.Errorf("Unable to restore terminal: %q", err)
 			}
 			logrus.SetFormatter(&logrus.TextFormatter{})
 		}()
 	}
 
-	headers := make(map[string]string)
-	headers["Connection"] = "Upgrade"
-	headers["Upgrade"] = "tcp"
+	headers := make(http.Header)
+	headers.Add("Connection", "Upgrade")
+	headers.Add("Upgrade", "tcp")
 
 	var socket net.Conn
 	socketSet := false
@@ -117,21 +133,22 @@ func Attach(ctx context.Context, nameOrID string, detachKeys *string, logs, stre
 		IdleConnTimeout: time.Duration(0),
 	}
 	conn.Client.Transport = t
-	response, err := conn.DoRequest(nil, http.MethodPost, "/containers/%s/attach", params, headers, nameOrID)
+	response, err := conn.DoRequest(ctx, nil, http.MethodPost, "/containers/%s/attach", params, headers, nameOrID)
 	if err != nil {
 		return err
 	}
+
 	if !(response.IsSuccess() || response.IsInformational()) {
+		defer response.Body.Close()
 		return response.Process(nil)
 	}
 
 	if needTTY {
 		winChange := make(chan os.Signal, 1)
-		signal.Notify(winChange, sig.SIGWINCH)
 		winCtx, winCancel := context.WithCancel(ctx)
 		defer winCancel()
-
-		go attachHandleResize(ctx, winCtx, winChange, false, nameOrID, file)
+		notifyWinChange(winCtx, winChange, file, outFile)
+		attachHandleResize(ctx, winCtx, winChange, false, nameOrID, file, outFile)
 	}
 
 	// If we are attaching around a start, we need to "signal"
@@ -141,35 +158,65 @@ func Attach(ctx context.Context, nameOrID string, detachKeys *string, logs, stre
 		attachReady <- true
 	}
 
+	stdoutChan := make(chan error)
+	stdinChan := make(chan error, 1) // stdin channel should not block
+
 	if isSet.stdin {
 		go func() {
 			logrus.Debugf("Copying STDIN to socket")
-			_, err := utils.CopyDetachable(socket, stdin, []byte{})
-			if err != nil {
-				logrus.Error("failed to write input to service: " + err.Error())
+
+			_, err := detach.Copy(socket, stdin, detachKeysInBytes)
+			if err != nil && err != define.ErrDetach {
+				logrus.Errorf("Failed to write input to service: %v", err)
 			}
+			if err == nil {
+				if closeWrite, ok := socket.(CloseWriter); ok {
+					if err := closeWrite.CloseWrite(); err != nil {
+						logrus.Warnf("Failed to close STDIN for writing: %v", err)
+					}
+				}
+			}
+			stdinChan <- err
 		}()
 	}
 
 	buffer := make([]byte, 1024)
 	if ctnr.Config.Tty {
-		logrus.Debugf("Copying STDOUT of container in terminal mode")
+		go func() {
+			logrus.Debugf("Copying STDOUT of container in terminal mode")
 
-		if !isSet.stdout {
-			return fmt.Errorf("container %q requires stdout to be set", ctnr.ID)
-		}
-		// If not multiplex'ed, read from server and write to stdout
-		_, err := io.Copy(stdout, socket)
-		if err != nil {
-			return err
+			if !isSet.stdout {
+				stdoutChan <- fmt.Errorf("container %q requires stdout to be set", ctnr.ID)
+			}
+			// If not multiplex'ed, read from server and write to stdout
+			_, err := io.Copy(stdout, socket)
+
+			stdoutChan <- err
+		}()
+
+		for {
+			select {
+			case err := <-stdoutChan:
+				if err != nil {
+					return err
+				}
+
+				return nil
+			case err := <-stdinChan:
+				if err != nil {
+					return err
+				}
+
+				return nil
+			}
 		}
 	} else {
-		logrus.Debugf("Copying standard streams of container in non-terminal mode")
+		logrus.Debugf("Copying standard streams of container %q in non-terminal mode", ctnr.ID)
 		for {
 			// Read multiplexed channels and write to appropriate stream
 			fd, l, err := DemuxHeader(socket, buffer)
 			if err != nil {
-				if errors.Is(err, io.EOF) {
+				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 					return nil
 				}
 				return err
@@ -199,13 +246,12 @@ func Attach(ctx context.Context, nameOrID string, detachKeys *string, logs, stre
 					}
 				}
 			case fd == 3:
-				return fmt.Errorf("error from service from stream: %s", frame)
+				return fmt.Errorf("from service from stream: %s", frame)
 			default:
 				return fmt.Errorf("unrecognized channel '%d' in header, 0-3 supported", fd)
 			}
 		}
 	}
-	return nil
 }
 
 // DemuxHeader reads header for stream from server multiplexed stdin/stdout/stderr/2nd error channel
@@ -221,7 +267,7 @@ func DemuxHeader(r io.Reader, buffer []byte) (fd, sz int, err error) {
 
 	fd = int(buffer[0])
 	if fd < 0 || fd > 3 {
-		err = errors.Wrapf(ErrLostSync, fmt.Sprintf(`channel "%d" found, 0-3 supported`, fd))
+		err = fmt.Errorf(`channel "%d" found, 0-3 supported: %w`, fd, ErrLostSync)
 		return
 	}
 
@@ -237,7 +283,7 @@ func DemuxFrame(r io.Reader, buffer []byte, length int) (frame []byte, err error
 
 	n, err := io.ReadFull(r, buffer[0:length])
 	if err != nil {
-		return nil, nil
+		return nil, err
 	}
 	if n < length {
 		err = io.ErrUnexpectedEOF
@@ -248,13 +294,19 @@ func DemuxFrame(r io.Reader, buffer []byte, length int) (frame []byte, err error
 }
 
 // ResizeContainerTTY sets container's TTY height and width in characters
-func ResizeContainerTTY(ctx context.Context, nameOrID string, height *int, width *int) error {
-	return resizeTTY(ctx, bindings.JoinURL("containers", nameOrID, "resize"), height, width)
+func ResizeContainerTTY(ctx context.Context, nameOrID string, options *ResizeTTYOptions) error {
+	if options == nil {
+		options = new(ResizeTTYOptions)
+	}
+	return resizeTTY(ctx, bindings.JoinURL("containers", nameOrID, "resize"), options.Height, options.Width)
 }
 
 // ResizeExecTTY sets session's TTY height and width in characters
-func ResizeExecTTY(ctx context.Context, nameOrID string, height *int, width *int) error {
-	return resizeTTY(ctx, bindings.JoinURL("exec", nameOrID, "resize"), height, width)
+func ResizeExecTTY(ctx context.Context, sessionID string, options *ResizeExecTTYOptions) error {
+	if options == nil {
+		options = new(ResizeExecTTYOptions)
+	}
+	return resizeTTY(ctx, bindings.JoinURL("exec", sessionID, "resize"), options.Height, options.Width)
 }
 
 // resizeTTY set size of TTY of container
@@ -271,10 +323,13 @@ func resizeTTY(ctx context.Context, endpoint string, height *int, width *int) er
 	if width != nil {
 		params.Set("w", strconv.Itoa(*width))
 	}
-	rsp, err := conn.DoRequest(nil, http.MethodPost, endpoint, params, nil)
+	params.Set("running", "true")
+	rsp, err := conn.DoRequest(ctx, nil, http.MethodPost, endpoint, params, nil)
 	if err != nil {
 		return err
 	}
+	defer rsp.Body.Close()
+
 	return rsp.Process(nil)
 }
 
@@ -290,37 +345,43 @@ func (f *rawFormatter) Format(entry *logrus.Entry) ([]byte, error) {
 	return append(buffer, '\r'), nil
 }
 
-// This is intended to be run as a goroutine, handling resizing for a container
-// or exec session.
-func attachHandleResize(ctx, winCtx context.Context, winChange chan os.Signal, isExec bool, id string, file *os.File) {
-	// Prime the pump, we need one reset to ensure everything is ready
-	winChange <- sig.SIGWINCH
-	for {
-		select {
-		case <-winCtx.Done():
-			return
-		case <-winChange:
-			h, w, err := terminal.GetSize(int(file.Fd()))
-			if err != nil {
-				logrus.Warnf("failed to obtain TTY size: " + err.Error())
-			}
+// This is intended to not be run as a goroutine, handling resizing for a container
+// or exec session. It will call resize once and then starts a goroutine which calls resize on winChange
+func attachHandleResize(ctx, winCtx context.Context, winChange chan os.Signal, isExec bool, id string, file *os.File, outFile *os.File) {
+	resize := func() {
+		w, h, err := getTermSize(file, outFile)
+		if err != nil {
+			logrus.Warnf("Failed to obtain TTY size: %v", err)
+		}
 
-			var resizeErr error
-			if isExec {
-				resizeErr = ResizeExecTTY(ctx, id, &h, &w)
-			} else {
-				resizeErr = ResizeContainerTTY(ctx, id, &h, &w)
-			}
-			if resizeErr != nil {
-				logrus.Warnf("failed to resize TTY: " + resizeErr.Error())
-			}
+		var resizeErr error
+		if isExec {
+			resizeErr = ResizeExecTTY(ctx, id, new(ResizeExecTTYOptions).WithHeight(h).WithWidth(w))
+		} else {
+			resizeErr = ResizeContainerTTY(ctx, id, new(ResizeTTYOptions).WithHeight(h).WithWidth(w))
+		}
+		if resizeErr != nil {
+			logrus.Debugf("Failed to resize TTY: %v", resizeErr)
 		}
 	}
+
+	resize()
+
+	go func() {
+		for {
+			select {
+			case <-winCtx.Done():
+				return
+			case <-winChange:
+				resize()
+			}
+		}
+	}()
 }
 
 // Configure the given terminal for raw mode
 func setRawTerminal(file *os.File) (*terminal.State, error) {
-	state, err := terminal.MakeRaw(int(file.Fd()))
+	state, err := makeRawTerm(file)
 	if err != nil {
 		return nil, err
 	}
@@ -331,7 +392,10 @@ func setRawTerminal(file *os.File) (*terminal.State, error) {
 }
 
 // ExecStartAndAttach starts and attaches to a given exec session.
-func ExecStartAndAttach(ctx context.Context, sessionID string, streams *define.AttachStreams) error {
+func ExecStartAndAttach(ctx context.Context, sessionID string, options *ExecStartAndAttachOptions) error {
+	if options == nil {
+		options = new(ExecStartAndAttachOptions)
+	}
 	conn, err := bindings.GetClient(ctx)
 	if err != nil {
 		return err
@@ -340,15 +404,17 @@ func ExecStartAndAttach(ctx context.Context, sessionID string, streams *define.A
 	// TODO: Make this configurable (can't use streams' InputStream as it's
 	// buffered)
 	terminalFile := os.Stdin
+	terminalOutFile := os.Stdout
 
 	logrus.Debugf("Starting & Attaching to exec session ID %q", sessionID)
 
 	// We need to inspect the exec session first to determine whether to use
 	// -t.
-	resp, err := conn.DoRequest(nil, http.MethodGet, "/exec/%s/json", nil, nil, sessionID)
+	resp, err := conn.DoRequest(ctx, nil, http.MethodGet, "/exec/%s/json", nil, nil, sessionID)
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 
 	respStruct := new(define.InspectExecSession)
 	if err := resp.Process(respStruct); err != nil {
@@ -362,6 +428,17 @@ func ExecStartAndAttach(ctx context.Context, sessionID string, streams *define.A
 	// If we are in TTY mode, we need to set raw mode for the terminal.
 	// TODO: Share all of this with Attach() for containers.
 	needTTY := terminalFile != nil && terminal.IsTerminal(int(terminalFile.Fd())) && isTerm
+
+	body := struct {
+		Detach bool   `json:"Detach"`
+		TTY    bool   `json:"Tty"`
+		Height uint16 `json:"h"`
+		Width  uint16 `json:"w"`
+	}{
+		Detach: false,
+		TTY:    needTTY,
+	}
+
 	if needTTY {
 		state, err := setRawTerminal(terminalFile)
 		if err != nil {
@@ -369,17 +446,18 @@ func ExecStartAndAttach(ctx context.Context, sessionID string, streams *define.A
 		}
 		defer func() {
 			if err := terminal.Restore(int(terminalFile.Fd()), state); err != nil {
-				logrus.Errorf("unable to restore terminal: %q", err)
+				logrus.Errorf("Unable to restore terminal: %q", err)
 			}
 			logrus.SetFormatter(&logrus.TextFormatter{})
 		}()
+		w, h, err := getTermSize(terminalFile, terminalOutFile)
+		if err != nil {
+			logrus.Warnf("Failed to obtain TTY size: %v", err)
+		}
+		body.Width = uint16(w)
+		body.Height = uint16(h)
 	}
 
-	body := struct {
-		Detach bool `json:"Detach"`
-	}{
-		Detach: false,
-	}
 	bodyJSON, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -403,29 +481,38 @@ func ExecStartAndAttach(ctx context.Context, sessionID string, streams *define.A
 		IdleConnTimeout: time.Duration(0),
 	}
 	conn.Client.Transport = t
-	response, err := conn.DoRequest(bytes.NewReader(bodyJSON), http.MethodPost, "/exec/%s/start", nil, nil, sessionID)
+	response, err := conn.DoRequest(ctx, bytes.NewReader(bodyJSON), http.MethodPost, "/exec/%s/start", nil, nil, sessionID)
 	if err != nil {
 		return err
 	}
+	defer response.Body.Close()
+
 	if !(response.IsSuccess() || response.IsInformational()) {
 		return response.Process(nil)
 	}
 
 	if needTTY {
 		winChange := make(chan os.Signal, 1)
-		signal.Notify(winChange, sig.SIGWINCH)
 		winCtx, winCancel := context.WithCancel(ctx)
 		defer winCancel()
 
-		go attachHandleResize(ctx, winCtx, winChange, true, sessionID, terminalFile)
+		notifyWinChange(winCtx, winChange, terminalFile, terminalOutFile)
+		attachHandleResize(ctx, winCtx, winChange, true, sessionID, terminalFile, terminalOutFile)
 	}
 
-	if streams.AttachInput {
+	if options.GetAttachInput() {
 		go func() {
 			logrus.Debugf("Copying STDIN to socket")
-			_, err := utils.CopyDetachable(socket, streams.InputStream, []byte{})
+			_, err := detach.Copy(socket, options.InputStream, []byte{})
 			if err != nil {
-				logrus.Error("failed to write input to service: " + err.Error())
+				logrus.Errorf("Failed to write input to service: %v", err)
+			}
+
+			if closeWrite, ok := socket.(CloseWriter); ok {
+				logrus.Debugf("Closing STDIN")
+				if err := closeWrite.CloseWrite(); err != nil {
+					logrus.Warnf("Failed to close STDIN for writing: %v", err)
+				}
 			}
 		}()
 	}
@@ -433,11 +520,11 @@ func ExecStartAndAttach(ctx context.Context, sessionID string, streams *define.A
 	buffer := make([]byte, 1024)
 	if isTerm {
 		logrus.Debugf("Handling terminal attach to exec")
-		if !streams.AttachOutput {
+		if !options.GetAttachOutput() {
 			return fmt.Errorf("exec session %s has a terminal and must have STDOUT enabled", sessionID)
 		}
 		// If not multiplex'ed, read from server and write to stdout
-		_, err := utils.CopyDetachable(streams.OutputStream, socket, []byte{})
+		_, err := detach.Copy(options.GetOutputStream(), socket, []byte{})
 		if err != nil {
 			return err
 		}
@@ -447,7 +534,7 @@ func ExecStartAndAttach(ctx context.Context, sessionID string, streams *define.A
 			// Read multiplexed channels and write to appropriate stream
 			fd, l, err := DemuxHeader(socket, buffer)
 			if err != nil {
-				if errors.Is(err, io.EOF) {
+				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 					return nil
 				}
 				return err
@@ -459,27 +546,27 @@ func ExecStartAndAttach(ctx context.Context, sessionID string, streams *define.A
 
 			switch {
 			case fd == 0:
-				if streams.AttachInput {
+				if options.GetAttachInput() {
 					// Write STDIN to STDOUT (echoing characters
 					// typed by another attach session)
-					if _, err := streams.OutputStream.Write(frame[0:l]); err != nil {
+					if _, err := options.GetOutputStream().Write(frame[0:l]); err != nil {
 						return err
 					}
 				}
 			case fd == 1:
-				if streams.AttachOutput {
-					if _, err := streams.OutputStream.Write(frame[0:l]); err != nil {
+				if options.GetAttachOutput() {
+					if _, err := options.GetOutputStream().Write(frame[0:l]); err != nil {
 						return err
 					}
 				}
 			case fd == 2:
-				if streams.AttachError {
-					if _, err := streams.ErrorStream.Write(frame[0:l]); err != nil {
+				if options.GetAttachError() {
+					if _, err := options.GetErrorStream().Write(frame[0:l]); err != nil {
 						return err
 					}
 				}
 			case fd == 3:
-				return fmt.Errorf("error from service from stream: %s", frame)
+				return fmt.Errorf("from service from stream: %s", frame)
 			default:
 				return fmt.Errorf("unrecognized channel '%d' in header, 0-3 supported", fd)
 			}

@@ -7,10 +7,11 @@ import (
 	"os"
 	"strings"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/utils"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/pkg/errors"
+	"github.com/containers/common/pkg/completion"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
 )
 
@@ -19,20 +20,21 @@ var (
 )
 
 var (
-	pruneDescription = fmt.Sprintf(`podman pod prune Removes all exited pods`)
+	pruneDescription = `podman pod prune Removes all exited pods`
 
 	pruneCommand = &cobra.Command{
-		Use:     "prune [flags]",
-		Short:   "Remove all stopped pods and their containers",
-		Long:    pruneDescription,
-		RunE:    prune,
-		Example: `podman pod prune`,
+		Use:               "prune [options]",
+		Args:              validate.NoArgs,
+		Short:             "Remove all stopped pods and their containers",
+		Long:              pruneDescription,
+		RunE:              prune,
+		ValidArgsFunction: completion.AutocompleteNone,
+		Example:           `podman pod prune`,
 	}
 )
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: pruneCommand,
 		Parent:  podCmd,
 	})
@@ -41,16 +43,13 @@ func init() {
 }
 
 func prune(cmd *cobra.Command, args []string) error {
-	if len(args) > 0 {
-		return errors.Errorf("`%s` takes no arguments", cmd.CommandPath())
-	}
 	if !pruneOptions.Force {
 		reader := bufio.NewReader(os.Stdin)
 		fmt.Println("WARNING! This will remove all stopped/exited pods..")
 		fmt.Print("Are you sure you want to continue? [y/N] ")
 		answer, err := reader.ReadString('\n')
 		if err != nil {
-			return errors.Wrapf(err, "error reading input")
+			return err
 		}
 		if strings.ToLower(answer)[0] != 'y' {
 			return nil
@@ -60,5 +59,5 @@ func prune(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	return utils.PrintPodPruneResults(responses)
+	return utils.PrintPodPruneResults(responses, false)
 }

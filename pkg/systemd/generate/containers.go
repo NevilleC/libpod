@@ -1,7 +1,10 @@
+//go:build !remote
+
 package generate
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -9,83 +12,111 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/containers/podman/v2/libpod"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/containers/podman/v2/version"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/libpod"
+	libpodDefine "github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/systemd/define"
+	"github.com/containers/podman/v5/version"
 	"github.com/sirupsen/logrus"
+	"github.com/spf13/pflag"
 )
 
 // containerInfo contains data required for generating a container's systemd
 // unit file.
 type containerInfo struct {
-	// ServiceName of the systemd service.
-	ServiceName string
-	// Name or ID of the container.
-	ContainerNameOrID string
-	// StopTimeout sets the timeout Podman waits before killing the container
-	// during service stop.
-	StopTimeout uint
-	// RestartPolicy of the systemd unit (e.g., no, on-failure, always).
-	RestartPolicy string
-	// PIDFile of the service. Required for forking services. Must point to the
-	// PID of the associated conmon process.
-	PIDFile string
-	// ContainerIDFile to be used in the unit.
-	ContainerIDFile string
-	// GenerateTimestamp, if set the generated unit file has a time stamp.
-	GenerateTimestamp bool
-	// BoundToServices are the services this service binds to.  Note that this
-	// service runs after them.
-	BoundToServices []string
-	// PodmanVersion for the header. Will be set internally. Will be auto-filled
-	// if left empty.
-	PodmanVersion string
-	// Executable is the path to the podman executable. Will be auto-filled if
-	// left empty.
-	Executable string
-	// TimeStamp at the time of creating the unit file. Will be set internally.
-	TimeStamp string
-	// CreateCommand is the full command plus arguments of the process the
-	// container has been created with.
-	CreateCommand []string
-	// EnvVariable is generate.EnvVariable and must not be set.
-	EnvVariable string
-	// ExecStartPre of the unit.
-	ExecStartPre string
-	// ExecStart of the unit.
-	ExecStart string
-	// ExecStop of the unit.
-	ExecStop string
-	// ExecStopPost of the unit.
-	ExecStopPost string
-
-	// If not nil, the container is part of the pod.  We can use the
-	// podInfo to extract the relevant data.
-	pod *podInfo
+	ServiceName            string
+	ContainerNameOrID      string
+	Type                   string
+	NotifyAccess           string
+	StopTimeout            uint
+	RestartPolicy          string
+	RestartSec             uint
+	StartLimitBurst        string
+	PIDFile                string
+	ContainerIDFile        string
+	GenerateTimestamp      bool
+	BoundToServices        []string
+	PodmanVersion          string
+	Executable             string
+	RootFlags              string
+	TimeStamp              string
+	CreateCommand          []string
+	containerEnv           []string
+	ExtraEnvs              []string
+	EnvVariable            string
+	AdditionalEnvVariables []string
+	ExecStart              string
+	TimeoutStartSec        uint
+	TimeoutStopSec         uint
+	ExecStartPre           string
+	ExecStop               string
+	ExecStopPost           string
+	GenerateNoHeader       bool
+	Pod                    *podInfo
+	GraphRoot              string
+	RunRoot                string
+	IdentifySpecifier      bool
+	Wants                  []string
+	After                  []string
+	Requires               []string
 }
 
 const containerTemplate = headerTemplate + `
-{{- if .BoundToServices}}
-BindsTo={{- range $index, $value := .BoundToServices -}}{{if $index}} {{end}}{{ $value }}.service{{end}}
-After={{- range $index, $value := .BoundToServices -}}{{if $index}} {{end}}{{ $value }}.service{{end}}
-{{- end}}
+{{{{- if .BoundToServices}}}}
+BindsTo={{{{- range $index, $value := .BoundToServices -}}}}{{{{if $index}}}} {{{{end}}}}{{{{ $value }}}}.service{{{{end}}}}
+After={{{{- range $index, $value := .BoundToServices -}}}}{{{{if $index}}}} {{{{end}}}}{{{{ $value }}}}.service{{{{end}}}}
+{{{{- end}}}}
+{{{{- if or .Wants .After .Requires }}}}
+
+# User-defined dependencies
+{{{{- end}}}}
+{{{{- if .Wants}}}}
+Wants={{{{- range $index, $value := .Wants }}}}{{{{ if $index}}}} {{{{end}}}}{{{{ $value }}}}{{{{end}}}}
+{{{{- end}}}}
+{{{{- if .After}}}}
+After={{{{- range $index, $value := .After }}}}{{{{ if $index}}}} {{{{end}}}}{{{{ $value }}}}{{{{end}}}}
+{{{{- end}}}}
+{{{{- if .Requires}}}}
+Requires={{{{- range $index, $value := .Requires }}}}{{{{ if $index}}}} {{{{end}}}}{{{{ $value }}}}{{{{end}}}}
+{{{{- end}}}}
 
 [Service]
-Environment={{.EnvVariable}}=%n
-Restart={{.RestartPolicy}}
-{{- if .ExecStartPre}}
-ExecStartPre={{.ExecStartPre}}
-{{- end}}
-ExecStart={{.ExecStart}}
-ExecStop={{.ExecStop}}
-ExecStopPost={{.ExecStopPost}}
-PIDFile={{.PIDFile}}
-KillMode=none
-Type=forking
+Environment={{{{.EnvVariable}}}}=%n{{{{- if (eq .IdentifySpecifier true) }}}}-%i {{{{- end}}}}
+{{{{- if .ExtraEnvs}}}}
+Environment={{{{- range $index, $value := .ExtraEnvs -}}}}{{{{if $index}}}} {{{{end}}}}{{{{ $value }}}}{{{{end}}}}
+{{{{- end}}}}
+{{{{- if .AdditionalEnvVariables}}}}
+{{{{- range $index, $value := .AdditionalEnvVariables -}}}}{{{{if $index}}}}{{{{end}}}}
+Environment={{{{ $value }}}}{{{{end}}}}
+{{{{- end}}}}
+Restart={{{{.RestartPolicy}}}}
+{{{{- if .RestartSec}}}}
+RestartSec={{{{.RestartSec}}}}
+{{{{- end}}}}
+{{{{- if .StartLimitBurst}}}}
+StartLimitBurst={{{{.StartLimitBurst}}}}
+{{{{- end}}}}
+{{{{- if ne .TimeoutStartSec 0}}}}
+TimeoutStartSec={{{{.TimeoutStartSec}}}}
+{{{{- end}}}}
+TimeoutStopSec={{{{.TimeoutStopSec}}}}
+ExecStart={{{{.ExecStart}}}}
+{{{{- if .ExecStop}}}}
+ExecStop={{{{.ExecStop}}}}
+{{{{- end}}}}
+{{{{- if .ExecStopPost}}}}
+ExecStopPost={{{{.ExecStopPost}}}}
+{{{{- end}}}}
+{{{{- if .PIDFile}}}}
+PIDFile={{{{.PIDFile}}}}
+{{{{- end}}}}
+Type={{{{.Type}}}}
+{{{{- if .NotifyAccess}}}}
+NotifyAccess={{{{.NotifyAccess}}}}
+{{{{- end}}}}
 
 [Install]
-WantedBy=multi-user.target default.target
+WantedBy=default.target
 `
 
 // ContainerUnit generates a systemd unit for the specified container.  Based
@@ -104,34 +135,74 @@ func ContainerUnit(ctr *libpod.Container, options entities.GenerateSystemdOption
 }
 
 func generateContainerInfo(ctr *libpod.Container, options entities.GenerateSystemdOptions) (*containerInfo, error) {
-	timeout := ctr.StopTimeout()
+	stopTimeout := ctr.StopTimeout()
 	if options.StopTimeout != nil {
-		timeout = *options.StopTimeout
+		stopTimeout = *options.StopTimeout
+	}
+
+	startTimeout := uint(0)
+	if options.StartTimeout != nil {
+		startTimeout = *options.StartTimeout
 	}
 
 	config := ctr.Config()
+	if len(config.InitContainerType) > 0 {
+		return nil, fmt.Errorf("unsupported container %s: cannot generate systemd units for init containers", ctr.ID())
+	}
+
 	conmonPidFile := config.ConmonPidFile
 	if conmonPidFile == "" {
-		return nil, errors.Errorf("conmon PID file path is empty, try to recreate the container with --conmon-pidfile flag")
+		return nil, errors.New("conmon PID file path is empty, try to recreate the container with --conmon-pidfile flag")
+	}
+
+	// #15284: old units generated without --new can lead to issues on
+	// shutdown when the containers are created with a custom restart
+	// policy.
+	if !options.New {
+		switch config.RestartPolicy {
+		case libpodDefine.RestartPolicyNo, libpodDefine.RestartPolicyNone:
+			// All good
+		default:
+			logrus.Warnf("Container %s has restart policy %q which can lead to issues on shutdown: consider recreating the container without a restart policy and use systemd's restart mechanism instead", ctr.ID(), config.RestartPolicy)
+		}
 	}
 
 	createCommand := []string{}
 	if config.CreateCommand != nil {
 		createCommand = config.CreateCommand
 	} else if options.New {
-		return nil, errors.Errorf("cannot use --new on container %q: no create command found", ctr.ID())
+		return nil, fmt.Errorf("cannot use --new on container %q: no create command found: only works on containers created directly with podman but not via REST API", ctr.ID())
 	}
 
 	nameOrID, serviceName := containerServiceName(ctr, options)
 
+	var runRoot string
+	if options.New {
+		runRoot = "%t/containers"
+	} else {
+		runRoot = ctr.Runtime().RunRoot()
+		if runRoot == "" {
+			return nil, errors.New("could not look up container's runroot: got empty string")
+		}
+	}
+
+	envs := config.Spec.Process.Env
+
 	info := containerInfo{
-		ServiceName:       serviceName,
-		ContainerNameOrID: nameOrID,
-		RestartPolicy:     options.RestartPolicy,
-		PIDFile:           conmonPidFile,
-		StopTimeout:       timeout,
-		GenerateTimestamp: true,
-		CreateCommand:     createCommand,
+		ServiceName:            serviceName,
+		ContainerNameOrID:      nameOrID,
+		RestartPolicy:          define.DefaultRestartPolicy,
+		PIDFile:                conmonPidFile,
+		TimeoutStartSec:        startTimeout,
+		StopTimeout:            stopTimeout,
+		GenerateTimestamp:      true,
+		CreateCommand:          createCommand,
+		RunRoot:                runRoot,
+		containerEnv:           envs,
+		Wants:                  options.Wants,
+		After:                  options.After,
+		Requires:               options.Requires,
+		AdditionalEnvVariables: options.AdditionalEnvVariables,
 	}
 
 	return &info, nil
@@ -144,16 +215,85 @@ func containerServiceName(ctr *libpod.Container, options entities.GenerateSystem
 	if options.Name {
 		nameOrID = ctr.Name()
 	}
-	serviceName := fmt.Sprintf("%s%s%s", options.ContainerPrefix, options.Separator, nameOrID)
+
+	serviceName := getServiceName(options.ContainerPrefix, options.Separator, nameOrID)
+
 	return nameOrID, serviceName
+}
+
+// setContainerNameForTemplate updates startCommand to contain the name argument with
+// a value that includes the identify specifier.
+// In case startCommand doesn't contain that argument it's added after "run" and its
+// value will be set to info.ServiceName concated with the identify specifier %i.
+func setContainerNameForTemplate(startCommand []string, info *containerInfo) ([]string, error) {
+	// find the index of "--name" in the command slice
+	nameIx := -1
+	for argIx, arg := range startCommand {
+		if arg == "--name" {
+			nameIx = argIx + 1
+			break
+		}
+		if strings.HasPrefix(arg, "--name=") {
+			nameIx = argIx
+			break
+		}
+	}
+	switch {
+	case nameIx == -1:
+		// if not found, add --name argument in the command slice before the "run" argument.
+		// it's assumed that the command slice contains this argument.
+		runIx := -1
+		for argIx, arg := range startCommand {
+			if arg == "run" {
+				runIx = argIx
+				break
+			}
+		}
+		if runIx == -1 {
+			return startCommand, fmt.Errorf("\"run\" is missing in the command arguments")
+		}
+		startCommand = append(startCommand[:runIx+1], startCommand[runIx:]...)
+		startCommand[runIx+1] = fmt.Sprintf("--name=%s-%%i", info.ServiceName)
+	default:
+		// append the identity specifier (%i) to the end of the --name value
+		startCommand[nameIx] = fmt.Sprintf("%s-%%i", startCommand[nameIx])
+	}
+	return startCommand, nil
+}
+
+func formatOptionsString(cmd string) string {
+	return formatOptions(strings.Split(cmd, " "))
+}
+
+func formatOptions(options []string) string {
+	var formatted strings.Builder
+	if len(options) == 0 {
+		return ""
+	}
+	formatted.WriteString(options[0])
+	for _, o := range options[1:] {
+		if strings.HasPrefix(o, "-") {
+			formatted.WriteString(" \\\n\t" + o)
+			continue
+		}
+		formatted.WriteString(" " + o)
+	}
+	return formatted.String()
 }
 
 // executeContainerTemplate executes the container template on the specified
 // containerInfo.  Note that the containerInfo is also post processed and
 // completed, which allows for an easier unit testing.
 func executeContainerTemplate(info *containerInfo, options entities.GenerateSystemdOptions) (string, error) {
-	if err := validateRestartPolicy(info.RestartPolicy); err != nil {
-		return "", err
+	if options.RestartPolicy != nil {
+		if err := validateRestartPolicy(*options.RestartPolicy); err != nil {
+			return "", err
+		}
+		info.RestartPolicy = *options.RestartPolicy
+	}
+
+	if options.RestartSec != nil {
+		info.RestartSec = *options.RestartSec
 	}
 
 	// Make sure the executable is set.
@@ -166,10 +306,14 @@ func executeContainerTemplate(info *containerInfo, options entities.GenerateSyst
 		info.Executable = executable
 	}
 
-	info.EnvVariable = EnvVariable
-	info.ExecStart = "{{.Executable}} start {{.ContainerNameOrID}}"
-	info.ExecStop = "{{.Executable}} stop {{if (ge .StopTimeout 0)}}-t {{.StopTimeout}}{{end}} {{.ContainerNameOrID}}"
-	info.ExecStopPost = "{{.Executable}} stop {{if (ge .StopTimeout 0)}}-t {{.StopTimeout}}{{end}} {{.ContainerNameOrID}}"
+	info.Type = "forking"
+	info.EnvVariable = define.EnvVariable
+	info.ExecStart = "{{{{.Executable}}}} start {{{{.ContainerNameOrID}}}}"
+	info.ExecStop = formatOptionsString("{{{{.Executable}}}} stop {{{{if (ge .StopTimeout 0)}}}} -t {{{{.StopTimeout}}}}{{{{end}}}} {{{{.ContainerNameOrID}}}}")
+	info.ExecStopPost = formatOptionsString("{{{{.Executable}}}} stop {{{{if (ge .StopTimeout 0)}}}} -t {{{{.StopTimeout}}}}{{{{end}}}} {{{{.ContainerNameOrID}}}}")
+	for i, env := range info.AdditionalEnvVariables {
+		info.AdditionalEnvVariables[i] = escapeSystemdArg(env)
+	}
 
 	// Assemble the ExecStart command when creating a new container.
 	//
@@ -179,50 +323,86 @@ func executeContainerTemplate(info *containerInfo, options entities.GenerateSyst
 	// invalid `info.CreateCommand`.  Hence, we're doing a best effort unit
 	// generation and don't try aiming at completeness.
 	if options.New {
-		info.PIDFile = "%t/" + info.ServiceName + ".pid"
-		info.ContainerIDFile = "%t/" + info.ServiceName + ".ctr-id"
+		info.Type = "notify"
+		info.NotifyAccess = "all"
+		info.PIDFile = ""
+		info.ContainerIDFile = "%t/%n.ctr-id"
+		info.ExecStop = formatOptionsString("{{{{.Executable}}}} stop --ignore {{{{if (ge .StopTimeout 0)}}}}-t {{{{.StopTimeout}}}}{{{{end}}}} --cidfile={{{{.ContainerIDFile}}}}")
+		info.ExecStopPost = formatOptionsString("{{{{.Executable}}}} rm -f --ignore {{{{if (ge .StopTimeout 0)}}}}-t {{{{.StopTimeout}}}}{{{{end}}}} --cidfile={{{{.ContainerIDFile}}}}")
 		// The create command must at least have three arguments:
 		// 	/usr/bin/podman run $IMAGE
-		index := 2
-		if info.CreateCommand[1] == "container" {
-			index = 3
+		index := 0
+		for i, arg := range info.CreateCommand {
+			if arg == "run" || arg == "create" {
+				index = i + 1
+				break
+			}
 		}
-		if len(info.CreateCommand) < index+1 {
-			return "", errors.Errorf("container's create command is too short or invalid: %v", info.CreateCommand)
+		if index == 0 {
+			return "", fmt.Errorf("container's create command is too short or invalid: %v", info.CreateCommand)
 		}
 		// We're hard-coding the first five arguments and append the
-		// CreateCommand with a stripped command and subcomand.
-		startCommand := []string{
-			info.Executable,
-			"run",
-			"--conmon-pidfile", "{{.PIDFile}}",
-			"--cidfile", "{{.ContainerIDFile}}",
-			"--cgroups=no-conmon",
+		// CreateCommand with a stripped command and subcommand.
+		startCommand := []string{info.Executable}
+		if index > 2 {
+			// include root flags
+			info.RootFlags = strings.Join(escapeSystemdArguments(info.CreateCommand[1:index-1]), " ")
+			startCommand = append(startCommand, info.CreateCommand[1:index-1]...)
 		}
-		// If the container is in a pod, make sure that the
-		// --pod-id-file is set correctly.
-		if info.pod != nil {
-			podFlags := []string{"--pod-id-file", info.pod.PodIDFile}
-			startCommand = append(startCommand, podFlags...)
-			info.CreateCommand = filterPodFlags(info.CreateCommand)
+		startCommand = append(startCommand,
+			"run",
+			"--cidfile={{{{.ContainerIDFile}}}}",
+			"--cgroups=no-conmon",
+			"--rm",
+		)
+		remainingCmd := info.CreateCommand[index:]
+		// Presence check for certain flags/options.
+		fs := pflag.NewFlagSet("args", pflag.ContinueOnError)
+		fs.ParseErrorsWhitelist.UnknownFlags = true
+		fs.Usage = func() {}
+		fs.SetInterspersed(false)
+		fs.BoolP("detach", "d", false, "")
+		fs.String("name", "", "")
+		fs.Bool("replace", false, "")
+		fs.StringArrayP("env", "e", nil, "")
+		fs.String("sdnotify", "", "")
+		fs.String("restart", "", "")
+		// have to define extra -h flag to prevent help error when parsing -h hostname
+		// https://github.com/containers/podman/issues/15124
+		fs.StringP("help", "h", "", "")
+		if err := fs.Parse(remainingCmd); err != nil {
+			return "", fmt.Errorf("parsing remaining command-line arguments: %w", err)
 		}
 
-		// Presence check for certain flags/options.
-		hasDetachParam := false
-		hasNameParam := false
-		hasReplaceParam := false
-		for _, p := range info.CreateCommand[index:] {
-			switch p {
-			case "--detach", "-d":
-				hasDetachParam = true
-			case "--name":
-				hasNameParam = true
-			case "--replace":
-				hasReplaceParam = true
-			}
-			if strings.HasPrefix(p, "--name=") {
-				hasNameParam = true
-			}
+		remainingCmd = filterCommonContainerFlags(remainingCmd, fs.NArg())
+		// If the container is in a pod, make sure that the
+		// --pod-id-file is set correctly.
+		if info.Pod != nil {
+			podFlags := []string{"--pod-id-file", "{{{{.Pod.PodIDFile}}}}"}
+			startCommand = append(startCommand, podFlags...)
+			remainingCmd = filterPodFlags(remainingCmd, fs.NArg())
+		}
+
+		hasDetachParam, err := fs.GetBool("detach")
+		if err != nil {
+			return "", err
+		}
+		hasNameParam := fs.Lookup("name").Changed
+		hasReplaceParam, err := fs.GetBool("replace")
+		if err != nil {
+			return "", err
+		}
+
+		// Default to --sdnotify=conmon unless already set by the
+		// container.
+		sdnotifyFlag := fs.Lookup("sdnotify")
+		if !sdnotifyFlag.Changed {
+			startCommand = append(startCommand, "--sdnotify=conmon")
+		} else if sdnotifyFlag.Value.String() == libpodDefine.SdNotifyModeIgnore {
+			// If ignore is set force conmon otherwise the unit with Type=notify will fail.
+			logrus.Infof("Forcing --sdnotify=conmon for container %s", info.ContainerNameOrID)
+			remainingCmd = removeSdNotifyArg(remainingCmd, fs.NArg())
+			startCommand = append(startCommand, "--sdnotify=conmon")
 		}
 
 		if !hasDetachParam {
@@ -238,30 +418,92 @@ func executeContainerTemplate(info *containerInfo, options entities.GenerateSyst
 			// will wait the `podman run` command exit until failed
 			// with timeout error.
 			startCommand = append(startCommand, "-d")
+
+			if fs.Changed("detach") {
+				// this can only happen if --detach=false is set
+				// in that case we need to remove it otherwise we
+				// would overwrite the previous detach arg to false
+				remainingCmd = removeDetachArg(remainingCmd, fs.NArg())
+			}
 		}
 		if hasNameParam && !hasReplaceParam {
 			// Enforce --replace for named containers.  This will
-			// make systemd units more robuts as it allows them to
+			// make systemd units more robust as it allows them to
 			// start after system crashes (see
 			// github.com/containers/podman/issues/5485).
 			startCommand = append(startCommand, "--replace")
-		}
-		startCommand = append(startCommand, info.CreateCommand[index:]...)
-		startCommand = quoteArguments(startCommand)
 
-		info.ExecStartPre = "/bin/rm -f {{.PIDFile}} {{.ContainerIDFile}}"
-		info.ExecStart = strings.Join(startCommand, " ")
-		info.ExecStop = "{{.Executable}} stop --ignore --cidfile {{.ContainerIDFile}} {{if (ge .StopTimeout 0)}}-t {{.StopTimeout}}{{end}}"
-		info.ExecStopPost = "{{.Executable}} rm --ignore -f --cidfile {{.ContainerIDFile}}"
+			if fs.Changed("replace") {
+				// this can only happen if --replace=false is set
+				// in that case we need to remove it otherwise we
+				// would overwrite the previous replace arg to false
+				remainingCmd = removeReplaceArg(remainingCmd, fs.NArg())
+			}
+		}
+
+		// Unless the user explicitly set a restart policy, check
+		// whether the container was created with a custom one and use
+		// it instead of the default.
+		if options.RestartPolicy == nil {
+			restartPolicy, err := fs.GetString("restart")
+			if err != nil {
+				return "", err
+			}
+			if restartPolicy != "" {
+				if strings.HasPrefix(restartPolicy, "on-failure:") {
+					// Special case --restart=on-failure:5
+					spl := strings.Split(restartPolicy, ":")
+					restartPolicy = spl[0]
+					info.StartLimitBurst = spl[1]
+				} else if restartPolicy == libpodDefine.RestartPolicyUnlessStopped {
+					restartPolicy = libpodDefine.RestartPolicyAlways
+				}
+				info.RestartPolicy = restartPolicy
+			}
+		}
+
+		envs, err := fs.GetStringArray("env")
+		if err != nil {
+			return "", err
+		}
+		for _, env := range envs {
+			// if env arg does not contain an equal sign we have to add the envar to the unit
+			// because it does try to red the value from the environment
+			if !strings.Contains(env, "=") {
+				for _, containerEnv := range info.containerEnv {
+					key, _, _ := strings.Cut(containerEnv, "=")
+					if key == env {
+						info.ExtraEnvs = append(info.ExtraEnvs, escapeSystemdArg(containerEnv))
+					}
+				}
+			}
+		}
+
+		startCommand = append(startCommand, remainingCmd...)
+		startCommand = escapeSystemdArguments(startCommand)
+		if options.TemplateUnitFile {
+			info.IdentifySpecifier = true
+			startCommand, err = setContainerNameForTemplate(startCommand, info)
+			if err != nil {
+				return "", err
+			}
+		}
+		info.ExecStart = formatOptions(startCommand)
 	}
+	info.TimeoutStopSec = minTimeoutStopSec + info.StopTimeout
 
 	if info.PodmanVersion == "" {
 		info.PodmanVersion = version.Version.String()
 	}
-	if info.GenerateTimestamp {
-		info.TimeStamp = fmt.Sprintf("%v", time.Now().Format(time.UnixDate))
+
+	if options.NoHeader {
+		info.GenerateNoHeader = true
+		info.GenerateTimestamp = false
 	}
 
+	if info.GenerateTimestamp {
+		info.TimeStamp = time.Now().Format(time.UnixDate)
+	}
 	// Sort the slices to assure a deterministic output.
 	sort.Strings(info.BoundToServices)
 
@@ -273,9 +515,9 @@ func executeContainerTemplate(info *containerInfo, options entities.GenerateSyst
 	// generation.  That's especially needed for embedding the PID and ID
 	// files in other fields which will eventually get replaced in the 2nd
 	// template execution.
-	templ, err := template.New("container_template").Parse(containerTemplate)
+	templ, err := template.New("container_template").Delims("{{{{", "}}}}").Parse(containerTemplate)
 	if err != nil {
-		return "", errors.Wrap(err, "error parsing systemd service template")
+		return "", fmt.Errorf("parsing systemd service template: %w", err)
 	}
 
 	var buf bytes.Buffer
@@ -284,9 +526,9 @@ func executeContainerTemplate(info *containerInfo, options entities.GenerateSyst
 	}
 
 	// Now parse the generated template (i.e., buf) and execute it.
-	templ, err = template.New("container_template").Parse(buf.String())
+	templ, err = template.New("container_template").Delims("{{{{", "}}}}").Parse(buf.String())
 	if err != nil {
-		return "", errors.Wrap(err, "error parsing systemd service template")
+		return "", fmt.Errorf("parsing systemd service template: %w", err)
 	}
 
 	buf = bytes.Buffer{}

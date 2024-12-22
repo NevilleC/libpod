@@ -2,47 +2,33 @@ package events
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
 	"time"
 
-	"github.com/hpcloud/tail"
-	"github.com/pkg/errors"
+	"github.com/containers/storage/pkg/stringid"
 )
 
 // ErrNoJournaldLogging indicates that there is no journald logging
 // supported (requires libsystemd)
-var ErrNoJournaldLogging = errors.New("No support for journald logging")
+var ErrNoJournaldLogging = errors.New("no support for journald logging")
 
 // String returns a string representation of EventerType
 func (et EventerType) String() string {
-	switch et {
-	case LogFile:
-		return "file"
-	case Journald:
-		return "journald"
-	case Null:
-		return "none"
-	default:
-		return "invalid"
-	}
+	return string(et)
 }
 
 // IsValidEventer checks if the given string is a valid eventer type.
 func IsValidEventer(eventer string) bool {
-	switch eventer {
-	case LogFile.String():
-		return true
-	case Journald.String():
-		return true
-	case Null.String():
+	switch EventerType(eventer) {
+	case LogFile, Journald, Null:
 		return true
 	default:
 		return false
 	}
 }
 
-// NewEvent creates a event struct and populates with
+// NewEvent creates an event struct and populates with
 // the given status and time.
 func NewEvent(status Status) Event {
 	return Event{
@@ -51,52 +37,81 @@ func NewEvent(status Status) Event {
 	}
 }
 
-// Recycle checks if the event log has reach a limit and if so
-// renames the current log and starts a new one.  The remove bool
-// indicates the old log file should be deleted.
-func (e *Event) Recycle(path string, remove bool) error {
-	return errors.New("not implemented")
-}
-
 // ToJSONString returns the event as a json'ified string
 func (e *Event) ToJSONString() (string, error) {
 	b, err := json.Marshal(e)
 	return string(b), err
 }
 
-// ToHumanReadable returns human readable event as a formatted string
-func (e *Event) ToHumanReadable() string {
+// ToHumanReadable returns human-readable event as a formatted string
+func (e *Event) ToHumanReadable(truncate bool) string {
+	if e == nil {
+		return ""
+	}
 	var humanFormat string
+	id := e.ID
+	if truncate {
+		id = stringid.TruncateID(id)
+	}
 	switch e.Type {
 	case Container, Pod:
-		humanFormat = fmt.Sprintf("%s %s %s %s (image=%s, name=%s)", e.Time, e.Type, e.Status, e.ID, e.Image, e.Name)
+		humanFormat = fmt.Sprintf("%s %s %s %s (image=%s, name=%s", e.Time, e.Type, e.Status, id, e.Image, e.Name)
+		if e.PodID != "" {
+			humanFormat += fmt.Sprintf(", pod_id=%s", e.PodID)
+		}
+		if e.Status == HealthStatus {
+			humanFormat += fmt.Sprintf(", health_status=%s", e.HealthStatus)
+			humanFormat += fmt.Sprintf(", health_failing_streak=%d", e.HealthFailingStreak)
+			humanFormat += fmt.Sprintf(", health_log=%s", e.HealthLog)
+		}
+		// check if the container has labels and add it to the output
+		if len(e.Attributes) > 0 {
+			for k, v := range e.Attributes {
+				humanFormat += fmt.Sprintf(", %s=%s", k, v)
+			}
+		}
+		humanFormat += ")"
+	case Network:
+		if e.Status == Create || e.Status == Remove {
+			if netdriver, exists := e.Attributes["driver"]; exists {
+				humanFormat = fmt.Sprintf("%s %s %s %s (name=%s, type=%s)", e.Time, e.Type, e.Status, e.ID, e.Network, netdriver)
+			}
+		} else {
+			humanFormat = fmt.Sprintf("%s %s %s %s (container=%s, name=%s)", e.Time, e.Type, e.Status, id, id, e.Network)
+		}
 	case Image:
-		humanFormat = fmt.Sprintf("%s %s %s %s %s", e.Time, e.Type, e.Status, e.ID, e.Name)
+		humanFormat = fmt.Sprintf("%s %s %s %s %s", e.Time, e.Type, e.Status, id, e.Name)
+		if e.Error != "" {
+			humanFormat += " " + e.Error
+		}
 	case System:
-		humanFormat = fmt.Sprintf("%s %s %s", e.Time, e.Type, e.Status)
-	case Volume:
+		if e.Name != "" {
+			humanFormat = fmt.Sprintf("%s %s %s %s", e.Time, e.Type, e.Status, e.Name)
+		} else {
+			humanFormat = fmt.Sprintf("%s %s %s", e.Time, e.Type, e.Status)
+		}
+	case Volume, Machine:
 		humanFormat = fmt.Sprintf("%s %s %s %s", e.Time, e.Type, e.Status, e.Name)
 	}
 	return humanFormat
 }
 
-// NewEventFromString takes stringified json and converts
+// newEventFromJSONString takes stringified json and converts
 // it to an event
 func newEventFromJSONString(event string) (*Event, error) {
-	e := Event{}
-	if err := json.Unmarshal([]byte(event), &e); err != nil {
+	e := new(Event)
+	if err := json.Unmarshal([]byte(event), e); err != nil {
 		return nil, err
 	}
-	return &e, nil
-
+	return e, nil
 }
 
-// ToString converts a Type to a string
+// String converts a Type to a string
 func (t Type) String() string {
 	return string(t)
 }
 
-// ToString converts a status to a string
+// String converts a status to a string
 func (s Status) String() string {
 	return string(s)
 }
@@ -108,6 +123,10 @@ func StringToType(name string) (Type, error) {
 		return Container, nil
 	case Image.String():
 		return Image, nil
+	case Machine.String():
+		return Machine, nil
+	case Network.String():
+		return Network, nil
 	case Pod.String():
 		return Pod, nil
 	case System.String():
@@ -117,16 +136,16 @@ func StringToType(name string) (Type, error) {
 	case "":
 		return "", ErrEventTypeBlank
 	}
-	return "", errors.Errorf("unknown event type %q", name)
+	return "", fmt.Errorf("unknown event type %q", name)
 }
 
 // StringToStatus converts a string to an Event Status
-// TODO if we add more events, we might consider a go-generator to
-// create the switch statement
 func StringToStatus(name string) (Status, error) {
 	switch name {
 	case Attach.String():
 		return Attach, nil
+	case AutoUpdate.String():
+		return AutoUpdate, nil
 	case Build.String():
 		return Build, nil
 	case Checkpoint.String():
@@ -139,10 +158,14 @@ func StringToStatus(name string) (Status, error) {
 		return Create, nil
 	case Exec.String():
 		return Exec, nil
+	case ExecDied.String():
+		return ExecDied, nil
 	case Exited.String():
 		return Exited, nil
 	case Export.String():
 		return Export, nil
+	case HealthStatus.String():
+		return HealthStatus, nil
 	case History.String():
 		return History, nil
 	case Import.String():
@@ -155,24 +178,34 @@ func StringToStatus(name string) (Status, error) {
 		return LoadFromArchive, nil
 	case Mount.String():
 		return Mount, nil
+	case NetworkConnect.String():
+		return NetworkConnect, nil
+	case NetworkDisconnect.String():
+		return NetworkDisconnect, nil
 	case Pause.String():
 		return Pause, nil
 	case Prune.String():
 		return Prune, nil
 	case Pull.String():
 		return Pull, nil
+	case PullError.String():
+		return PullError, nil
 	case Push.String():
 		return Push, nil
 	case Refresh.String():
 		return Refresh, nil
 	case Remove.String():
 		return Remove, nil
+	case Rename.String():
+		return Rename, nil
 	case Renumber.String():
 		return Renumber, nil
 	case Restart.String():
 		return Restart, nil
 	case Restore.String():
 		return Restore, nil
+	case Rotate.String():
+		return Rotate, nil
 	case Save.String():
 		return Save, nil
 	case Start.String():
@@ -189,20 +222,8 @@ func StringToStatus(name string) (Status, error) {
 		return Unpause, nil
 	case Untag.String():
 		return Untag, nil
+	case Update.String():
+		return Update, nil
 	}
-	return "", errors.Errorf("unknown event status %q", name)
-}
-
-func (e EventLogFile) getTail(options ReadOptions) (*tail.Tail, error) {
-	reopen := true
-	seek := tail.SeekInfo{Offset: 0, Whence: os.SEEK_END}
-	if options.FromStart || !options.Stream {
-		seek.Whence = 0
-		reopen = false
-	}
-	stream := options.Stream
-	if len(options.Until) > 0 {
-		stream = false
-	}
-	return tail.TailFile(e.options.LogFilePath, tail.Config{ReOpen: reopen, Follow: stream, Location: &seek, Logger: tail.DiscardingLogger, Poll: true})
+	return "", fmt.Errorf("unknown event status %q", name)
 }

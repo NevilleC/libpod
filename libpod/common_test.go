@@ -1,3 +1,5 @@
+//go:build !remote
+
 package libpod
 
 import (
@@ -7,10 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/containers/common/libnetwork/types"
 	"github.com/containers/common/pkg/config"
-	"github.com/containers/podman/v2/libpod/define"
-	"github.com/containers/podman/v2/libpod/lock"
-	"github.com/cri-o/ocicni/pkg/ocicni"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/libpod/lock"
 	"github.com/opencontainers/runtime-tools/generate"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -41,18 +43,20 @@ func getTestContainer(id, name string, manager lock.Manager) (*Container, error)
 			ContainerNetworkConfig: ContainerNetworkConfig{
 				DNSServer: []net.IP{net.ParseIP("192.168.1.1"), net.ParseIP("192.168.2.2")},
 				DNSSearch: []string{"example.com", "example.example.com"},
-				PortMappings: []ocicni.PortMapping{
+				PortMappings: []types.PortMapping{
 					{
 						HostPort:      80,
 						ContainerPort: 90,
 						Protocol:      "tcp",
 						HostIP:        "192.168.3.3",
+						Range:         1,
 					},
 					{
 						HostPort:      100,
 						ContainerPort: 110,
 						Protocol:      "udp",
 						HostIP:        "192.168.4.4",
+						Range:         1,
 					},
 				},
 			},

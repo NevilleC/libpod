@@ -1,34 +1,17 @@
-// +build !remote
+//go:build !remote_testing && (linux || freebsd)
 
 package integration
 
 import (
-	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
-	"strings"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
 func IsRemote() bool {
 	return false
-}
-
-func SkipIfRemote(string) {
-}
-
-func SkipIfRootlessCgroupsV1() {
-	if os.Geteuid() != 0 && !CGROUPSV2 {
-		Skip("Rooless requires cgroupsV2 to set limits")
-	}
-}
-
-func SkipIfRootless() {
-	if os.Geteuid() != 0 {
-		Skip("This function is not enabled for rootless podman")
-	}
 }
 
 // Podman is the exec call to podman on the filesystem
@@ -37,117 +20,65 @@ func (p *PodmanTestIntegration) Podman(args []string) *PodmanSessionIntegration 
 	return &PodmanSessionIntegration{podmanSession}
 }
 
+// PodmanSystemdScope runs the podman command in a new systemd scope
+func (p *PodmanTestIntegration) PodmanSystemdScope(args []string) *PodmanSessionIntegration {
+	wrapper := []string{"systemd-run", "--scope"}
+	if isRootless() {
+		wrapper = []string{"systemd-run", "--scope", "--user"}
+	}
+	podmanSession := p.PodmanAsUserBase(args, 0, 0, "", nil, false, false, wrapper, nil)
+	return &PodmanSessionIntegration{podmanSession}
+}
+
 // PodmanExtraFiles is the exec call to podman on the filesystem and passes down extra files
 func (p *PodmanTestIntegration) PodmanExtraFiles(args []string, extraFiles []*os.File) *PodmanSessionIntegration {
-	podmanSession := p.PodmanAsUserBase(args, 0, 0, "", nil, false, false, extraFiles)
-	return &PodmanSessionIntegration{podmanSession}
-}
-
-// PodmanNoCache calls the podman command with no configured imagecache
-func (p *PodmanTestIntegration) PodmanNoCache(args []string) *PodmanSessionIntegration {
-	podmanSession := p.PodmanBase(args, false, true)
-	return &PodmanSessionIntegration{podmanSession}
-}
-
-// PodmanNoEvents calls the Podman command without an imagecache and without an
-// events backend. It is used mostly for caching and uncaching images.
-func (p *PodmanTestIntegration) PodmanNoEvents(args []string) *PodmanSessionIntegration {
-	podmanSession := p.PodmanBase(args, true, true)
+	podmanSession := p.PodmanAsUserBase(args, 0, 0, "", nil, false, false, nil, extraFiles)
 	return &PodmanSessionIntegration{podmanSession}
 }
 
 func (p *PodmanTestIntegration) setDefaultRegistriesConfigEnv() {
-	defaultFile := filepath.Join(INTEGRATION_ROOT, "test/registries.conf")
-	os.Setenv("REGISTRIES_CONFIG_PATH", defaultFile)
+	defaultFile := "registries.conf"
+	if UsingCacheRegistry() {
+		defaultFile = "registries-cached.conf"
+	}
+	defaultPath := filepath.Join(INTEGRATION_ROOT, "test", defaultFile)
+	err := os.Setenv("CONTAINERS_REGISTRIES_CONF", defaultPath)
+	Expect(err).ToNot(HaveOccurred())
 }
 
 func (p *PodmanTestIntegration) setRegistriesConfigEnv(b []byte) {
 	outfile := filepath.Join(p.TempDir, "registries.conf")
-	os.Setenv("REGISTRIES_CONFIG_PATH", outfile)
-	ioutil.WriteFile(outfile, b, 0644)
+	os.Setenv("CONTAINERS_REGISTRIES_CONF", outfile)
+	err := os.WriteFile(outfile, b, 0644)
+	Expect(err).ToNot(HaveOccurred())
 }
 
 func resetRegistriesConfigEnv() {
-	os.Setenv("REGISTRIES_CONFIG_PATH", "")
+	os.Setenv("CONTAINERS_REGISTRIES_CONF", "")
 }
 
 func PodmanTestCreate(tempDir string) *PodmanTestIntegration {
 	return PodmanTestCreateUtil(tempDir, false)
 }
 
-// MakeOptions assembles all the podman main options
-func (p *PodmanTestIntegration) makeOptions(args []string, noEvents, noCache bool) []string {
-	var debug string
-	if _, ok := os.LookupEnv("DEBUG"); ok {
-		debug = "--log-level=debug --syslog=true "
-	}
-
-	eventsType := "file"
-	if noEvents {
-		eventsType = "none"
-	}
-
-	podmanOptions := strings.Split(fmt.Sprintf("%s--root %s --runroot %s --runtime %s --conmon %s --cni-config-dir %s --cgroup-manager %s --tmpdir %s --events-backend %s",
-		debug, p.CrioRoot, p.RunRoot, p.OCIRuntime, p.ConmonBinary, p.CNIConfigDir, p.CgroupManager, p.TmpDir, eventsType), " ")
-	if os.Getenv("HOOK_OPTION") != "" {
-		podmanOptions = append(podmanOptions, os.Getenv("HOOK_OPTION"))
-	}
-
-	podmanOptions = append(podmanOptions, strings.Split(p.StorageOptions, " ")...)
-	if !noCache {
-		cacheOptions := []string{"--storage-opt",
-			fmt.Sprintf("%s.imagestore=%s", p.PodmanTest.ImageCacheFS, p.PodmanTest.ImageCacheDir)}
-		podmanOptions = append(cacheOptions, podmanOptions...)
-	}
-	podmanOptions = append(podmanOptions, args...)
-	return podmanOptions
-}
-
 // RestoreArtifact puts the cached image into our test store
 func (p *PodmanTestIntegration) RestoreArtifact(image string) error {
-	fmt.Printf("Restoring %s...\n", image)
-	dest := strings.Split(image, "/")
-	destName := fmt.Sprintf("/tmp/%s.tar", strings.Replace(strings.Join(strings.Split(dest[len(dest)-1], "/"), ""), ":", "-", -1))
-	restore := p.PodmanNoEvents([]string{"load", "-q", "-i", destName})
-	restore.Wait(90)
-	return nil
-}
-
-// RestoreArtifactToCache populates the imagecache from tarballs that were cached earlier
-func (p *PodmanTestIntegration) RestoreArtifactToCache(image string) error {
-	fmt.Printf("Restoring %s...\n", image)
-	dest := strings.Split(image, "/")
-	destName := fmt.Sprintf("/tmp/%s.tar", strings.Replace(strings.Join(strings.Split(dest[len(dest)-1], "/"), ""), ":", "-", -1))
-
-	p.CrioRoot = p.ImageCacheDir
-	restore := p.PodmanNoEvents([]string{"load", "-q", "-i", destName})
-	restore.WaitWithDefaultTimeout()
+	tarball := imageTarPath(image)
+	if _, err := os.Stat(tarball); err == nil {
+		GinkgoWriter.Printf("Restoring %s...\n", image)
+		restore := p.PodmanNoEvents([]string{"load", "-q", "-i", tarball})
+		restore.Wait(90)
+	}
 	return nil
 }
 
 func (p *PodmanTestIntegration) StopRemoteService() {}
-func (p *PodmanTestIntegration) DelayForVarlink()   {}
 
-func populateCache(podman *PodmanTestIntegration) {
-	for _, image := range CACHE_IMAGES {
-		podman.RestoreArtifactToCache(image)
-	}
-	// logformatter uses this to recognize the first test
-	fmt.Printf("-----------------------------\n")
-}
-
-func removeCache() {
-	// Remove cache dirs
-	if err := os.RemoveAll(ImageCacheDir); err != nil {
-		fmt.Printf("%q\n", err)
-	}
-}
-
-// SeedImages is a no-op for localized testing
-func (p *PodmanTestIntegration) SeedImages() error {
-	return nil
-}
-
-// We don't support running Varlink when local
+// We don't support running API service when local
 func (p *PodmanTestIntegration) StartRemoteService() {
+}
+
+// Just a stub for compiling with `!remote`.
+func getRemoteOptions(p *PodmanTestIntegration, args []string) []string {
+	return nil
 }

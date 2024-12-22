@@ -2,56 +2,69 @@ package generate
 
 import (
 	"context"
+	"errors"
 	"net/http"
-	"net/url"
 	"strconv"
 
-	"github.com/containers/podman/v2/pkg/bindings"
-	"github.com/containers/podman/v2/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/bindings"
+	"github.com/containers/podman/v5/pkg/domain/entities/types"
 )
 
-func Systemd(ctx context.Context, nameOrID string, options entities.GenerateSystemdOptions) (*entities.GenerateSystemdReport, error) {
+func Systemd(ctx context.Context, nameOrID string, options *SystemdOptions) (*types.GenerateSystemdReport, error) {
+	if options == nil {
+		options = new(SystemdOptions)
+	}
 	conn, err := bindings.GetClient(ctx)
 	if err != nil {
 		return nil, err
 	}
-	params := url.Values{}
-
-	params.Set("useName", strconv.FormatBool(options.Name))
-	params.Set("new", strconv.FormatBool(options.New))
-	if options.RestartPolicy != "" {
-		params.Set("restartPolicy", options.RestartPolicy)
-	}
-	if options.StopTimeout != nil {
-		params.Set("stopTimeout", strconv.FormatUint(uint64(*options.StopTimeout), 10))
-	}
-	params.Set("containerPrefix", options.ContainerPrefix)
-	params.Set("podPrefix", options.PodPrefix)
-	params.Set("separator", options.Separator)
-
-	response, err := conn.DoRequest(nil, http.MethodGet, "/generate/%s/systemd", params, nil, nameOrID)
+	params, err := options.ToParams()
 	if err != nil {
 		return nil, err
 	}
-	report := &entities.GenerateSystemdReport{}
+
+	response, err := conn.DoRequest(ctx, nil, http.MethodGet, "/generate/%s/systemd", params, nil, nameOrID)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+
+	report := &types.GenerateSystemdReport{}
 	return report, response.Process(&report.Units)
 }
 
-func Kube(ctx context.Context, nameOrID string, options entities.GenerateKubeOptions) (*entities.GenerateKubeReport, error) {
+// Kube generate Kubernetes YAML (v1 specification)
+//
+// Note: Caller is responsible for closing returned reader
+func Kube(ctx context.Context, nameOrIDs []string, options *KubeOptions) (*types.GenerateKubeReport, error) {
+	if options == nil {
+		options = new(KubeOptions)
+	}
 	conn, err := bindings.GetClient(ctx)
 	if err != nil {
 		return nil, err
 	}
-	params := url.Values{}
-	params.Set("service", strconv.FormatBool(options.Service))
+	if len(nameOrIDs) < 1 {
+		return nil, errors.New("must provide the name or ID of one container or pod")
+	}
 
-	response, err := conn.DoRequest(nil, http.MethodGet, "/generate/%s/kube", params, nil, nameOrID)
+	params, err := options.ToParams()
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range nameOrIDs {
+		params.Add("names", name)
+	}
+	if options.Replicas != nil {
+		params.Set("replicas", strconv.Itoa(int(*options.Replicas)))
+	}
+	response, err := conn.DoRequest(ctx, nil, http.MethodGet, "/generate/kube", params, nil)
 	if err != nil {
 		return nil, err
 	}
 
 	if response.StatusCode == http.StatusOK {
-		return &entities.GenerateKubeReport{Reader: response.Body}, nil
+		return &types.GenerateKubeReport{Reader: response.Body}, nil
 	}
 
 	// Unpack the error.

@@ -1,14 +1,17 @@
+//go:build !remote
+
 package compat
 
 import (
 	"net/http"
 
-	"github.com/containers/podman/v2/libpod"
-	"github.com/containers/podman/v2/pkg/api/handlers/utils"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
 )
 
 func PauseContainer(w http.ResponseWriter, r *http.Request) {
-	runtime := r.Context().Value("runtime").(*libpod.Runtime)
+	runtime := r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
 
 	// /{version}/containers/(name)/pause
 	name := utils.GetName(r)
@@ -24,5 +27,5 @@ func PauseContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Success
-	utils.WriteResponse(w, http.StatusNoContent, "")
+	utils.WriteResponse(w, http.StatusNoContent, nil)
 }

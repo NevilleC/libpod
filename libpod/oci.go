@@ -1,10 +1,13 @@
+//go:build !remote
+
 package libpod
 
 import (
 	"net/http"
 
-	"github.com/containers/podman/v2/libpod/define"
-	"k8s.io/client-go/tools/remotecommand"
+	"github.com/containers/common/pkg/resize"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 // OCIRuntime is an implementation of an OCI runtime.
@@ -13,20 +16,19 @@ import (
 // management logic - e.g., we do not expect it to determine on its own that
 // calling 'UnpauseContainer()' on a container that is not paused is an error.
 // The code calling the OCIRuntime will manage this.
-// TODO: May want to move the Attach() code under this umbrella. It's highly OCI
-// runtime dependent.
-// TODO: May want to move the conmon cleanup code here too - it depends on
+// TODO: May want to move the conmon cleanup code here - it depends on
 // Conmon being in use.
-type OCIRuntime interface {
+type OCIRuntime interface { //nolint:interfacebloat
 	// Name returns the name of the runtime.
 	Name() string
 	// Path returns the path to the runtime executable.
 	Path() string
 
 	// CreateContainer creates the container in the OCI runtime.
-	CreateContainer(ctr *Container, restoreOptions *ContainerCheckpointOptions) error
-	// UpdateContainerStatus updates the status of the given container.
-	UpdateContainerStatus(ctr *Container) error
+	// The returned int64 contains the microseconds needed to restore
+	// the given container if it is a restore and if restoreOptions.PrintStats
+	// is true. In all other cases the returned int64 is 0.
+	CreateContainer(ctr *Container, restoreOptions *ContainerCheckpointOptions) (int64, error)
 	// StartContainer starts the given container.
 	StartContainer(ctr *Container) error
 	// KillContainer sends the given signal to the given container.
@@ -50,13 +52,15 @@ type OCIRuntime interface {
 	// UnpauseContainer unpauses the given container.
 	UnpauseContainer(ctr *Container) error
 
+	// Attach to a container.
+	Attach(ctr *Container, params *AttachOptions) error
 	// HTTPAttach performs an attach intended to be transported over HTTP.
 	// For terminal attach, the container's output will be directly streamed
 	// to output; otherwise, STDOUT and STDERR will be multiplexed, with
 	// a header prepended as follows: 1-byte STREAM (0, 1, 2 for STDIN,
 	// STDOUT, STDERR), 3 null (0x00) bytes, 4-byte big endian length.
 	// If a cancel channel is provided, it can be used to asynchronously
-	// termninate the attach session. Detach keys, if given, will also cause
+	// terminate the attach session. Detach keys, if given, will also cause
 	// the attach session to be terminated if provided via the STDIN
 	// channel. If they are not provided, the default detach keys will be
 	// used instead. Detach keys of "" will disable detaching via keyboard.
@@ -64,7 +68,7 @@ type OCIRuntime interface {
 	// client.
 	HTTPAttach(ctr *Container, r *http.Request, w http.ResponseWriter, streams *HTTPAttachStreams, detachKeys *string, cancel <-chan bool, hijackDone chan<- bool, streamAttach, streamLogs bool) error
 	// AttachResize resizes the terminal in use by the given container.
-	AttachResize(ctr *Container, newSize remotecommand.TerminalSize) error
+	AttachResize(ctr *Container, newSize resize.TerminalSize) error
 
 	// ExecContainer executes a command in a running container.
 	// Returns an int (PID of exec session), error channel (errors from
@@ -73,20 +77,23 @@ type OCIRuntime interface {
 	// has completed, as one might expect. The attach session will remain
 	// running, in a goroutine that will return via the chan error in the
 	// return signature.
-	ExecContainer(ctr *Container, sessionID string, options *ExecOptions, streams *define.AttachStreams) (int, chan error, error)
+	// newSize resizes the tty to this size before the process is started, must be nil if the exec session has no tty
+	ExecContainer(ctr *Container, sessionID string, options *ExecOptions, streams *define.AttachStreams, newSize *resize.TerminalSize) (int, chan error, error)
 	// ExecContainerHTTP executes a command in a running container and
 	// attaches its standard streams to a provided hijacked HTTP session.
 	// Maintains the same invariants as ExecContainer (returns on session
 	// start, with a goroutine running in the background to handle attach).
 	// The HTTP attach itself maintains the same invariants as HTTPAttach.
-	ExecContainerHTTP(ctr *Container, sessionID string, options *ExecOptions, r *http.Request, w http.ResponseWriter, streams *HTTPAttachStreams, cancel <-chan bool, hijackDone chan<- bool, holdConnOpen <-chan bool) (int, chan error, error)
+	// newSize resizes the tty to this size before the process is started, must be nil if the exec session has no tty
+	ExecContainerHTTP(ctr *Container, sessionID string, options *ExecOptions, r *http.Request, w http.ResponseWriter,
+		streams *HTTPAttachStreams, cancel <-chan bool, hijackDone chan<- bool, holdConnOpen <-chan bool, newSize *resize.TerminalSize) (int, chan error, error)
 	// ExecContainerDetached executes a command in a running container, but
 	// does not attach to it. Returns the PID of the exec session and an
 	// error (if starting the exec session failed)
 	ExecContainerDetached(ctr *Container, sessionID string, options *ExecOptions, stdin bool) (int, error)
 	// ExecAttachResize resizes the terminal of a running exec session. Only
 	// allowed with sessions that were created with a TTY.
-	ExecAttachResize(ctr *Container, sessionID string, newSize remotecommand.TerminalSize) error
+	ExecAttachResize(ctr *Container, sessionID string, newSize resize.TerminalSize) error
 	// ExecStopContainer stops a given exec session in a running container.
 	// SIGTERM with be sent initially, then SIGKILL after the given timeout.
 	// If timeout is 0, SIGKILL will be sent immediately, and SIGTERM will
@@ -95,16 +102,14 @@ type OCIRuntime interface {
 	// ExecUpdateStatus checks the status of a given exec session.
 	// Returns true if the session is still running, or false if it exited.
 	ExecUpdateStatus(ctr *Container, sessionID string) (bool, error)
-	// ExecContainerCleanup cleans up after an exec session exits.
-	// It removes any files left by the exec session that are no longer
-	// needed, including the attach socket.
-	ExecContainerCleanup(ctr *Container, sessionID string) error
 
 	// CheckpointContainer checkpoints the given container.
 	// Some OCI runtimes may not support this - if SupportsCheckpoint()
 	// returns false, this is not implemented, and will always return an
-	// error.
-	CheckpointContainer(ctr *Container, options ContainerCheckpointOptions) error
+	// error. If CheckpointOptions.PrintStats is true the first return parameter
+	// contains the number of microseconds the runtime needed to checkpoint
+	// the given container.
+	CheckpointContainer(ctr *Container, options ContainerCheckpointOptions) (int64, error)
 
 	// CheckConmonRunning verifies that the given container's Conmon
 	// instance is still running. Runtimes without Conmon, or systems where
@@ -142,8 +147,41 @@ type OCIRuntime interface {
 	// This is the path to that file for a given container.
 	ExitFilePath(ctr *Container) (string, error)
 
+	// OOMFilePath is the path to a container's oom file if it was oom killed.
+	// An oom file is only created when the container is oom killed. The existence
+	// of this file means that the container was oom killed.
+	// This is the path to that file for a given container.
+	OOMFilePath(ctr *Container) (string, error)
+
 	// RuntimeInfo returns verbose information about the runtime.
 	RuntimeInfo() (*define.ConmonInfo, *define.OCIRuntimeInfo, error)
+
+	// UpdateContainer updates the given container's cgroup configuration.
+	UpdateContainer(ctr *Container, res *specs.LinuxResources) error
+}
+
+// AttachOptions are options used when attached to a container or an exec
+// session.
+type AttachOptions struct {
+	// Streams are the streams to attach to.
+	Streams *define.AttachStreams
+	// DetachKeys containers the key combination that will detach from the
+	// attach session. Empty string is assumed as no detach keys - user
+	// detach is impossible. If unset, defaults from containers.conf will be
+	// used.
+	DetachKeys *string
+	// InitialSize is the initial size of the terminal. Set before the
+	// attach begins.
+	InitialSize *resize.TerminalSize
+	// AttachReady signals when the attach has successfully completed and
+	// streaming has begun.
+	AttachReady chan<- bool
+	// Start indicates that the container should be started if it is not
+	// already running.
+	Start bool
+	// Started signals when the container has been successfully started.
+	// Required if Start is true, unused otherwise.
+	Started chan<- bool
 }
 
 // ExecOptions are options passed into ExecContainer. They control the command
@@ -151,8 +189,6 @@ type OCIRuntime interface {
 type ExecOptions struct {
 	// Cmd is the command to execute.
 	Cmd []string
-	// CapAdd is a set of capabilities to add to the executed command.
-	CapAdd []string
 	// Env is a set of environment variables to add to the container.
 	Env map[string]string
 	// Terminal is whether to create a new TTY for the exec session.
@@ -169,6 +205,9 @@ type ExecOptions struct {
 	// to 0, 1, 2) that will be passed to the executed process. The total FDs
 	// passed will be 3 + PreserveFDs.
 	PreserveFDs uint
+	// PreserveFD is a list of additional file descriptors (in addition
+	// to 0, 1, 2) that will be passed to the executed process.
+	PreserveFD []uint
 	// DetachKeys is a set of keys that, when pressed in sequence, will
 	// detach from the container.
 	// If not provided, the default keys will be used.
@@ -181,6 +220,8 @@ type ExecOptions struct {
 	// ExitCommandDelay is a delay (in seconds) between the exec session
 	// exiting, and the exit command being invoked.
 	ExitCommandDelay uint
+	// Privileged indicates the execed process will be launched in Privileged mode
+	Privileged bool
 }
 
 // HTTPAttachStreams informs the HTTPAttach endpoint which of the container's

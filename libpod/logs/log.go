@@ -1,6 +1,7 @@
 package logs
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -8,9 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/containers/podman/v2/libpod/logs/reversereader"
-	"github.com/hpcloud/tail"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/libpod/logs/reversereader"
+	"github.com/nxadm/tail"
 	"github.com/sirupsen/logrus"
 )
 
@@ -27,6 +27,9 @@ const (
 
 	// FullLogType signifies a log line is full
 	FullLogType = "F"
+
+	// ANSIEscapeResetCode is a code that resets all colors and text effects
+	ANSIEscapeResetCode = "\033[0m"
 )
 
 // LogOptions is the options you can use for logs
@@ -34,8 +37,10 @@ type LogOptions struct {
 	Details    bool
 	Follow     bool
 	Since      time.Time
+	Until      time.Time
 	Tail       int64
 	Timestamps bool
+	Colors     bool
 	Multi      bool
 	WaitGroup  *sync.WaitGroup
 	UseName    bool
@@ -49,6 +54,7 @@ type LogLine struct {
 	Msg          string
 	CID          string
 	CName        string
+	ColorID      int64
 }
 
 // GetLogFile returns an hp tail for a container given options
@@ -73,95 +79,111 @@ func GetLogFile(path string, options *LogOptions) (*tail.Tail, []*LogLine, error
 		Whence: whence,
 	}
 
-	t, err := tail.TailFile(path, tail.Config{MustExist: true, Poll: true, Follow: options.Follow, Location: &seek, Logger: tail.DiscardingLogger})
+	t, err := tail.TailFile(path, tail.Config{MustExist: true, Poll: true, Follow: options.Follow, Location: &seek, Logger: tail.DiscardingLogger, ReOpen: options.Follow})
 	return t, logTail, err
 }
 
 func getTailLog(path string, tail int) ([]*LogLine, error) {
 	var (
-		nlls       []*LogLine
 		nllCounter int
 		leftover   string
-		partial    string
 		tailLog    []*LogLine
+		eof        bool
 	)
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
+	defer f.Close()
 	rr, err := reversereader.NewReverseReader(f)
 	if err != nil {
 		return nil, err
 	}
 
-	inputs := make(chan []string)
-	go func() {
-		for {
-			s, err := rr.Read()
-			if err != nil {
-				if errors.Cause(err) == io.EOF {
-					inputs <- []string{leftover}
-				} else {
-					logrus.Error(err)
-				}
-				close(inputs)
-				if err := f.Close(); err != nil {
-					logrus.Error(err)
-				}
-				break
-			}
-			line := strings.Split(s+leftover, "\n")
-			if len(line) > 1 {
-				inputs <- line[1:]
-			}
-			leftover = line[0]
-		}
-	}()
+	first := true
 
-	for i := range inputs {
-		// the incoming array is FIFO; we want FIFO so
-		// reverse the slice read order
-		for j := len(i) - 1; j >= 0; j-- {
-			// lines that are "" are junk
-			if len(i[j]) < 1 {
+	for {
+		s, err := rr.Read()
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				return nil, fmt.Errorf("reverse log read: %w", err)
+			}
+			eof = true
+		}
+
+		lines := strings.Split(s+leftover, "\n")
+		// we read a chunk of data, so make sure to read the line in inverse order
+		for i := len(lines) - 1; i > 0; i-- {
+			// ignore empty lines
+			if lines[i] == "" {
 				continue
 			}
-			// read the content in reverse and add each nll until we have the same
-			// number of F type messages as the desired tail
-			nll, err := NewLogLine(i[j])
+			nll, err := NewLogLine(lines[i])
 			if err != nil {
 				return nil, err
 			}
-			nlls = append(nlls, nll)
-			if !nll.Partial() {
+			if !nll.Partial() || first {
 				nllCounter++
+				// Even if the last line is partial we need to count it as it will be printed as line.
+				// Because we read backwards the first line we read is the last line in the log.
+				first = false
 			}
+			// We explicitly need to check for more lines than tail because we have
+			// to read to next full line and must keep all partial lines
+			// https://github.com/containers/podman/issues/19545
+			if nllCounter > tail {
+				// because we add lines in the inverse order we must invert the slice in the end
+				return reverseLog(tailLog), nil
+			}
+			// only append after the return here because we do not want to include the next full line
+			tailLog = append(tailLog, nll)
 		}
-		// if we have enough loglines, we can hangup
-		if nllCounter >= tail {
-			break
-		}
-	}
+		leftover = lines[0]
 
-	// re-assemble the log lines and trim (if needed) to the
-	// tail length
-	for _, nll := range nlls {
-		if nll.Partial() {
-			partial += nll.Msg
-		} else {
-			nll.Msg += partial
-			// prepend because we need to reverse the order again to FIFO
-			tailLog = append([]*LogLine{nll}, tailLog...)
-			partial = ""
-		}
-		if len(tailLog) == tail {
-			break
+		// eof was reached
+		if eof {
+			// when we have still a line and do not have enough tail lines already
+			if leftover != "" && nllCounter < tail {
+				nll, err := NewLogLine(leftover)
+				if err != nil {
+					return nil, err
+				}
+				tailLog = append(tailLog, nll)
+			}
+			// because we add lines in the inverse order we must invert the slice in the end
+			return reverseLog(tailLog), nil
 		}
 	}
-	return tailLog, nil
 }
 
-// String converts a logline to a string for output given whether a detail
+// reverseLog reverse the log line slice, needed for tail as we read lines backwards but still
+// need to print them in the correct order at the end  so use that helper for it.
+func reverseLog(s []*LogLine) []*LogLine {
+	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
+		s[i], s[j] = s[j], s[i]
+	}
+	return s
+}
+
+// getColor returns an ANSI escape code for color based on the colorID
+func getColor(colorID int64) string {
+	colors := map[int64]string{
+		0: "\033[37m", // Light Gray
+		1: "\033[31m", // Red
+		2: "\033[33m", // Yellow
+		3: "\033[34m", // Blue
+		4: "\033[35m", // Magenta
+		5: "\033[36m", // Cyan
+		6: "\033[32m", // Green
+	}
+	return colors[colorID%int64(len(colors))]
+}
+
+func (l *LogLine) colorize(prefix string) string {
+	return getColor(l.ColorID) + prefix + l.Msg + ANSIEscapeResetCode
+}
+
+// String converts a log line to a string for output given whether a detail
 // bool is specified.
 func (l *LogLine) String(options *LogOptions) string {
 	var out string
@@ -176,26 +198,39 @@ func (l *LogLine) String(options *LogOptions) string {
 			out = fmt.Sprintf("%s ", cid)
 		}
 	}
+
 	if options.Timestamps {
 		out += fmt.Sprintf("%s ", l.Time.Format(LogTimeFormat))
 	}
-	return out + l.Msg
+
+	if options.Colors {
+		out = l.colorize(out)
+	} else {
+		out += l.Msg
+	}
+
+	return out
 }
 
 // Since returns a bool as to whether a log line occurred after a given time
 func (l *LogLine) Since(since time.Time) bool {
-	return l.Time.After(since)
+	return l.Time.After(since) || since.IsZero()
+}
+
+// Until returns a bool as to whether a log line occurred before a given time
+func (l *LogLine) Until(until time.Time) bool {
+	return l.Time.Before(until) || until.IsZero()
 }
 
 // NewLogLine creates a logLine struct from a container log string
 func NewLogLine(line string) (*LogLine, error) {
 	splitLine := strings.Split(line, " ")
 	if len(splitLine) < 4 {
-		return nil, errors.Errorf("'%s' is not a valid container log line", line)
+		return nil, fmt.Errorf("'%s' is not a valid container log line", line)
 	}
 	logTime, err := time.Parse(LogTimeFormat, splitLine[0])
 	if err != nil {
-		return nil, errors.Wrapf(err, "unable to convert time %s from container log", splitLine[0])
+		return nil, fmt.Errorf("unable to convert time %s from container log: %w", splitLine[0], err)
 	}
 	l := LogLine{
 		Time:         logTime,
@@ -209,4 +244,28 @@ func NewLogLine(line string) (*LogLine, error) {
 // Partial returns a bool if the log line is a partial log type
 func (l *LogLine) Partial() bool {
 	return l.ParseLogType == PartialLogType
+}
+
+func (l *LogLine) Write(stdout io.Writer, stderr io.Writer, logOpts *LogOptions) {
+	switch l.Device {
+	case "stdout":
+		if stdout != nil {
+			if l.Partial() {
+				fmt.Fprint(stdout, l.String(logOpts))
+			} else {
+				fmt.Fprintln(stdout, l.String(logOpts))
+			}
+		}
+	case "stderr":
+		if stderr != nil {
+			if l.Partial() {
+				fmt.Fprint(stderr, l.String(logOpts))
+			} else {
+				fmt.Fprintln(stderr, l.String(logOpts))
+			}
+		}
+	default:
+		// Warn the user if the device type does not match. Most likely the file is corrupted.
+		logrus.Warnf("Unknown Device type '%s' in log file from Container %s", l.Device, l.CID)
+	}
 }

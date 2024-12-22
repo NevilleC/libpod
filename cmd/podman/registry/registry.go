@@ -4,32 +4,26 @@ import (
 	"context"
 	"path/filepath"
 
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/containers/podman/v2/pkg/domain/infra"
-	"github.com/containers/podman/v2/pkg/rootless"
-	"github.com/containers/podman/v2/pkg/util"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/infra"
+	"github.com/containers/podman/v5/pkg/rootless"
+	"github.com/containers/podman/v5/pkg/util"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
 
-// DefaultRootAPIAddress is the default address of the REST socket
-const DefaultRootAPIAddress = "unix:/run/podman/podman.sock"
-
-// DefaultVarlinkAddress is the default address of the varlink socket
-const DefaultVarlinkAddress = "unix:/run/podman/io.podman"
+// DefaultRootAPIAddress is the default path of the REST socket with unix:// prefix
+const DefaultRootAPIAddress = "unix://" + DefaultRootAPIPath
 
 type CliCommand struct {
-	Mode    []entities.EngineMode
 	Command *cobra.Command
 	Parent  *cobra.Command
 }
 
-const ExecErrorCodeGeneric = 125
-
 var (
 	cliCtx          context.Context
 	containerEngine entities.ContainerEngine
-	exitCode        = ExecErrorCodeGeneric
+	exitCode        = 0
 	imageEngine     entities.ImageEngine
 
 	// Commands holds the cobra.Commands to present to the user, including
@@ -66,10 +60,18 @@ func ContainerEngine() entities.ContainerEngine {
 	return containerEngine
 }
 
-// NewContainerEngine is a wrapper for building an ContainerEngine to be used for PreRunE functions
+// NewContainerEngine is a wrapper for building a ContainerEngine to be used for PreRunE functions
 func NewContainerEngine(cmd *cobra.Command, args []string) (entities.ContainerEngine, error) {
 	if containerEngine == nil {
 		podmanOptions.FlagSet = cmd.Flags()
+		if cmd.Name() == "reset" && cmd.Parent().Name() == "system" {
+			logrus.Debugf("Performing system reset, runtime validation checks will be relaxed")
+			podmanOptions.IsReset = true
+		}
+		if cmd.Name() == "renumber" && cmd.Parent().Name() == "system" {
+			logrus.Debugf("Performing system renumber, runtime validation checks will be relaxed")
+			podmanOptions.IsRenumber = true
+		}
 		engine, err := infra.NewContainerEngine(&podmanOptions)
 		if err != nil {
 			return nil, err
@@ -105,12 +107,12 @@ func GetContext() context.Context {
 
 func DefaultAPIAddress() string {
 	if rootless.IsRootless() {
-		xdg, err := util.GetRuntimeDir()
+		xdg, err := util.GetRootlessRuntimeDir()
 		if err != nil {
 			logrus.Warnf("Failed to get rootless runtime dir for DefaultAPIAddress: %s", err)
 			return DefaultRootAPIAddress
 		}
-		return "unix:" + filepath.Join(xdg, "podman", "podman.sock")
+		return "unix://" + filepath.Join(xdg, "podman", "podman.sock")
 	}
 	return DefaultRootAPIAddress
 }

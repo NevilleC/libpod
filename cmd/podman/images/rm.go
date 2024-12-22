@@ -1,12 +1,13 @@
 package images
 
 import (
+	"errors"
 	"fmt"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/containers/podman/v2/pkg/errorhandling"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/errorhandling"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -14,13 +15,26 @@ import (
 var (
 	rmDescription = "Removes one or more previously pulled or locally created images."
 	rmCmd         = &cobra.Command{
-		Use:   "rm [flags] IMAGE [IMAGE...]",
-		Short: "Removes one or more images from local storage",
-		Long:  rmDescription,
-		RunE:  rm,
+		Use:               "rm [options] IMAGE [IMAGE...]",
+		Short:             "Remove one or more images from local storage",
+		Long:              rmDescription,
+		RunE:              rm,
+		ValidArgsFunction: common.AutocompleteImages,
 		Example: `podman image rm imageID
   podman image rm --force alpine
   podman image rm c4dfb1609ee2 93fd78260bd1 c0ed59d05ff7`,
+	}
+
+	rmiCmd = &cobra.Command{
+		Use:               "rmi [options] IMAGE [IMAGE...]",
+		Args:              rmCmd.Args,
+		Short:             rmCmd.Short,
+		Long:              rmCmd.Long,
+		RunE:              rmCmd.RunE,
+		ValidArgsFunction: rmCmd.ValidArgsFunction,
+		Example: `podman rmi imageID
+  podman rmi --force alpine
+  podman rmi c4dfb1609ee2 93fd78260bd1 c0ed59d05ff7`,
 	}
 
 	imageOpts = entities.ImageRemoveOptions{}
@@ -28,25 +42,35 @@ var (
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: rmCmd,
 		Parent:  imageCmd,
 	})
 
 	imageRemoveFlagSet(rmCmd.Flags())
+
+	registry.Commands = append(registry.Commands, registry.CliCommand{
+		Command: rmiCmd,
+	})
+	imageRemoveFlagSet(rmiCmd.Flags())
 }
 
 func imageRemoveFlagSet(flags *pflag.FlagSet) {
 	flags.BoolVarP(&imageOpts.All, "all", "a", false, "Remove all images")
+	flags.BoolVarP(&imageOpts.Ignore, "ignore", "i", false, "Ignore errors if a specified image does not exist")
 	flags.BoolVarP(&imageOpts.Force, "force", "f", false, "Force Removal of the image")
+	flags.BoolVar(&imageOpts.NoPrune, "no-prune", false, "Do not remove dangling images")
 }
 
 func rm(cmd *cobra.Command, args []string) error {
 	if len(args) < 1 && !imageOpts.All {
-		return errors.Errorf("image name or ID must be specified")
+		return errors.New("image name or ID must be specified")
 	}
 	if len(args) > 0 && imageOpts.All {
-		return errors.Errorf("when using the --all switch, you may not pass any images names or IDs")
+		return errors.New("when using the --all switch, you may not pass any images names or IDs")
+	}
+
+	if imageOpts.Force {
+		imageOpts.Ignore = true
 	}
 
 	// Note: certain image-removal errors are non-fatal.  Hence, the report
@@ -62,6 +86,8 @@ func rm(cmd *cobra.Command, args []string) error {
 				fmt.Println("Deleted: " + d)
 			}
 		}
+	}
+	if len(rmErrors) > 0 {
 		registry.SetExitCode(report.ExitCode)
 	}
 

@@ -1,4 +1,4 @@
-// +build !linux !apparmor
+//go:build !linux || !apparmor
 
 package apparmor
 

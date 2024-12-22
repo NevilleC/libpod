@@ -1,22 +1,23 @@
 package images
 
 import (
+	"cmp"
+	"errors"
 	"fmt"
 	"os"
-	"sort"
+	"slices"
 	"strings"
-	"text/tabwriter"
-	"text/template"
 	"time"
 	"unicode"
 
+	"github.com/containers/common/pkg/completion"
+	"github.com/containers/common/pkg/report"
 	"github.com/containers/image/v5/docker/reference"
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/pkg/domain/entities"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/docker/go-units"
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 )
 
 type listFlagType struct {
@@ -31,18 +32,29 @@ type listFlagType struct {
 }
 
 var (
-	// Command: podman image _list_
-	listCmd = &cobra.Command{
-		Use:     "list [flags] [IMAGE]",
-		Aliases: []string{"ls"},
-		Args:    cobra.MaximumNArgs(1),
-		Short:   "List images in local storage",
-		Long:    "Lists images previously pulled to the system or created on the system.",
-		RunE:    images,
+	imageListCmd = &cobra.Command{
+		Use:               "list [options] [IMAGE]",
+		Aliases:           []string{"ls"},
+		Args:              cobra.MaximumNArgs(1),
+		Short:             "List images in local storage",
+		Long:              "Lists images previously pulled to the system or created on the system.",
+		RunE:              images,
+		ValidArgsFunction: common.AutocompleteImages,
 		Example: `podman image list --format json
   podman image list --sort repository --format "table {{.ID}} {{.Repository}} {{.Tag}}"
   podman image list --filter dangling=true`,
-		DisableFlagsInUseLine: true,
+	}
+
+	imagesCmd = &cobra.Command{
+		Use:               "images [options] [IMAGE]",
+		Args:              imageListCmd.Args,
+		Short:             imageListCmd.Short,
+		Long:              imageListCmd.Long,
+		RunE:              imageListCmd.RunE,
+		ValidArgsFunction: imageListCmd.ValidArgsFunction,
+		Example: `podman images --format json
+  podman images --sort repository --format "table {{.ID}} {{.Repository}} {{.Tag}}"
+  podman images --filter dangling=true`,
 	}
 
 	// Options to pull data
@@ -61,22 +73,39 @@ var (
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
-		Command: listCmd,
+		Command: imageListCmd,
 		Parent:  imageCmd,
 	})
-	imageListFlagSet(listCmd.Flags())
+	imageListFlagSet(imageListCmd)
+
+	registry.Commands = append(registry.Commands, registry.CliCommand{
+		Command: imagesCmd,
+	})
+	imageListFlagSet(imagesCmd)
 }
 
-func imageListFlagSet(flags *pflag.FlagSet) {
+func imageListFlagSet(cmd *cobra.Command) {
+	flags := cmd.Flags()
+
 	flags.BoolVarP(&listOptions.All, "all", "a", false, "Show all images (default hides intermediate images)")
-	flags.StringSliceVarP(&listOptions.Filter, "filter", "f", []string{}, "Filter output based on conditions provided (default [])")
-	flags.StringVar(&listFlag.format, "format", "", "Change the output format to JSON or a Go template")
+
+	filterFlagName := "filter"
+	flags.StringArrayVarP(&listOptions.Filter, filterFlagName, "f", []string{}, "Filter output based on conditions provided (default [])")
+	_ = cmd.RegisterFlagCompletionFunc(filterFlagName, common.AutocompleteImageFilters)
+
+	formatFlagName := "format"
+	flags.StringVar(&listFlag.format, formatFlagName, "", "Change the output format to JSON or a Go template")
+	_ = cmd.RegisterFlagCompletionFunc(formatFlagName, common.AutocompleteFormat(&imageReporter{}))
+
 	flags.BoolVar(&listFlag.digests, "digests", false, "Show digests")
 	flags.BoolVarP(&listFlag.noHeading, "noheading", "n", false, "Do not print column headings")
 	flags.BoolVar(&listFlag.noTrunc, "no-trunc", false, "Do not truncate output")
 	flags.BoolVarP(&listFlag.quiet, "quiet", "q", false, "Display only image IDs")
-	flags.StringVar(&listFlag.sort, "sort", "created", "Sort by "+sortFields.String())
+
+	sortFlagName := "sort"
+	flags.StringVar(&listFlag.sort, sortFlagName, "created", "Sort by "+sortFields.String())
+	_ = cmd.RegisterFlagCompletionFunc(sortFlagName, completion.AutocompleteNone)
+
 	flags.BoolVarP(&listFlag.history, "history", "", false, "Display the image name history")
 }
 
@@ -89,7 +118,7 @@ func images(cmd *cobra.Command, args []string) error {
 		listOptions.Filter = append(listOptions.Filter, "reference="+args[0])
 	}
 
-	if cmd.Flag("sort").Changed && !sortFields.Contains(listFlag.sort) {
+	if cmd.Flags().Changed("sort") && !sortFields.Contains(listFlag.sort) {
 		return fmt.Errorf("\"%s\" is not a valid field for sorting. Choose from: %s",
 			listFlag.sort, sortFields.String())
 	}
@@ -104,12 +133,15 @@ func images(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	switch {
+	case report.IsJSON(listFlag.format):
+		return writeJSON(imgs)
 	case listFlag.quiet:
 		return writeID(imgs)
-	case cmd.Flag("format").Changed && listFlag.format == "json":
-		return writeJSON(imgs)
 	default:
-		return writeTemplate(imgs)
+		if cmd.Flags().Changed("format") && !report.HasTable(listFlag.format) {
+			listFlag.noHeading = true
+		}
+		return writeTemplate(cmd, imgs)
 	}
 }
 
@@ -155,27 +187,31 @@ func writeJSON(images []imageReporter) error {
 	return nil
 }
 
-func writeTemplate(imgs []imageReporter) error {
-	var (
-		hdr, row string
-	)
-	if len(listFlag.format) < 1 {
-		hdr, row = imageListFormat(listFlag)
+func writeTemplate(cmd *cobra.Command, imgs []imageReporter) error {
+	hdrs := report.Headers(imageReporter{}, map[string]string{
+		"ID":       "IMAGE ID",
+		"ReadOnly": "R/O",
+	})
+
+	rpt := report.New(os.Stdout, cmd.Name())
+	defer rpt.Flush()
+
+	var err error
+	if cmd.Flags().Changed("format") {
+		rpt, err = rpt.Parse(report.OriginUser, cmd.Flag("format").Value.String())
 	} else {
-		row = listFlag.format
-		if !strings.HasSuffix(row, "\n") {
-			row += "\n"
-		}
+		rpt, err = rpt.Parse(report.OriginPodman, lsFormatFromFlags(listFlag))
 	}
-	format := hdr + "{{range . }}" + row + "{{end}}"
-	tmpl, err := template.New("list").Parse(format)
 	if err != nil {
 		return err
 	}
-	tmpl = template.Must(tmpl, nil)
-	w := tabwriter.NewWriter(os.Stdout, 8, 2, 2, ' ', 0)
-	defer w.Flush()
-	return tmpl.Execute(w, imgs)
+
+	if rpt.RenderHeaders && !listFlag.noHeading {
+		if err := rpt.Execute(hdrs); err != nil {
+			return err
+		}
+	}
+	return rpt.Execute(imgs)
 }
 
 func sortImages(imageS []*entities.ImageSummary) ([]imageReporter, error) {
@@ -190,7 +226,7 @@ func sortImages(imageS []*entities.ImageSummary) ([]imageReporter, error) {
 				h.ImageSummary = *e
 				h.Repository, h.Tag, err = tokenRepoTag(tag)
 				if err != nil {
-					return nil, errors.Wrapf(err, "error parsing repository tag %q:", tag)
+					return nil, fmt.Errorf("parsing repository tag: %q: %w", tag, err)
 				}
 				if h.Tag == "<none>" {
 					untagged = append(untagged, h)
@@ -214,7 +250,35 @@ func sortImages(imageS []*entities.ImageSummary) ([]imageReporter, error) {
 		listFlag.readOnly = e.IsReadOnly()
 	}
 
-	sort.Slice(imgs, sortFunc(listFlag.sort, imgs))
+	slices.SortFunc(imgs, func(a, b imageReporter) int {
+		switch listFlag.sort {
+		case "id":
+			return cmp.Compare(a.ID(), b.ID())
+
+		case "repository":
+			r := cmp.Compare(a.Repository, b.Repository)
+			if r == 0 {
+				// if repository is the same imply tag sorting
+				return cmp.Compare(a.Tag, b.Tag)
+			}
+			return r
+		case "size":
+			return cmp.Compare(a.size(), b.size())
+		case "tag":
+			return cmp.Compare(a.Tag, b.Tag)
+		case "created":
+			if a.created().After(b.created()) {
+				return -1
+			}
+			if a.created().Equal(b.created()) {
+				return 0
+			}
+			return 1
+		default:
+			return 0
+		}
+	})
+
 	return imgs, err
 }
 
@@ -247,69 +311,29 @@ func tokenRepoTag(ref string) (string, string, error) {
 	}
 
 	return name, tag, nil
-
 }
 
-func sortFunc(key string, data []imageReporter) func(i, j int) bool {
-	switch key {
-	case "id":
-		return func(i, j int) bool {
-			return data[i].ID() < data[j].ID()
-		}
-	case "repository":
-		return func(i, j int) bool {
-			return data[i].Repository < data[j].Repository
-		}
-	case "size":
-		return func(i, j int) bool {
-			return data[i].size() < data[j].size()
-		}
-	case "tag":
-		return func(i, j int) bool {
-			return data[i].Tag < data[j].Tag
-		}
-	default:
-		// case "created":
-		return func(i, j int) bool {
-			return data[i].created().After(data[j].created())
-		}
+func lsFormatFromFlags(flags listFlagType) string {
+	row := []string{
+		"{{if .Repository}}{{.Repository}}{{else}}<none>{{end}}",
+		"{{if .Tag}}{{.Tag}}{{else}}<none>{{end}}",
 	}
-}
-
-func imageListFormat(flags listFlagType) (string, string) {
-	// Defaults
-	hdr := "REPOSITORY\tTAG"
-	row := "{{.Repository}}\t{{if .Tag}}{{.Tag}}{{else}}<none>{{end}}"
 
 	if flags.digests {
-		hdr += "\tDIGEST"
-		row += "\t{{.Digest}}"
+		row = append(row, "{{.Digest}}")
 	}
 
-	hdr += "\tIMAGE ID"
-	row += "\t{{.ID}}"
-
-	hdr += "\tCREATED\tSIZE"
-	row += "\t{{.Created}}\t{{.Size}}"
+	row = append(row, "{{.ID}}", "{{.Created}}", "{{.Size}}")
 
 	if flags.history {
-		hdr += "\tHISTORY"
-		row += "\t{{if .History}}{{.History}}{{else}}<none>{{end}}"
+		row = append(row, "{{if .History}}{{.History}}{{else}}<none>{{end}}")
 	}
 
 	if flags.readOnly {
-		hdr += "\tReadOnly"
-		row += "\t{{.ReadOnly}}"
+		row = append(row, "{{.ReadOnly}}")
 	}
 
-	if flags.noHeading {
-		hdr = ""
-	} else {
-		hdr += "\n"
-	}
-
-	row += "\n"
-	return hdr, row
+	return "{{range . }}" + strings.Join(row, "\t") + "\n{{end -}}"
 }
 
 type imageReporter struct {

@@ -1,113 +1,91 @@
 package common
 
-import "github.com/containers/podman/v2/pkg/domain/entities"
+import (
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+)
 
-type ContainerCLIOpts struct {
-	Annotation        []string
-	Attach            []string
-	Authfile          string
-	BlkIOWeight       string
-	BlkIOWeightDevice []string
-	CapAdd            []string
-	CapDrop           []string
-	CgroupNS          string
-	CGroupsMode       string
-	CGroupParent      string
-	CIDFile           string
-	ConmonPIDFile     string
-	CPUPeriod         uint64
-	CPUQuota          int64
-	CPURTPeriod       uint64
-	CPURTRuntime      int64
-	CPUShares         uint64
-	CPUS              float64
-	CPUSetCPUs        string
-	CPUSetMems        string
-	Detach            bool
-	DetachKeys        string
-	Devices           []string
-	DeviceCGroupRule  []string
-	DeviceReadBPs     []string
-	DeviceReadIOPs    []string
-	DeviceWriteBPs    []string
-	DeviceWriteIOPs   []string
-	Entrypoint        *string
-	Env               []string
-	EnvHost           bool
-	EnvFile           []string
-	Expose            []string
-	GIDMap            []string
-	GroupAdd          []string
-	HealthCmd         string
-	HealthInterval    string
-	HealthRetries     uint
-	HealthStartPeriod string
-	HealthTimeout     string
-	Hostname          string
-	HTTPProxy         bool
-	ImageVolume       string
-	Init              bool
-	InitPath          string
-	Interactive       bool
-	IPC               string
-	KernelMemory      string
-	Label             []string
-	LabelFile         []string
-	LogDriver         string
-	LogOptions        []string
-	Memory            string
-	MemoryReservation string
-	MemorySwap        string
-	MemorySwappiness  int64
-	Name              string
-	NoHealthCheck     bool
-	OOMKillDisable    bool
-	OOMScoreAdj       int
-	OverrideArch      string
-	OverrideOS        string
-	OverrideVariant   string
-	PID               string
-	PIDsLimit         *int64
-	Pod               string
-	PodIDFile         string
-	PreserveFDs       uint
-	Privileged        bool
-	PublishAll        bool
-	Pull              string
-	Quiet             bool
-	ReadOnly          bool
-	ReadOnlyTmpFS     bool
-	Restart           string
-	Replace           bool
-	Rm                bool
-	RootFS            bool
-	SecurityOpt       []string
-	SdNotifyMode      string
-	ShmSize           string
-	SignaturePolicy   string
-	StopSignal        string
-	StopTimeout       uint
-	StoreageOpt       []string
-	SubUIDName        string
-	SubGIDName        string
-	Sysctl            []string
-	Systemd           string
-	TmpFS             []string
-	TTY               bool
-	Timezone          string
-	Umask             string
-	UIDMap            []string
-	Ulimit            []string
-	User              string
-	UserNS            string
-	UTS               string
-	Mount             []string
-	Volume            []string
-	VolumesFrom       []string
-	Workdir           string
-	SeccompPolicy     string
+func ulimits() []string {
+	if !registry.IsRemote() {
+		return podmanConfig.ContainersConfDefaultsRO.Ulimits()
+	}
+	return nil
+}
 
-	Net *entities.NetOptions
+func cgroupConfig() string {
+	if !registry.IsRemote() {
+		return podmanConfig.ContainersConfDefaultsRO.Cgroups()
+	}
+	return ""
+}
 
-	CgroupConf []string
+func devices() []string {
+	if !registry.IsRemote() {
+		return podmanConfig.ContainersConfDefaultsRO.Devices()
+	}
+	return nil
+}
+
+func Env() []string {
+	if !registry.IsRemote() {
+		return podmanConfig.ContainersConfDefaultsRO.Env()
+	}
+	return nil
+}
+
+func pidsLimit() int64 {
+	if !registry.IsRemote() {
+		return podmanConfig.ContainersConfDefaultsRO.PidsLimit()
+	}
+	return -1
+}
+
+func policy() string {
+	if !registry.IsRemote() {
+		return podmanConfig.ContainersConfDefaultsRO.Engine.PullPolicy
+	}
+	return ""
+}
+
+func shmSize() string {
+	if !registry.IsRemote() {
+		return podmanConfig.ContainersConfDefaultsRO.ShmSize()
+	}
+	return ""
+}
+
+func volumes() []string {
+	if !registry.IsRemote() {
+		return podmanConfig.ContainersConfDefaultsRO.Volumes()
+	}
+	return nil
+}
+
+func LogDriver() string {
+	if !registry.IsRemote() {
+		return podmanConfig.ContainersConfDefaultsRO.Containers.LogDriver
+	}
+	return ""
+}
+
+// DefineCreateDefault is used to initialize ctr create options before flag initialization
+func DefineCreateDefaults(opts *entities.ContainerCreateOptions) {
+	opts.LogDriver = LogDriver()
+	opts.CgroupsMode = cgroupConfig()
+	opts.MemorySwappiness = -1
+	opts.ImageVolume = podmanConfig.ContainersConfDefaultsRO.Engine.ImageVolumeMode
+	opts.Pull = policy()
+	opts.ReadWriteTmpFS = true
+	opts.SdNotifyMode = define.SdNotifyModeContainer
+	opts.StopTimeout = podmanConfig.ContainersConfDefaultsRO.Engine.StopTimeout
+	opts.Systemd = "true"
+	opts.Timezone = podmanConfig.ContainersConfDefaultsRO.TZ()
+	opts.Umask = podmanConfig.ContainersConfDefaultsRO.Umask()
+	opts.Ulimit = ulimits()
+	opts.SeccompPolicy = "default"
+	opts.Volume = volumes()
+	opts.HealthLogDestination = define.DefaultHealthCheckLocalDestination
+	opts.HealthMaxLogCount = define.DefaultHealthMaxLogCount
+	opts.HealthMaxLogSize = define.DefaultHealthMaxLogSize
 }

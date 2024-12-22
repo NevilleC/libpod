@@ -3,27 +3,28 @@ package images
 import (
 	"fmt"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/pkg/domain/entities"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
 )
 
 var (
-	treeDescription = "Prints layer hierarchy of an image in a tree format"
+	treeDescription = "Print layer hierarchy of an image in a tree format"
 	treeCmd         = &cobra.Command{
-		Use:     "tree [flags] IMAGE",
-		Args:    cobra.ExactArgs(1),
-		Short:   treeDescription,
-		Long:    treeDescription,
-		RunE:    tree,
-		Example: "podman image tree alpine:latest",
+		Use:               "tree [options] IMAGE",
+		Args:              cobra.ExactArgs(1),
+		Short:             treeDescription,
+		Long:              treeDescription,
+		RunE:              tree,
+		ValidArgsFunction: common.AutocompleteImages,
+		Example:           "podman image tree alpine:latest",
 	}
 	treeOpts entities.ImageTreeOptions
 )
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: treeCmd,
 		Parent:  imageCmd,
 	})

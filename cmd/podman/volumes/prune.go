@@ -7,11 +7,13 @@ import (
 	"os"
 	"strings"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/utils"
-	"github.com/containers/podman/v2/cmd/podman/validate"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/pkg/errors"
+	"github.com/containers/common/pkg/completion"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/parse"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
 )
 
@@ -21,37 +23,78 @@ var (
   The command prompts for confirmation which can be overridden with the --force flag.
   Note all data will be destroyed.`
 	pruneCommand = &cobra.Command{
-		Use:   "prune",
-		Args:  validate.NoArgs,
-		Short: "Remove all unused volumes",
-		Long:  volumePruneDescription,
-		RunE:  prune,
+		Use:               "prune [options]",
+		Args:              validate.NoArgs,
+		Short:             "Remove all unused volumes",
+		Long:              volumePruneDescription,
+		RunE:              prune,
+		ValidArgsFunction: completion.AutocompleteNone,
 	}
-)
-
-var (
-	pruneOptions entities.VolumePruneOptions
+	filter = []string{}
 )
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: pruneCommand,
 		Parent:  volumeCmd,
 	})
 	flags := pruneCommand.Flags()
-	flags.BoolVarP(&pruneOptions.Force, "force", "f", false, "Do not prompt for confirmation")
+
+	filterFlagName := "filter"
+	flags.StringArrayVar(&filter, filterFlagName, []string{}, "Provide filter values (e.g. 'label=<key>=<value>')")
+	_ = pruneCommand.RegisterFlagCompletionFunc(filterFlagName, common.AutocompleteVolumeFilters)
+	flags.BoolP("force", "f", false, "Do not prompt for confirmation")
 }
 
 func prune(cmd *cobra.Command, args []string) error {
+	var (
+		pruneOptions  = entities.VolumePruneOptions{}
+		listOptions   = entities.VolumeListOptions{}
+		unusedOptions = entities.VolumeListOptions{}
+	)
 	// Prompt for confirmation if --force is not set
-	if !pruneOptions.Force {
+	force, err := cmd.Flags().GetBool("force")
+	if err != nil {
+		return err
+	}
+	pruneOptions.Filters, err = parse.FilterArgumentsIntoFilters(filter)
+	if err != nil {
+		return err
+	}
+	if !force {
 		reader := bufio.NewReader(os.Stdin)
-		fmt.Println("WARNING! This will remove all volumes not used by at least one container.")
+		fmt.Println("WARNING! This will remove all volumes not used by at least one container. The following volumes will be removed:")
+		if err != nil {
+			return err
+		}
+		listOptions.Filter, err = parse.FilterArgumentsIntoFilters(filter)
+		if err != nil {
+			return err
+		}
+		// filter all the dangling volumes
+		unusedOptions.Filter = make(map[string][]string, 1)
+		unusedOptions.Filter["dangling"] = []string{"true"}
+		unusedVolumes, err := registry.ContainerEngine().VolumeList(context.Background(), unusedOptions)
+		if err != nil {
+			return err
+		}
+		// filter volumes based on user input
+		filteredVolumes, err := registry.ContainerEngine().VolumeList(context.Background(), listOptions)
+		if err != nil {
+			return err
+		}
+		finalVolumes := getIntersection(unusedVolumes, filteredVolumes)
+		if len(finalVolumes) < 1 {
+			fmt.Println("No dangling volumes found")
+			return nil
+		}
+		for _, fv := range finalVolumes {
+			fmt.Println(fv.Name)
+		}
 		fmt.Print("Are you sure you want to continue? [y/N] ")
 		answer, err := reader.ReadString('\n')
 		if err != nil {
-			return errors.Wrapf(err, "error reading input")
+			return err
 		}
 		if strings.ToLower(answer)[0] != 'y' {
 			return nil
@@ -61,5 +104,19 @@ func prune(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	return utils.PrintVolumePruneResults(responses)
+	return utils.PrintVolumePruneResults(responses, false)
+}
+
+func getIntersection(a, b []*entities.VolumeListReport) []*entities.VolumeListReport {
+	var intersection []*entities.VolumeListReport
+	hash := make(map[string]bool, len(a))
+	for _, aa := range a {
+		hash[aa.Name] = true
+	}
+	for _, bb := range b {
+		if hash[bb.Name] {
+			intersection = append(intersection, bb)
+		}
+	}
+	return intersection
 }

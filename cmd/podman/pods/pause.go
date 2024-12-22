@@ -4,10 +4,11 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/utils"
-	"github.com/containers/podman/v2/cmd/podman/validate"
-	"github.com/containers/podman/v2/pkg/domain/entities"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
 )
 
@@ -16,15 +17,15 @@ var (
 
   All running containers within each specified pod will then be paused.`
 	pauseCommand = &cobra.Command{
-		Use:   "pause [flags] POD [POD...]",
+		Use:   "pause [options] POD [POD...]",
 		Short: "Pause one or more pods",
 		Long:  podPauseDescription,
 		RunE:  pause,
 		Args: func(cmd *cobra.Command, args []string) error {
-			return validate.CheckAllLatestAndCIDFile(cmd, args, false, false)
+			return validate.CheckAllLatestAndIDFile(cmd, args, false, "")
 		},
+		ValidArgsFunction: common.AutocompletePodsRunning,
 		Example: `podman pod pause podID1 podID2
-  podman pod pause --latest
   podman pod pause --all`,
 	}
 )
@@ -35,7 +36,6 @@ var (
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: pauseCommand,
 		Parent:  podCmd,
 	})

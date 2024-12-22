@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"time"
 
-	podmanVersion "github.com/containers/podman/v2/version"
+	"github.com/containers/podman/v5/version"
 )
 
 // Overwritten at build time
@@ -27,6 +27,7 @@ type Version struct {
 	BuiltTime  string
 	Built      int64
 	OsArch     string
+	Os         string
 }
 
 // GetVersion returns a VersionOutput struct for API and podman
@@ -42,12 +43,13 @@ func GetVersion() (Version, error) {
 		}
 	}
 	return Version{
-		APIVersion: podmanVersion.APIVersion.String(),
-		Version:    podmanVersion.Version.String(),
+		APIVersion: version.APIVersion[version.Libpod][version.CurrentAPI].String(),
+		Version:    version.Version.String(),
 		GoVersion:  runtime.Version(),
 		GitCommit:  gitCommit,
 		BuiltTime:  time.Unix(buildTime, 0).Format(time.ANSIC),
 		Built:      buildTime,
 		OsArch:     runtime.GOOS + "/" + runtime.GOARCH,
+		Os:         runtime.GOOS,
 	}, nil
 }

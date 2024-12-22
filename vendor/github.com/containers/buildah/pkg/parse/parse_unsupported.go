@@ -1,16 +1,17 @@
-// +build !linux,!darwin
+//go:build !linux && !darwin
 
 package parse
 
 import (
-	"github.com/opencontainers/runc/libcontainer/configs"
-	"github.com/pkg/errors"
+	"errors"
+
+	"github.com/containers/buildah/define"
 )
 
 func getDefaultProcessLimits() []string {
 	return []string{}
 }
 
-func DeviceFromPath(device string) ([]configs.Device, error) {
-	return []configs.Device{}, errors.Errorf("devices not supported")
+func DeviceFromPath(device string) (define.ContainerDevices, error) {
+	return nil, errors.New("devices not supported")
 }

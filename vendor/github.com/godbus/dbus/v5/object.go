@@ -16,6 +16,7 @@ type BusObject interface {
 	AddMatchSignal(iface, member string, options ...MatchOption) *Call
 	RemoveMatchSignal(iface, member string, options ...MatchOption) *Call
 	GetProperty(p string) (Variant, error)
+	StoreProperty(p string, value interface{}) error
 	SetProperty(p string, v interface{}) error
 	Destination() string
 	Path() ObjectPath
@@ -45,7 +46,7 @@ func (o *Object) CallWithContext(ctx context.Context, method string, flags Flags
 // Deprecated: use (*Conn) AddMatchSignal instead.
 func (o *Object) AddMatchSignal(iface, member string, options ...MatchOption) *Call {
 	base := []MatchOption{
-		withMatchType("signal"),
+		withMatchTypeSignal(),
 		WithMatchInterface(iface),
 		WithMatchMember(member),
 	}
@@ -64,7 +65,7 @@ func (o *Object) AddMatchSignal(iface, member string, options ...MatchOption) *C
 // Deprecated: use (*Conn) RemoveMatchSignal instead.
 func (o *Object) RemoveMatchSignal(iface, member string, options ...MatchOption) *Call {
 	base := []MatchOption{
-		withMatchType("signal"),
+		withMatchTypeSignal(),
 		WithMatchInterface(iface),
 		WithMatchMember(member),
 	}
@@ -109,7 +110,6 @@ func (o *Object) createCall(ctx context.Context, method string, flags Flags, ch 
 	method = method[i+1:]
 	msg := new(Message)
 	msg.Type = TypeMethodCall
-	msg.serial = o.conn.getSerial()
 	msg.Flags = flags & (FlagNoAutoStart | FlagNoReplyExpected)
 	msg.Headers = make(map[HeaderField]Variant)
 	msg.Headers[FieldPath] = MakeVariant(o.path)
@@ -122,73 +122,21 @@ func (o *Object) createCall(ctx context.Context, method string, flags Flags, ch 
 	if len(args) > 0 {
 		msg.Headers[FieldSignature] = MakeVariant(SignatureOf(args...))
 	}
-	if msg.Flags&FlagNoReplyExpected == 0 {
-		if ch == nil {
-			ch = make(chan *Call, 1)
-		} else if cap(ch) == 0 {
-			panic("dbus: unbuffered channel passed to (*Object).Go")
-		}
-		ctx, cancel := context.WithCancel(ctx)
-		call := &Call{
-			Destination: o.dest,
-			Path:        o.path,
-			Method:      method,
-			Args:        args,
-			Done:        ch,
-			ctxCanceler: cancel,
-			ctx:         ctx,
-		}
-		o.conn.calls.track(msg.serial, call)
-		o.conn.sendMessageAndIfClosed(msg, func() {
-			o.conn.calls.handleSendError(msg, ErrClosed)
-			cancel()
-		})
-		go func() {
-			<-ctx.Done()
-			o.conn.calls.handleSendError(msg, ctx.Err())
-		}()
-
-		return call
-	}
-	done := make(chan *Call, 1)
-	call := &Call{
-		Err:  nil,
-		Done: done,
-	}
-	defer func() {
-		call.Done <- call
-		close(done)
-	}()
-	o.conn.sendMessageAndIfClosed(msg, func() {
-		call.Err = ErrClosed
-	})
-	return call
+	return o.conn.SendWithContext(ctx, msg, ch)
 }
 
 // GetProperty calls org.freedesktop.DBus.Properties.Get on the given
 // object. The property name must be given in interface.member notation.
 func (o *Object) GetProperty(p string) (Variant, error) {
-	idx := strings.LastIndex(p, ".")
-	if idx == -1 || idx+1 == len(p) {
-		return Variant{}, errors.New("dbus: invalid property " + p)
-	}
-
-	iface := p[:idx]
-	prop := p[idx+1:]
-
-	result := Variant{}
-	err := o.Call("org.freedesktop.DBus.Properties.Get", 0, iface, prop).Store(&result)
-
-	if err != nil {
-		return Variant{}, err
-	}
-
-	return result, nil
+	var result Variant
+	err := o.StoreProperty(p, &result)
+	return result, err
 }
 
-// SetProperty calls org.freedesktop.DBus.Properties.Set on the given
+// StoreProperty calls org.freedesktop.DBus.Properties.Get on the given
 // object. The property name must be given in interface.member notation.
-func (o *Object) SetProperty(p string, v interface{}) error {
+// It stores the returned property into the provided value.
+func (o *Object) StoreProperty(p string, value interface{}) error {
 	idx := strings.LastIndex(p, ".")
 	if idx == -1 || idx+1 == len(p) {
 		return errors.New("dbus: invalid property " + p)
@@ -197,7 +145,29 @@ func (o *Object) SetProperty(p string, v interface{}) error {
 	iface := p[:idx]
 	prop := p[idx+1:]
 
-	return o.Call("org.freedesktop.DBus.Properties.Set", 0, iface, prop, v).Err
+	return o.Call("org.freedesktop.DBus.Properties.Get", 0, iface, prop).
+		Store(value)
+}
+
+// SetProperty calls org.freedesktop.DBus.Properties.Set on the given
+// object. The property name must be given in interface.member notation.
+// Panics if v is not a valid Variant type.
+func (o *Object) SetProperty(p string, v interface{}) error {
+	// v might already be a variant...
+	variant, ok := v.(Variant)
+	if !ok {
+		// Otherwise, make it into one.
+		variant = MakeVariant(v)
+	}
+	idx := strings.LastIndex(p, ".")
+	if idx == -1 || idx+1 == len(p) {
+		return errors.New("dbus: invalid property " + p)
+	}
+
+	iface := p[:idx]
+	prop := p[idx+1:]
+
+	return o.Call("org.freedesktop.DBus.Properties.Set", 0, iface, prop, variant).Err
 }
 
 // Destination returns the destination that calls on (o *Object) are sent to.

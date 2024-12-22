@@ -1,4 +1,4 @@
-% podman-healthcheck-run(1)
+% podman-healthcheck-run 1
 
 ## NAME
 podman\-healthcheck\-run - Run a container healthcheck
@@ -21,19 +21,20 @@ Possible errors that can occur during the healthcheck are:
 * container is not running
 
 ## OPTIONS
-**--help**
+#### **--help**
 
 Print usage statement
 
 
 ## EXAMPLES
 
+Run healthchecks in specified container:
 ```
 $ podman healthcheck run mywebapp
 ```
 
 ## SEE ALSO
-podman-healthcheck(1)
+**[podman(1)](podman.1.md)**, **[podman-healthcheck(1)](podman-healthcheck.1.md)**
 
 ## HISTORY
 Feb 2019, Originally compiled by Brent Baude <bbaude@redhat.com>

@@ -1,4 +1,4 @@
-![PODMAN logo](../../logo/podman-logo-source.svg)
+![PODMAN logo](https://raw.githubusercontent.com/containers/common/main/logos/podman-logo-full-vert.png)
 
 # Podman Tutorials
 
@@ -6,13 +6,13 @@
 
 **[Introduction Tutorial](podman_tutorial.md)**
 
-Learn how to setup Podman and perform some basic commands with the utility.
+Learn how to set up Podman and perform some basic commands with the utility.
 
 **[Basic Setup and Use of Podman in a Rootless environment](rootless_tutorial.md)**
 
-The steps required to setup rootless Podman are enumerated.
+The steps required to set up rootless Podman are enumerated.
 
-**[Setup Mac/Windows](mac_win_client.md)
+**[Setup Mac/Windows](mac_win_client.md)**
 
 Special setup for running the Podman remote client on a Mac or Windows PC and connecting to Podman running on a Linux VM are documented.
 
@@ -26,8 +26,16 @@ How the libpod API can be used within your own project.
 
 **[Image Signing](image_signing.md)**
 
-Learn how to setup and use image signing with Podman.
+Learn how to set up and use image signing with Podman.
 
-**[Go Bindings](podman-go-bindings.md)**
+**[Basic Networking](basic_networking.md)**
 
-A brief how-to on using Podman's Go bindings in external applications.
+A basic guide to common network setups with Podman
+
+**[Socket activation](socket_activation.md)**
+
+Learn how to run containers that support socket activation.
+
+**[Performance](performance.md)**
+
+Performance guide regarding Podman configuration and usage.

@@ -1,4 +1,8 @@
-# Podman Remote clients for MacOS and Windows
+# Podman Remote clients for macOS and Windows
+
+***
+**_NOTE:_** For running Podman on Windows, refer to the [Podman for Windows](podman-for-windows.md) guide, which uses the recommended approach of a Podman-managed Linux backend. For Mac, see the [Podman installation instructions](https://podman.io/getting-started/installation). This guide covers the advanced usage of Podman with a custom Linux VM or a remote external Linux system.
+***
 
 ## Introduction
 
@@ -12,13 +16,13 @@ The remote client uses a client-server model. You need Podman installed on a Lin
 
 ### Windows
 
-Installing the Windows Podman client begins by downloading the Podman windows installer. The windows installer is built with each Podman release and is downloadable from its [release description page](https://github.com/containers/podman/releases/latest).  You can also build the installer from source using the `podman.msi` Makefile endpoint.
+Installing the Windows Podman client begins by downloading the Podman Windows installer. The Windows installer is built with each Podman release and is downloadable from its [release description page](https://github.com/containers/podman/releases/latest). The Windows installer file is named `podman-#.#.#-setup.exe`, where the `#` symbols represent the version number of Podman.
 
-Once you have downloaded the installer, simply double click the installer and Podman will be installed.  The path is also set to put `podman` in the default user path.
+Once you have downloaded the installer to your Windows host, simply double click the installer and Podman will be installed.  The path is also set to put `podman` in the default user path.
 
-Podman must be run at a command prompt using the Windows ‘cmd” or powershell applications.
+Podman must be run at a command prompt using the Windows Command Prompt (`cmd.exe`) or PowerShell (`pwsh.exe`) applications.
 
-### MacOS
+### macOS
 
 The Mac Client is available through [Homebrew](https://brew.sh/). You can download homebrew via the instructions on their site. Install podman using:
 ```
@@ -29,14 +33,14 @@ $ brew install podman
 
 ### Enable the Podman service on the server machine.
 
-Before performing any  Podman client commands, you must enable the podman.sock SystemD service on the Linux server.  In these examples, we are running Podman as a normal, unprivileged user, also known as a rootless user.  By default, the rootless socket listens at  `/run/user/${UID}/podman/podman.sock`.  You can enable this socket, permanently using the following command:
+Before performing any  Podman client commands, you must enable the podman.sock SystemD service on the Linux server.  In these examples, we are running Podman as a normal, unprivileged user, also known as a rootless user.  By default, the rootless socket listens at  `/run/user/${UID}/podman/podman.sock`.  You can enable and start this socket permanently, using the following commands:
 ```
-$ systemctl --user enable podman.socket
+$ systemctl --user enable --now podman.socket
 ```
 You will need to enable linger for this user in order for the socket to work when the user is not logged in.
 
 ```
-$ sudo loginctl enable-linger $USER
+sudo loginctl enable-linger $USER
 ```
 
 You can verify that the socket is listening with a simple Podman command.
@@ -55,7 +59,7 @@ host:
 
 In order for the client to communicate with the server you need to enable and start the SSH daemon on your Linux machine, if it is not currently enabled.
 ```
-$ sudo systemctl enable -s sshd
+sudo systemctl enable --now sshd
 ```
 
 #### Setting up SSH

@@ -1,4 +1,4 @@
-// +build !remote
+//go:build !remote
 
 package system
 
@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/validate"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/containers/podman/v2/pkg/domain/infra"
+	"github.com/containers/common/pkg/completion"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/libpod/define"
 	"github.com/spf13/cobra"
 )
 
@@ -22,39 +22,29 @@ var (
 `
 
 	renumberCommand = &cobra.Command{
-		Use:                   "renumber",
-		Args:                  validate.NoArgs,
-		DisableFlagsInUseLine: true,
-		Short:                 "Migrate lock numbers",
-		Long:                  renumberDescription,
-		Run:                   renumber,
+		Annotations:       map[string]string{registry.EngineMode: registry.ABIMode},
+		Use:               "renumber",
+		Args:              validate.NoArgs,
+		Short:             "Migrate lock numbers",
+		Long:              renumberDescription,
+		Run:               renumber,
+		ValidArgsFunction: completion.AutocompleteNone,
 	}
 )
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode},
 		Command: renumberCommand,
 		Parent:  systemCmd,
 	})
-
 }
 func renumber(cmd *cobra.Command, args []string) {
-	// Shutdown all running engines, `renumber` will hijack all methods
-	registry.ContainerEngine().Shutdown(registry.Context())
-	registry.ImageEngine().Shutdown(registry.Context())
-
-	engine, err := infra.NewSystemEngine(entities.RenumberMode, registry.PodmanConfig())
-	if err != nil {
+	if err := registry.ContainerEngine().Renumber(registry.Context()); err != nil {
 		fmt.Println(err)
-		os.Exit(125)
-	}
-	defer engine.Shutdown(registry.Context())
-
-	err = engine.Renumber(registry.Context(), cmd.Flags(), registry.PodmanConfig())
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(125)
+		// FIXME change this to return the error like other commands
+		// defer will never run on os.Exit()
+		//nolint:gocritic
+		os.Exit(define.ExecErrorCodeGeneric)
 	}
 	os.Exit(0)
 }

@@ -1,20 +1,21 @@
+//go:build !remote
+
 package compat
 
 import (
+	"errors"
 	"net/http"
 
-	"github.com/containers/podman/v2/libpod"
-	"github.com/containers/podman/v2/libpod/define"
-	"github.com/containers/podman/v2/pkg/api/handlers/utils"
-	"github.com/containers/podman/v2/pkg/api/server/idletracker"
-	"github.com/gorilla/schema"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	"github.com/containers/podman/v5/pkg/api/server/idle"
+	api "github.com/containers/podman/v5/pkg/api/types"
 	"github.com/sirupsen/logrus"
 )
 
 func AttachContainer(w http.ResponseWriter, r *http.Request) {
-	runtime := r.Context().Value("runtime").(*libpod.Runtime)
-	decoder := r.Context().Value("decoder").(*schema.Decoder)
+	runtime := r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
+	decoder := utils.GetDecoder(r)
 
 	query := struct {
 		DetachKeys string `schema:"detachKeys"`
@@ -27,7 +28,7 @@ func AttachContainer(w http.ResponseWriter, r *http.Request) {
 		Stream: true,
 	}
 	if err := decoder.Decode(&query, r.URL.Query()); err != nil {
-		utils.Error(w, "Error parsing parameters", http.StatusBadRequest, err)
+		utils.Error(w, http.StatusBadRequest, err)
 		return
 	}
 
@@ -59,13 +60,13 @@ func AttachContainer(w http.ResponseWriter, r *http.Request) {
 		streams = nil
 	}
 	if useStreams && !streams.Stdout && !streams.Stderr && !streams.Stdin {
-		utils.Error(w, "Parameter conflict", http.StatusBadRequest, errors.Errorf("at least one of stdin, stdout, stderr must be true"))
+		utils.Error(w, http.StatusBadRequest, errors.New("at least one of stdin, stdout, stderr must be true"))
 		return
 	}
 
 	// At least one of these must be set
 	if !query.Stream && !query.Logs {
-		utils.Error(w, "Unsupported parameter", http.StatusBadRequest, errors.Errorf("at least one of Logs or Stream must be set"))
+		utils.Error(w, http.StatusBadRequest, errors.New("at least one of Logs or Stream must be set"))
 		return
 	}
 
@@ -76,46 +77,29 @@ func AttachContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	state, err := ctr.State()
-	if err != nil {
-		utils.InternalServerError(w, err)
-		return
+	logErr := func(e error) {
+		logrus.Errorf("Error attaching to container %s: %v", ctr.ID(), e)
 	}
-	// For Docker compatibility, we need to re-initialize containers in these states.
-	if state == define.ContainerStateConfigured || state == define.ContainerStateExited {
-		if err := ctr.Init(r.Context(), ctr.PodID() != ""); err != nil {
-			utils.Error(w, "Container in wrong state", http.StatusConflict, errors.Wrapf(err, "error preparing container %s for attach", ctr.ID()))
-			return
-		}
-	} else if !(state == define.ContainerStateCreated || state == define.ContainerStateRunning) {
-		utils.InternalServerError(w, errors.Wrapf(define.ErrCtrStateInvalid, "can only attach to created or running containers - currently in state %s", state.String()))
-		return
-	}
-
-	idleTracker := r.Context().Value("idletracker").(*idletracker.IdleTracker)
-	hijackChan := make(chan bool, 1)
 
 	// Perform HTTP attach.
 	// HTTPAttach will handle everything about the connection from here on
 	// (including closing it and writing errors to it).
-	if err := ctr.HTTPAttach(r, w, streams, detachKeys, nil, query.Stream, query.Logs, hijackChan); err != nil {
-		hijackComplete := <-hijackChan
+	hijackChan := make(chan bool, 1)
+	err = ctr.HTTPAttach(r, w, streams, detachKeys, nil, query.Stream, query.Logs, hijackChan)
 
-		// We can't really do anything about errors anymore. HTTPAttach
-		// should be writing them to the connection.
-		logrus.Errorf("Error attaching to container %s: %v", ctr.ID(), err)
+	if <-hijackChan {
+		// If connection was Hijacked, we have to signal it's being closed
+		t := r.Context().Value(api.IdleTrackerKey).(*idle.Tracker)
+		defer t.Close()
 
-		if hijackComplete {
-			// We do need to tell the idle tracker that the
-			// connection has been closed, though. We can guarantee
-			// that is true after HTTPAttach exits.
-			idleTracker.TrackHijackedClosed()
-		} else {
-			// A hijack was not successfully completed. We need to
-			// report the error normally.
-			utils.InternalServerError(w, err)
+		if err != nil {
+			// Cannot report error to client as a 500 as the Upgrade set status to 101
+			logErr(err)
 		}
+	} else {
+		// If the Hijack failed we are going to assume we can still inform client of failure
+		utils.InternalServerError(w, err)
+		logErr(err)
 	}
-
 	logrus.Debugf("Attach for container %s completed successfully", ctr.ID())
 }

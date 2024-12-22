@@ -1,17 +1,18 @@
+//go:build !remote
+
 package server
 
 import (
 	"net/http"
 
-	"github.com/containers/podman/v2/pkg/api/handlers/compat"
+	"github.com/containers/podman/v5/pkg/api/handlers/compat"
 	"github.com/gorilla/mux"
 )
 
 func (s *APIServer) registerPingHandlers(r *mux.Router) error {
-
 	r.Handle("/_ping", s.APIHandler(compat.Ping)).Methods(http.MethodGet, http.MethodHead)
 	r.Handle(VersionedPath("/_ping"), s.APIHandler(compat.Ping)).Methods(http.MethodGet, http.MethodHead)
-	// swagger:operation GET /libpod/_ping libpod libpodPingGet
+	// swagger:operation GET /libpod/_ping libpod SystemPing
 	// ---
 	//   summary: Ping service
 	//   description: |
@@ -53,14 +54,14 @@ func (s *APIServer) registerPingHandlers(r *mux.Router) error {
 	//             Max Podman API Version the server supports.
 	//             Available if service is backed by Podman, therefore may be used to
 	//             determine if talking to Podman engine or another engine
-	//         Libpod-Buildha-Version:
+	//         Libpod-Buildah-Version:
 	//           type: string
 	//           description: |
 	//             Default version of libpod image builder.
 	//               Available if service is backed by Podman, therefore may be used to
 	//               determine if talking to Podman engine or another engine
 	//     500:
-	//       $ref: "#/responses/InternalError"
+	//       $ref: "#/responses/internalError"
 	r.Handle("/libpod/_ping", s.APIHandler(compat.Ping)).Methods(http.MethodGet, http.MethodHead)
 	r.Handle(VersionedPath("/libpod/_ping"), s.APIHandler(compat.Ping)).Methods(http.MethodGet, http.MethodHead)
 	return nil

@@ -1,14 +1,16 @@
+//go:build !remote
+
 package server
 
 import (
 	"net/http"
 
-	"github.com/containers/podman/v2/pkg/api/handlers/libpod"
+	"github.com/containers/podman/v5/pkg/api/handlers/libpod"
 	"github.com/gorilla/mux"
 )
 
 func (s *APIServer) registerGenerateHandlers(r *mux.Router) error {
-	// swagger:operation GET /libpod/generate/{name:.*}/systemd libpod libpodGenerateSystemd
+	// swagger:operation GET /libpod/generate/{name}/systemd libpod GenerateSystemdLibpod
 	// ---
 	// tags:
 	//  - containers
@@ -17,7 +19,7 @@ func (s *APIServer) registerGenerateHandlers(r *mux.Router) error {
 	// description: Generate Systemd Units based on a pod or container.
 	// parameters:
 	//  - in: path
-	//    name: name:.*
+	//    name: name
 	//    type: string
 	//    required: true
 	//    description: Name or ID of the container or pod.
@@ -32,10 +34,20 @@ func (s *APIServer) registerGenerateHandlers(r *mux.Router) error {
 	//    default: false
 	//    description: Create a new container instead of starting an existing one.
 	//  - in: query
-	//    name: time
+	//    name: noHeader
+	//    type: boolean
+	//    default: false
+	//    description: Do not generate the header including the Podman version and the timestamp.
+	//  - in: query
+	//    name: startTimeout
+	//    type: integer
+	//    default: 0
+	//    description: Start timeout in seconds.
+	//  - in: query
+	//    name: stopTimeout
 	//    type: integer
 	//    default: 10
-	//    description: Stop timeout override.
+	//    description: Stop timeout in seconds.
 	//  - in: query
 	//    name: restartPolicy
 	//    default: on-failure
@@ -57,6 +69,39 @@ func (s *APIServer) registerGenerateHandlers(r *mux.Router) error {
 	//    type: string
 	//    default: "-"
 	//    description: Systemd unit name separator between name/id and prefix.
+	//  - in: query
+	//    name: restartSec
+	//    type: integer
+	//    default: 0
+	//    description: Configures the time to sleep before restarting a service.
+	//  - in: query
+	//    name: wants
+	//    type: array
+	//    items:
+	//        type: string
+	//    default: []
+	//    description: Systemd Wants list for the container or pods.
+	//  - in: query
+	//    name: after
+	//    type: array
+	//    items:
+	//        type: string
+	//    default: []
+	//    description: Systemd After list for the container or pods.
+	//  - in: query
+	//    name: requires
+	//    type: array
+	//    items:
+	//        type: string
+	//    default: []
+	//    description: Systemd Requires list for the container or pods.
+	//  - in: query
+	//    name: additionalEnvVariables
+	//    type: array
+	//    items:
+	//        type: string
+	//    default: []
+	//    description: Set environment variables to the systemd unit files.
 	// produces:
 	// - application/json
 	// responses:
@@ -67,10 +112,10 @@ func (s *APIServer) registerGenerateHandlers(r *mux.Router) error {
 	//       additionalProperties:
 	//         type: string
 	//   500:
-	//     $ref: "#/responses/InternalError"
+	//     $ref: "#/responses/internalError"
 	r.HandleFunc(VersionedPath("/libpod/generate/{name:.*}/systemd"), s.APIHandler(libpod.GenerateSystemd)).Methods(http.MethodGet)
 
-	// swagger:operation GET /libpod/generate/{name:.*}/kube libpod libpodGenerateKube
+	// swagger:operation GET /libpod/generate/kube libpod GenerateKubeLibpod
 	// ---
 	// tags:
 	//  - containers
@@ -78,9 +123,11 @@ func (s *APIServer) registerGenerateHandlers(r *mux.Router) error {
 	// summary: Generate a Kubernetes YAML file.
 	// description: Generate Kubernetes YAML based on a pod or container.
 	// parameters:
-	//  - in: path
-	//    name: name:.*
-	//    type: string
+	//  - in: query
+	//    name: names
+	//    type: array
+	//    items:
+	//       type: string
 	//    required: true
 	//    description: Name or ID of the container or pod.
 	//  - in: query
@@ -89,15 +136,16 @@ func (s *APIServer) registerGenerateHandlers(r *mux.Router) error {
 	//    default: false
 	//    description: Generate YAML for a Kubernetes service object.
 	// produces:
+	// - text/vnd.yaml
 	// - application/json
 	// responses:
 	//   200:
-	//     description: no error
+	//     description: Kubernetes YAML file describing pod
 	//     schema:
 	//      type: string
 	//      format: binary
 	//   500:
-	//     $ref: "#/responses/InternalError"
-	r.HandleFunc(VersionedPath("/libpod/generate/{name:.*}/kube"), s.APIHandler(libpod.GenerateKube)).Methods(http.MethodGet)
+	//     $ref: "#/responses/internalError"
+	r.HandleFunc(VersionedPath("/libpod/generate/kube"), s.APIHandler(libpod.GenerateKube)).Methods(http.MethodGet)
 	return nil
 }

@@ -2,24 +2,27 @@ package buildah
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"strings"
-	"time"
 
-	"github.com/containers/buildah/util"
+	"github.com/containers/buildah/define"
+	"github.com/containers/common/libimage"
+	"github.com/containers/common/pkg/config"
 	"github.com/containers/image/v5/image"
 	"github.com/containers/image/v5/manifest"
-	"github.com/containers/image/v5/pkg/sysregistriesv2"
-	is "github.com/containers/image/v5/storage"
+	"github.com/containers/image/v5/pkg/shortnames"
 	"github.com/containers/image/v5/transports"
-	"github.com/containers/image/v5/transports/alltransports"
 	"github.com/containers/image/v5/types"
 	"github.com/containers/storage"
+	"github.com/containers/storage/pkg/stringid"
 	digest "github.com/opencontainers/go-digest"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/openshift/imagebuilder"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/exp/maps"
+	"golang.org/x/exp/slices"
 )
 
 const (
@@ -27,29 +30,6 @@ const (
 	// as "no image".
 	BaseImageFakeName = imagebuilder.NoBaseImageSpecifier
 )
-
-func pullAndFindImage(ctx context.Context, store storage.Store, srcRef types.ImageReference, options BuilderOptions, sc *types.SystemContext) (*storage.Image, types.ImageReference, error) {
-	pullOptions := PullOptions{
-		ReportWriter:     options.ReportWriter,
-		Store:            store,
-		SystemContext:    options.SystemContext,
-		BlobDirectory:    options.BlobDirectory,
-		MaxRetries:       options.MaxPullRetries,
-		RetryDelay:       options.PullRetryDelay,
-		OciDecryptConfig: options.OciDecryptConfig,
-	}
-	ref, err := pullImage(ctx, store, srcRef, pullOptions, sc)
-	if err != nil {
-		logrus.Debugf("error pulling image %q: %v", transports.ImageName(srcRef), err)
-		return nil, nil, err
-	}
-	img, err := is.Transport.GetStoreImage(store, ref)
-	if err != nil {
-		logrus.Debugf("error reading pulled image %q: %v", transports.ImageName(srcRef), err)
-		return nil, nil, errors.Wrapf(err, "error locating image %q in local storage", transports.ImageName(ref))
-	}
-	return img, ref, nil
-}
 
 func getImageName(name string, img *storage.Image) string {
 	imageName := name
@@ -71,6 +51,15 @@ func getImageName(name string, img *storage.Image) string {
 
 func imageNamePrefix(imageName string) string {
 	prefix := imageName
+	if d, err := digest.Parse(imageName); err == nil {
+		prefix = d.Encoded()
+		if len(prefix) > 12 {
+			prefix = prefix[:12]
+		}
+	}
+	if stringid.ValidateID(prefix) == nil {
+		prefix = stringid.TruncateID(prefix)
+	}
 	s := strings.Split(prefix, ":")
 	if len(s) > 0 {
 		prefix = s[0]
@@ -86,162 +75,26 @@ func imageNamePrefix(imageName string) string {
 	return prefix
 }
 
-func newContainerIDMappingOptions(idmapOptions *IDMappingOptions) storage.IDMappingOptions {
+func newContainerIDMappingOptions(idmapOptions *define.IDMappingOptions) storage.IDMappingOptions {
 	var options storage.IDMappingOptions
 	if idmapOptions != nil {
-		options.HostUIDMapping = idmapOptions.HostUIDMapping
-		options.HostGIDMapping = idmapOptions.HostGIDMapping
-		uidmap, gidmap := convertRuntimeIDMaps(idmapOptions.UIDMap, idmapOptions.GIDMap)
-		if len(uidmap) > 0 && len(gidmap) > 0 {
-			options.UIDMap = uidmap
-			options.GIDMap = gidmap
+		if idmapOptions.AutoUserNs {
+			options.AutoUserNs = true
+			options.AutoUserNsOpts = idmapOptions.AutoUserNsOpts
 		} else {
-			options.HostUIDMapping = true
-			options.HostGIDMapping = true
+			options.HostUIDMapping = idmapOptions.HostUIDMapping
+			options.HostGIDMapping = idmapOptions.HostGIDMapping
+			uidmap, gidmap := convertRuntimeIDMaps(idmapOptions.UIDMap, idmapOptions.GIDMap)
+			if len(uidmap) > 0 && len(gidmap) > 0 {
+				options.UIDMap = uidmap
+				options.GIDMap = gidmap
+			} else {
+				options.HostUIDMapping = true
+				options.HostGIDMapping = true
+			}
 		}
 	}
 	return options
-}
-
-func resolveImage(ctx context.Context, systemContext *types.SystemContext, store storage.Store, options BuilderOptions) (types.ImageReference, string, *storage.Image, error) {
-	type failure struct {
-		resolvedImageName string
-		err               error
-	}
-	candidates, transport, searchRegistriesWereUsedButEmpty, err := util.ResolveName(options.FromImage, options.Registry, systemContext, store)
-	if err != nil {
-		return nil, "", nil, errors.Wrapf(err, "error parsing reference to image %q", options.FromImage)
-	}
-
-	failures := []failure{}
-	for _, image := range candidates {
-		if transport == "" {
-			img, err := store.Image(image)
-			if err != nil {
-				logrus.Debugf("error looking up known-local image %q: %v", image, err)
-				failures = append(failures, failure{resolvedImageName: image, err: err})
-				continue
-			}
-			ref, err := is.Transport.ParseStoreReference(store, img.ID)
-			if err != nil {
-				return nil, "", nil, errors.Wrapf(err, "error parsing reference to image %q", img.ID)
-			}
-			return ref, transport, img, nil
-		}
-
-		trans := transport
-		if transport != util.DefaultTransport {
-			trans = trans + ":"
-		}
-		srcRef, err := alltransports.ParseImageName(trans + image)
-		if err != nil {
-			logrus.Debugf("error parsing image name %q: %v", trans+image, err)
-			failures = append(failures, failure{
-				resolvedImageName: image,
-				err:               errors.Wrapf(err, "error parsing attempted image name %q", trans+image),
-			})
-			continue
-		}
-
-		if options.PullPolicy == PullAlways {
-			pulledImg, pulledReference, err := pullAndFindImage(ctx, store, srcRef, options, systemContext)
-			if err != nil {
-				logrus.Debugf("unable to pull and read image %q: %v", image, err)
-				failures = append(failures, failure{resolvedImageName: image, err: err})
-				continue
-			}
-			return pulledReference, transport, pulledImg, nil
-		}
-
-		destImage, err := localImageNameForReference(ctx, store, srcRef)
-		if err != nil {
-			return nil, "", nil, errors.Wrapf(err, "error computing local image name for %q", transports.ImageName(srcRef))
-		}
-		if destImage == "" {
-			return nil, "", nil, errors.Errorf("error computing local image name for %q", transports.ImageName(srcRef))
-		}
-		ref, err := is.Transport.ParseStoreReference(store, destImage)
-		if err != nil {
-			return nil, "", nil, errors.Wrapf(err, "error parsing reference to image %q", destImage)
-		}
-
-		if options.PullPolicy == PullIfNewer {
-			img, err := is.Transport.GetStoreImage(store, ref)
-			if err == nil {
-				// Let's see if this image is on the repository and if it's there
-				// then note it's Created date.
-				var repoImageCreated time.Time
-				repoImageFound := false
-				repoImage, err := srcRef.NewImage(ctx, systemContext)
-				if err == nil {
-					inspect, err := repoImage.Inspect(ctx)
-					if err == nil {
-						repoImageFound = true
-						repoImageCreated = *inspect.Created
-					}
-					repoImage.Close()
-				}
-				if !repoImageFound || repoImageCreated == img.Created {
-					// The image is only local or the same date is on the
-					// local and repo versions of the image, no need to pull.
-					return ref, transport, img, nil
-				}
-			}
-		} else {
-			// Get the image from the store if present for PullNever and PullIfMissing
-			img, err := is.Transport.GetStoreImage(store, ref)
-			if err == nil {
-				return ref, transport, img, nil
-			}
-			if errors.Cause(err) == storage.ErrImageUnknown && options.PullPolicy == PullNever {
-				logrus.Debugf("no such image %q: %v", transports.ImageName(ref), err)
-				failures = append(failures, failure{
-					resolvedImageName: image,
-					err:               errors.Errorf("no such image %q", transports.ImageName(ref)),
-				})
-				continue
-			}
-		}
-
-		pulledImg, pulledReference, err := pullAndFindImage(ctx, store, srcRef, options, systemContext)
-		if err != nil {
-			logrus.Debugf("unable to pull and read image %q: %v", image, err)
-			failures = append(failures, failure{resolvedImageName: image, err: err})
-			continue
-		}
-		return pulledReference, transport, pulledImg, nil
-	}
-
-	if len(failures) != len(candidates) {
-		return nil, "", nil, errors.Errorf("internal error: %d candidates (%#v) vs. %d failures (%#v)", len(candidates), candidates, len(failures), failures)
-	}
-
-	registriesConfPath := sysregistriesv2.ConfigPath(systemContext)
-	switch len(failures) {
-	case 0:
-		if searchRegistriesWereUsedButEmpty {
-			return nil, "", nil, errors.Errorf("image name %q is a short name and no search registries are defined in %s.", options.FromImage, registriesConfPath)
-		}
-		return nil, "", nil, errors.Errorf("internal error: no pull candidates were available for %q for an unknown reason", options.FromImage)
-
-	case 1:
-		err := failures[0].err
-		if failures[0].resolvedImageName != options.FromImage {
-			err = errors.Wrapf(err, "while pulling %q as %q", options.FromImage, failures[0].resolvedImageName)
-		}
-		if searchRegistriesWereUsedButEmpty {
-			err = errors.Wrapf(err, "(image name %q is a short name and no search registries are defined in %s)", options.FromImage, registriesConfPath)
-		}
-		return nil, "", nil, err
-
-	default:
-		// NOTE: a multi-line error string:
-		e := fmt.Sprintf("The following failures happened while trying to pull image specified by %q based on search registries in %s:", options.FromImage, registriesConfPath)
-		for _, f := range failures {
-			e = e + fmt.Sprintf("\n* %q: %s", f.resolvedImageName, f.err.Error())
-		}
-		return nil, "", nil, errors.New(e)
-	}
 }
 
 func containerNameExist(name string, containers []storage.Container) bool {
@@ -271,18 +124,61 @@ func newBuilder(ctx context.Context, store storage.Store, options BuilderOptions
 		img *storage.Image
 		err error
 	)
+
 	if options.FromImage == BaseImageFakeName {
 		options.FromImage = ""
 	}
 
-	systemContext := getSystemContext(store, options.SystemContext, options.SignaturePolicyPath)
-
-	if options.FromImage != "" && options.FromImage != "scratch" {
-		ref, _, img, err = resolveImage(ctx, systemContext, store, options)
+	if options.NetworkInterface == nil {
+		// create the network interface
+		// Note: It is important to do this before we pull any images/create containers.
+		// The default backend detection logic needs an empty store to correctly detect
+		// that we can use netavark, if the store was not empty it will use CNI to not break existing installs.
+		options.NetworkInterface, err = getNetworkInterface(store, options.CNIConfigDir, options.CNIPluginPath)
 		if err != nil {
 			return nil, err
 		}
 	}
+
+	systemContext := getSystemContext(store, options.SystemContext, options.SignaturePolicyPath)
+
+	if options.FromImage != "" && options.FromImage != BaseImageFakeName {
+		imageRuntime, err := libimage.RuntimeFromStore(store, &libimage.RuntimeOptions{SystemContext: systemContext})
+		if err != nil {
+			return nil, err
+		}
+
+		pullPolicy, err := config.ParsePullPolicy(options.PullPolicy.String())
+		if err != nil {
+			return nil, err
+		}
+
+		// Note: options.Format does *not* relate to the image we're
+		// about to pull (see tests/digests.bats).  So we're not
+		// forcing a MIMEType in the pullOptions below.
+		pullOptions := libimage.PullOptions{}
+		pullOptions.RetryDelay = &options.PullRetryDelay
+		pullOptions.OciDecryptConfig = options.OciDecryptConfig
+		pullOptions.SignaturePolicyPath = options.SignaturePolicyPath
+		pullOptions.Writer = options.ReportWriter
+		pullOptions.DestinationLookupReferenceFunc = cacheLookupReferenceFunc(options.BlobDirectory, types.PreserveOriginal)
+
+		maxRetries := uint(options.MaxPullRetries)
+		pullOptions.MaxRetries = &maxRetries
+
+		pulledImages, err := imageRuntime.Pull(ctx, options.FromImage, pullPolicy, &pullOptions)
+		if err != nil {
+			return nil, err
+		}
+		if len(pulledImages) > 0 {
+			img = pulledImages[0].StorageImage()
+			ref, err = pulledImages[0].StorageReference()
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	imageSpec := options.FromImage
 	imageID := ""
 	imageDigest := ""
@@ -296,12 +192,12 @@ func newBuilder(ctx context.Context, store storage.Store, options BuilderOptions
 	if ref != nil {
 		srcSrc, err := ref.NewImageSource(ctx, systemContext)
 		if err != nil {
-			return nil, errors.Wrapf(err, "error instantiating image for %q", transports.ImageName(ref))
+			return nil, fmt.Errorf("instantiating image for %q: %w", transports.ImageName(ref), err)
 		}
 		defer srcSrc.Close()
 		manifestBytes, manifestType, err := srcSrc.GetManifest(ctx, nil)
 		if err != nil {
-			return nil, errors.Wrapf(err, "error loading image manifest for %q", transports.ImageName(ref))
+			return nil, fmt.Errorf("loading image manifest for %q: %w", transports.ImageName(ref), err)
 		}
 		if manifestDigest, err := manifest.Digest(manifestBytes); err == nil {
 			imageDigest = manifestDigest.String()
@@ -310,21 +206,24 @@ func newBuilder(ctx context.Context, store storage.Store, options BuilderOptions
 		if manifest.MIMETypeIsMultiImage(manifestType) {
 			list, err := manifest.ListFromBlob(manifestBytes, manifestType)
 			if err != nil {
-				return nil, errors.Wrapf(err, "error parsing image manifest for %q as list", transports.ImageName(ref))
+				return nil, fmt.Errorf("parsing image manifest for %q as list: %w", transports.ImageName(ref), err)
 			}
 			instance, err := list.ChooseInstance(systemContext)
 			if err != nil {
-				return nil, errors.Wrapf(err, "error finding an appropriate image in manifest list %q", transports.ImageName(ref))
+				return nil, fmt.Errorf("finding an appropriate image in manifest list %q: %w", transports.ImageName(ref), err)
 			}
 			instanceDigest = &instance
 		}
 		src, err = image.FromUnparsedImage(ctx, systemContext, image.UnparsedInstance(srcSrc, instanceDigest))
 		if err != nil {
-			return nil, errors.Wrapf(err, "error instantiating image for %q instance %q", transports.ImageName(ref), instanceDigest)
+			return nil, fmt.Errorf("instantiating image for %q instance %q: %w", transports.ImageName(ref), instanceDigest, err)
 		}
 	}
 
 	name := "working-container"
+	if options.ContainerSuffix != "" {
+		name = options.ContainerSuffix
+	}
 	if options.Container != "" {
 		name = options.Container
 	} else {
@@ -337,27 +236,40 @@ func newBuilder(ctx context.Context, store storage.Store, options BuilderOptions
 	if options.Container == "" {
 		containers, err := store.Containers()
 		if err != nil {
-			return nil, errors.Wrapf(err, "unable to check for container names")
+			return nil, fmt.Errorf("unable to check for container names: %w", err)
 		}
 		tmpName = findUnusedContainer(tmpName, containers)
 	}
 
-	conflict := 100
+	suffixDigitsModulo := 100
 	for {
+		var flags map[string]interface{}
+		// check if we have predefined ProcessLabel and MountLabel
+		// this could be true if this is another stage in a build
+		if options.ProcessLabel != "" && options.MountLabel != "" {
+			flags = map[string]interface{}{
+				"ProcessLabel": options.ProcessLabel,
+				"MountLabel":   options.MountLabel,
+			}
+		}
 		coptions := storage.ContainerOptions{
 			LabelOpts:        options.CommonBuildOpts.LabelOpts,
 			IDMappingOptions: newContainerIDMappingOptions(options.IDMappingOptions),
+			Flags:            flags,
+			Volatile:         true,
 		}
 		container, err = store.CreateContainer("", []string{tmpName}, imageID, "", "", &coptions)
 		if err == nil {
 			name = tmpName
 			break
 		}
-		if errors.Cause(err) != storage.ErrDuplicateName || options.Container != "" {
-			return nil, errors.Wrapf(err, "error creating container")
+		if !errors.Is(err, storage.ErrDuplicateName) || options.Container != "" {
+			return nil, fmt.Errorf("creating container: %w", err)
 		}
-		tmpName = fmt.Sprintf("%s-%d", name, rand.Int()%conflict)
-		conflict = conflict * 10
+		tmpName = fmt.Sprintf("%s-%d", name, rand.Int()%suffixDigitsModulo)
+		if suffixDigitsModulo < 1_000_000_000 {
+			suffixDigitsModulo *= 10
+		}
 	}
 	defer func() {
 		if err != nil {
@@ -383,6 +295,7 @@ func newBuilder(ctx context.Context, store storage.Store, options BuilderOptions
 		FromImage:             imageSpec,
 		FromImageID:           imageID,
 		FromImageDigest:       imageDigest,
+		GroupAdd:              options.GroupAdd,
 		Container:             name,
 		ContainerID:           container.ID,
 		ImageAnnotations:      map[string]string{},
@@ -395,34 +308,50 @@ func newBuilder(ctx context.Context, store storage.Store, options BuilderOptions
 		ConfigureNetwork:      options.ConfigureNetwork,
 		CNIPluginPath:         options.CNIPluginPath,
 		CNIConfigDir:          options.CNIConfigDir,
-		IDMappingOptions: IDMappingOptions{
+		IDMappingOptions: define.IDMappingOptions{
 			HostUIDMapping: len(uidmap) == 0,
 			HostGIDMapping: len(uidmap) == 0,
 			UIDMap:         uidmap,
 			GIDMap:         gidmap,
 		},
-		Capabilities:    copyStringSlice(options.Capabilities),
-		CommonBuildOpts: options.CommonBuildOpts,
-		TopLayer:        topLayer,
-		Args:            options.Args,
-		Format:          options.Format,
-		TempVolumes:     map[string]bool{},
-		Devices:         options.Devices,
+		Capabilities:     slices.Clone(options.Capabilities),
+		CommonBuildOpts:  options.CommonBuildOpts,
+		TopLayer:         topLayer,
+		Args:             maps.Clone(options.Args),
+		Format:           options.Format,
+		TempVolumes:      map[string]bool{},
+		Devices:          options.Devices,
+		DeviceSpecs:      options.DeviceSpecs,
+		Logger:           options.Logger,
+		NetworkInterface: options.NetworkInterface,
+		CDIConfigDir:     options.CDIConfigDir,
 	}
 
 	if options.Mount {
 		_, err = builder.Mount(container.MountLabel())
 		if err != nil {
-			return nil, errors.Wrapf(err, "error mounting build container %q", builder.ContainerID)
+			return nil, fmt.Errorf("mounting build container %q: %w", builder.ContainerID, err)
 		}
 	}
 
-	if err := builder.initConfig(ctx, src); err != nil {
-		return nil, errors.Wrapf(err, "error preparing image configuration")
+	if err := builder.initConfig(ctx, systemContext, src, &options); err != nil {
+		return nil, fmt.Errorf("preparing image configuration: %w", err)
 	}
+
+	if !options.PreserveBaseImageAnns {
+		builder.SetAnnotation(v1.AnnotationBaseImageDigest, imageDigest)
+		if !shortnames.IsShortName(imageSpec) {
+			// If the base image was specified as a fully-qualified
+			// image name, let's set it.
+			builder.SetAnnotation(v1.AnnotationBaseImageName, imageSpec)
+		} else {
+			builder.UnsetAnnotation(v1.AnnotationBaseImageName)
+		}
+	}
+
 	err = builder.Save()
 	if err != nil {
-		return nil, errors.Wrapf(err, "error saving builder state for container %q", builder.ContainerID)
+		return nil, fmt.Errorf("saving builder state for container %q: %w", builder.ContainerID, err)
 	}
 
 	return builder, nil

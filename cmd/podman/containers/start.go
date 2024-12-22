@@ -1,51 +1,68 @@
 package containers
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/utils"
-	"github.com/containers/podman/v2/cmd/podman/validate"
-	"github.com/containers/podman/v2/libpod/define"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 )
 
 var (
 	startDescription = `Starts one or more containers.  The container name or ID can be used.`
 	startCommand     = &cobra.Command{
-		Use:   "start [flags] CONTAINER [CONTAINER...]",
-		Short: "Start one or more containers",
-		Long:  startDescription,
-		RunE:  start,
-		Example: `podman start --latest
-  podman start 860a4b231279 5421ab43b45
+		Use:               "start [options] CONTAINER [CONTAINER...]",
+		Short:             "Start one or more containers",
+		Long:              startDescription,
+		RunE:              start,
+		Args:              validateStart,
+		ValidArgsFunction: common.AutocompleteContainersStartable,
+		Example: `podman start 860a4b231279 5421ab43b45
   podman start --interactive --attach imageID`,
 	}
 
 	containerStartCommand = &cobra.Command{
-		Use:   startCommand.Use,
-		Short: startCommand.Short,
-		Long:  startCommand.Long,
-		RunE:  startCommand.RunE,
-		Example: `podman container start --latest
-  podman container start 860a4b231279 5421ab43b45
+		Use:               startCommand.Use,
+		Short:             startCommand.Short,
+		Long:              startCommand.Long,
+		RunE:              startCommand.RunE,
+		Args:              startCommand.Args,
+		ValidArgsFunction: startCommand.ValidArgsFunction,
+		Example: `podman container start 860a4b231279 5421ab43b45
   podman container start --interactive --attach imageID`,
 	}
 )
 
 var (
-	startOptions entities.ContainerStartOptions
+	startOptions = entities.ContainerStartOptions{
+		Filters: make(map[string][]string),
+	}
 )
 
-func startFlags(flags *pflag.FlagSet) {
+func startFlags(cmd *cobra.Command) {
+	flags := cmd.Flags()
+
 	flags.BoolVarP(&startOptions.Attach, "attach", "a", false, "Attach container's STDOUT and STDERR")
-	flags.StringVar(&startOptions.DetachKeys, "detach-keys", containerConfig.DetachKeys(), "Select the key sequence for detaching a container. Format is a single character `[a-Z]` or a comma separated sequence of `ctrl-<value>`, where `<value>` is one of: `a-z`, `@`, `^`, `[`, `\\`, `]`, `^` or `_`")
-	flags.BoolVarP(&startOptions.Interactive, "interactive", "i", false, "Keep STDIN open even if not attached")
+
+	detachKeysFlagName := "detach-keys"
+	flags.StringVar(&startOptions.DetachKeys, detachKeysFlagName, containerConfig.DetachKeys(), "Select the key sequence for detaching a container. Format is a single character `[a-Z]` or a comma separated sequence of `ctrl-<value>`, where `<value>` is one of: `a-z`, `@`, `^`, `[`, `\\`, `]`, `^` or `_`")
+	_ = cmd.RegisterFlagCompletionFunc(detachKeysFlagName, common.AutocompleteDetachKeys)
+
+	flags.BoolVarP(&startOptions.Interactive, "interactive", "i", false, "Make STDIN available to the contained process")
 	flags.BoolVar(&startOptions.SigProxy, "sig-proxy", false, "Proxy received signals to the process (default true if attaching, false otherwise)")
+
+	filterFlagName := "filter"
+	flags.StringArrayVarP(&filters, filterFlagName, "f", []string{}, "Filter output based on conditions given")
+	_ = cmd.RegisterFlagCompletionFunc(filterFlagName, common.AutocompletePsFilters)
+
+	flags.BoolVar(&startOptions.All, "all", false, "Start all containers regardless of their state or configuration")
 
 	if registry.IsRemote() {
 		_ = flags.MarkHidden("sig-proxy")
@@ -53,34 +70,43 @@ func startFlags(flags *pflag.FlagSet) {
 }
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: startCommand,
 	})
-	startFlags(startCommand.Flags())
+	startFlags(startCommand)
 	validate.AddLatestFlag(startCommand, &startOptions.Latest)
 
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: containerStartCommand,
 		Parent:  containerCmd,
 	})
-	startFlags(containerStartCommand.Flags())
+	startFlags(containerStartCommand)
 	validate.AddLatestFlag(containerStartCommand, &startOptions.Latest)
+}
 
+func validateStart(cmd *cobra.Command, args []string) error {
+	if len(args) == 0 && !startOptions.Latest && !startOptions.All && len(filters) < 1 {
+		return errors.New("start requires at least one argument")
+	}
+	if startOptions.All && startOptions.Latest {
+		return errors.New("--all and --latest cannot be used together")
+	}
+	if len(args) > 0 && startOptions.Latest {
+		return errors.New("--latest and containers cannot be used together")
+	}
+	if len(args) > 1 && startOptions.Attach {
+		return errors.New("you cannot start and attach multiple containers at once")
+	}
+	if (len(args) > 0 || startOptions.Latest) && startOptions.All {
+		return errors.New("either start all containers or the container(s) provided in the arguments")
+	}
+	if startOptions.Attach && startOptions.All {
+		return errors.New("you cannot start and attach all containers at once")
+	}
+	return nil
 }
 
 func start(cmd *cobra.Command, args []string) error {
 	var errs utils.OutputErrors
-	if len(args) == 0 && !startOptions.Latest {
-		return errors.New("start requires at least one argument")
-	}
-	if len(args) > 0 && startOptions.Latest {
-		return errors.Errorf("--latest and containers cannot be used together")
-	}
-	if len(args) > 1 && startOptions.Attach {
-		return errors.Errorf("you cannot start and attach multiple containers at once")
-	}
-
 	sigProxy := startOptions.SigProxy || startOptions.Attach
 	if cmd.Flag("sig-proxy").Changed {
 		sigProxy = startOptions.SigProxy
@@ -88,7 +114,7 @@ func start(cmd *cobra.Command, args []string) error {
 	startOptions.SigProxy = sigProxy
 
 	if sigProxy && !startOptions.Attach {
-		return errors.Wrapf(define.ErrInvalidArg, "you cannot use sig-proxy without --attach")
+		return fmt.Errorf("you cannot use sig-proxy without --attach: %w", define.ErrInvalidArg)
 	}
 	if startOptions.Attach {
 		startOptions.Stdin = os.Stdin
@@ -96,23 +122,31 @@ func start(cmd *cobra.Command, args []string) error {
 		startOptions.Stdout = os.Stdout
 	}
 
-	responses, err := registry.ContainerEngine().ContainerStart(registry.GetContext(), args, startOptions)
+	containers := utils.RemoveSlash(args)
+	for _, f := range filters {
+		fname, filter, hasFilter := strings.Cut(f, "=")
+		if !hasFilter {
+			return fmt.Errorf("invalid filter %q", f)
+		}
+		startOptions.Filters[fname] = append(startOptions.Filters[fname], filter)
+	}
+
+	responses, err := registry.ContainerEngine().ContainerStart(registry.GetContext(), containers, startOptions)
 	if err != nil {
 		return err
 	}
-
 	for _, r := range responses {
-		if r.Err == nil {
-			if startOptions.Attach {
-				// Implement the exitcode when the only one container is enabled attach
-				registry.SetExitCode(r.ExitCode)
-			} else {
-				fmt.Println(r.RawInput)
-			}
-		} else {
+		switch {
+		case r.Err != nil:
 			errs = append(errs, r.Err)
+		case startOptions.Attach:
+			// Implement the exitcode when the only one container is enabled attach
+			registry.SetExitCode(r.ExitCode)
+		case r.RawInput != "":
+			fmt.Println(r.RawInput)
+		default:
+			fmt.Println(r.Id)
 		}
 	}
-
 	return errs.PrintErrors()
 }

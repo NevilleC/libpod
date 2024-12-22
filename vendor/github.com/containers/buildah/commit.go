@@ -5,13 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/containers/buildah/pkg/blobcache"
 	"github.com/containers/buildah/util"
+	"github.com/containers/common/libimage"
+	"github.com/containers/common/libimage/manifests"
 	"github.com/containers/image/v5/docker"
 	"github.com/containers/image/v5/docker/reference"
 	"github.com/containers/image/v5/manifest"
@@ -20,12 +21,12 @@ import (
 	"github.com/containers/image/v5/transports"
 	"github.com/containers/image/v5/types"
 	encconfig "github.com/containers/ocicrypt/config"
-	"github.com/containers/storage"
 	"github.com/containers/storage/pkg/archive"
 	"github.com/containers/storage/pkg/stringid"
 	digest "github.com/opencontainers/go-digest"
-	"github.com/pkg/errors"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/exp/maps"
 )
 
 const (
@@ -68,6 +69,10 @@ type CommitOptions struct {
 	// Squash tells the builder to produce an image with a single layer
 	// instead of with possibly more than one layer.
 	Squash bool
+	// OmitHistory tells the builder to ignore the history of build layers and
+	// base while preparing image-spec, setting this to true will ensure no history
+	// is added to the image-spec. (default false)
+	OmitHistory bool
 	// BlobDirectory is the name of a directory in which we'll look for
 	// prebuilt copies of layer blobs that we might otherwise need to
 	// regenerate from on-disk layers.  If blobs are available, the
@@ -83,6 +88,8 @@ type CommitOptions struct {
 	OmitTimestamp bool
 	// SignBy is the fingerprint of a GPG key to use for signing the image.
 	SignBy string
+	// Manifest list to add the image to.
+	Manifest string
 	// MaxRetries is the maximum number of attempts we'll make to commit
 	// the image to an external registry if the first attempt fails.
 	MaxRetries int
@@ -98,86 +105,77 @@ type CommitOptions struct {
 	// integers in the slice represent 0-indexed layer indices, with support for negative
 	// indexing. i.e. 0 is the first layer, -1 is the last (top-most) layer.
 	OciEncryptLayers *[]int
+	// ConfidentialWorkloadOptions is used to force the output image's rootfs to contain a
+	// LUKS-compatibly encrypted disk image (for use with krun) instead of the usual
+	// contents of a rootfs.
+	ConfidentialWorkloadOptions ConfidentialWorkloadOptions
+	// UnsetEnvs is a list of environments to not add to final image.
+	// Deprecated: use UnsetEnv() before committing instead.
+	UnsetEnvs []string
+	// OverrideConfig is an optional Schema2Config which can override parts
+	// of the working container's configuration for the image that is being
+	// committed.
+	OverrideConfig *manifest.Schema2Config
+	// OverrideChanges is a slice of Dockerfile-style instructions to make
+	// to the configuration of the image that is being committed, after
+	// OverrideConfig is applied.
+	OverrideChanges []string
+	// ExtraImageContent is a map which describes additional content to add
+	// to the new layer in the committed image.  The map's keys are
+	// filesystem paths in the image and the corresponding values are the
+	// paths of files whose contents will be used in their place.  The
+	// contents will be owned by 0:0 and have mode 0o644.  Currently only
+	// accepts regular files.
+	ExtraImageContent map[string]string
+	// SBOMScanOptions encapsulates options which control whether or not we
+	// run scanners on the rootfs that we're about to commit, and how.
+	SBOMScanOptions []SBOMScanOptions
+	// CompatSetParent causes the "parent" field to be set when committing
+	// the image in Docker format.  Newer BuildKit-based builds don't set
+	// this field.
+	CompatSetParent types.OptionalBool
+	// PrependedLinkedLayers and AppendedLinkedLayers are combinations of
+	// history entries and locations of either directory trees (if
+	// directories, per os.Stat()) or uncompressed layer blobs which should
+	// be added to the image at commit-time.  The order of these relative
+	// to PrependedEmptyLayers and AppendedEmptyLayers, and relative to the
+	// corresponding members in the Builder object, in the committed image
+	// is not guaranteed.
+	PrependedLinkedLayers, AppendedLinkedLayers []LinkedLayer
 }
 
-// PushOptions can be used to alter how an image is copied somewhere.
-type PushOptions struct {
-	// Compression specifies the type of compression which is applied to
-	// layer blobs.  The default is to not use compression, but
-	// archive.Gzip is recommended.
-	Compression archive.Compression
-	// SignaturePolicyPath specifies an override location for the signature
-	// policy which should be used for verifying the new image as it is
-	// being written.  Except in specific circumstances, no value should be
-	// specified, indicating that the shared, system-wide default policy
-	// should be used.
-	SignaturePolicyPath string
-	// ReportWriter is an io.Writer which will be used to log the writing
-	// of the new image.
-	ReportWriter io.Writer
-	// Store is the local storage store which holds the source image.
-	Store storage.Store
-	// github.com/containers/image/types SystemContext to hold credentials
-	// and other authentication/authorization information.
-	SystemContext *types.SystemContext
-	// ManifestType is the format to use when saving the image using the 'dir' transport
-	// possible options are oci, v2s1, and v2s2
-	ManifestType string
-	// BlobDirectory is the name of a directory in which we'll look for
-	// prebuilt copies of layer blobs that we might otherwise need to
-	// regenerate from on-disk layers, substituting them in the list of
-	// blobs to copy whenever possible.
-	BlobDirectory string
-	// Quiet is a boolean value that determines if minimal output to
-	// the user will be displayed, this is best used for logging.
-	// The default is false.
-	Quiet bool
-	// SignBy is the fingerprint of a GPG key to use for signing the image.
-	SignBy string
-	// RemoveSignatures causes any existing signatures for the image to be
-	// discarded for the pushed copy.
-	RemoveSignatures bool
-	// MaxRetries is the maximum number of attempts we'll make to push any
-	// one image to the external registry if the first attempt fails.
-	MaxRetries int
-	// RetryDelay is how long to wait before retrying a push attempt.
-	RetryDelay time.Duration
-	// OciEncryptConfig when non-nil indicates that an image should be encrypted.
-	// The encryption options is derived from the construction of EncryptConfig object.
-	OciEncryptConfig *encconfig.EncryptConfig
-	// OciEncryptLayers represents the list of layers to encrypt.
-	// If nil, don't encrypt any layers.
-	// If non-nil and len==0, denotes encrypt all layers.
-	// integers in the slice represent 0-indexed layer indices, with support for negative
-	// indexing. i.e. 0 is the first layer, -1 is the last (top-most) layer.
-	OciEncryptLayers *[]int
+// LinkedLayer combines a history entry with the location of either a directory
+// tree (if it's a directory, per os.Stat()) or an uncompressed layer blob
+// which should be added to the image at commit-time.  The BlobPath and
+// History.EmptyLayer fields should be considered mutually-exclusive.
+type LinkedLayer struct {
+	History  v1.History // history entry to add
+	BlobPath string     // corresponding uncompressed blob file (layer as a tar archive), or directory tree to archive
 }
 
-var (
-	// storageAllowedPolicyScopes overrides the policy for local storage
-	// to ensure that we can read images from it.
-	storageAllowedPolicyScopes = signature.PolicyTransportScopes{
-		"": []signature.PolicyRequirement{
-			signature.NewPRInsecureAcceptAnything(),
-		},
-	}
-)
+// storageAllowedPolicyScopes overrides the policy for local storage
+// to ensure that we can read images from it.
+var storageAllowedPolicyScopes = signature.PolicyTransportScopes{
+	"": []signature.PolicyRequirement{
+		signature.NewPRInsecureAcceptAnything(),
+	},
+}
 
 // checkRegistrySourcesAllows checks the $BUILD_REGISTRY_SOURCES environment
 // variable, if it's set.  The contents are expected to be a JSON-encoded
 // github.com/openshift/api/config/v1.Image, set by an OpenShift build
 // controller that arranged for us to be run in a container.
-func checkRegistrySourcesAllows(forWhat string, dest types.ImageReference) error {
+func checkRegistrySourcesAllows(forWhat string, dest types.ImageReference) (insecure bool, err error) {
 	transport := dest.Transport()
 	if transport == nil {
-		return nil
+		return false, nil
 	}
 	if transport.Name() != docker.Transport.Name() {
-		return nil
+		return false, nil
 	}
 	dref := dest.DockerReference()
 	if dref == nil || reference.Domain(dref) == "" {
-		return nil
+		return false, nil
 	}
 
 	if registrySources, ok := os.LookupEnv("BUILD_REGISTRY_SOURCES"); ok && len(registrySources) > 0 {
@@ -188,7 +186,7 @@ func checkRegistrySourcesAllows(forWhat string, dest types.ImageReference) error
 			AllowedRegistries  []string `json:"allowedRegistries,omitempty"`
 		}
 		if err := json.Unmarshal([]byte(registrySources), &sources); err != nil {
-			return errors.Wrapf(err, "error parsing $BUILD_REGISTRY_SOURCES (%q) as JSON", registrySources)
+			return false, fmt.Errorf("parsing $BUILD_REGISTRY_SOURCES (%q) as JSON: %w", registrySources, err)
 		}
 		blocked := false
 		if len(sources.BlockedRegistries) > 0 {
@@ -199,7 +197,7 @@ func checkRegistrySourcesAllows(forWhat string, dest types.ImageReference) error
 			}
 		}
 		if blocked {
-			return errors.Errorf("%s registry at %q denied by policy: it is in the blocked registries list", forWhat, reference.Domain(dref))
+			return false, fmt.Errorf("%s registry at %q denied by policy: it is in the blocked registries list", forWhat, reference.Domain(dref))
 		}
 		allowed := true
 		if len(sources.AllowedRegistries) > 0 {
@@ -211,10 +209,63 @@ func checkRegistrySourcesAllows(forWhat string, dest types.ImageReference) error
 			}
 		}
 		if !allowed {
-			return errors.Errorf("%s registry at %q denied by policy: not in allowed registries list", forWhat, reference.Domain(dref))
+			return false, fmt.Errorf("%s registry at %q denied by policy: not in allowed registries list", forWhat, reference.Domain(dref))
+		}
+		if len(sources.InsecureRegistries) > 0 {
+			return true, nil
 		}
 	}
-	return nil
+	return false, nil
+}
+
+func (b *Builder) addManifest(ctx context.Context, manifestName string, imageSpec string) (string, error) {
+	var create bool
+	systemContext := &types.SystemContext{}
+	var list manifests.List
+	runtime, err := libimage.RuntimeFromStore(b.store, &libimage.RuntimeOptions{SystemContext: systemContext})
+	if err != nil {
+		return "", err
+	}
+	manifestList, err := runtime.LookupManifestList(manifestName)
+	if err != nil {
+		create = true
+		list = manifests.Create()
+	} else {
+		locker, err := manifests.LockerForImage(b.store, manifestList.ID())
+		if err != nil {
+			return "", err
+		}
+		locker.Lock()
+		defer locker.Unlock()
+		_, list, err = manifests.LoadFromImage(b.store, manifestList.ID())
+		if err != nil {
+			return "", err
+		}
+	}
+
+	names, err := util.ExpandNames([]string{manifestName}, systemContext, b.store)
+	if err != nil {
+		return "", fmt.Errorf("encountered while expanding manifest list name %q: %w", manifestName, err)
+	}
+
+	ref, err := util.VerifyTagName(imageSpec)
+	if err != nil {
+		// check if the local image exists
+		if ref, _, err = util.FindImage(b.store, "", systemContext, imageSpec); err != nil {
+			return "", err
+		}
+	}
+
+	if _, err = list.Add(ctx, systemContext, ref, true); err != nil {
+		return "", err
+	}
+	var imageID string
+	if create {
+		imageID, err = list.SaveToImage(b.store, "", names, manifest.DockerV2ListMediaType)
+	} else {
+		imageID, err = list.SaveToImage(b.store, manifestList.ID(), nil, "")
+	}
+	return imageID, err
 }
 
 // Commit writes the contents of the container, along with its updated
@@ -222,7 +273,10 @@ func checkRegistrySourcesAllows(forWhat string, dest types.ImageReference) error
 // add any additional tags that were specified. Returns the ID of the new image
 // if commit was successful and the image destination was local.
 func (b *Builder) Commit(ctx context.Context, dest types.ImageReference, options CommitOptions) (string, reference.Canonical, digest.Digest, error) {
-	var imgID string
+	var (
+		imgID string
+		src   types.ImageReference
+	)
 
 	// If we weren't given a name, build a destination reference using a
 	// temporary name that we'll remove later.  The correct thing to do
@@ -234,7 +288,7 @@ func (b *Builder) Commit(ctx context.Context, dest types.ImageReference, options
 	// work twice.
 	if options.OmitTimestamp {
 		if options.HistoryTimestamp != nil {
-			return imgID, nil, "", errors.Errorf("OmitTimestamp ahd HistoryTimestamp can not be used together")
+			return imgID, nil, "", fmt.Errorf("OmitTimestamp ahd HistoryTimestamp can not be used together")
 		}
 		timestamp := time.Unix(0, 0).UTC()
 		options.HistoryTimestamp = &timestamp
@@ -244,7 +298,7 @@ func (b *Builder) Commit(ctx context.Context, dest types.ImageReference, options
 		nameToRemove = stringid.GenerateRandomID() + "-tmp"
 		dest2, err := is.Transport.ParseStoreReference(b.store, nameToRemove)
 		if err != nil {
-			return imgID, nil, "", errors.Wrapf(err, "error creating temporary destination reference for image")
+			return imgID, nil, "", fmt.Errorf("creating temporary destination reference for image: %w", err)
 		}
 		dest = dest2
 	}
@@ -253,23 +307,23 @@ func (b *Builder) Commit(ctx context.Context, dest types.ImageReference, options
 
 	blocked, err := isReferenceBlocked(dest, systemContext)
 	if err != nil {
-		return "", nil, "", errors.Wrapf(err, "error checking if committing to registry for %q is blocked", transports.ImageName(dest))
+		return "", nil, "", fmt.Errorf("checking if committing to registry for %q is blocked: %w", transports.ImageName(dest), err)
 	}
 	if blocked {
-		return "", nil, "", errors.Errorf("commit access to registry for %q is blocked by configuration", transports.ImageName(dest))
+		return "", nil, "", fmt.Errorf("commit access to registry for %q is blocked by configuration", transports.ImageName(dest))
 	}
 
 	// Load the system signing policy.
 	commitPolicy, err := signature.DefaultPolicy(systemContext)
 	if err != nil {
-		return "", nil, "", errors.Wrapf(err, "error obtaining default signature policy")
+		return "", nil, "", fmt.Errorf("obtaining default signature policy: %w", err)
 	}
 	// Override the settings for local storage to make sure that we can always read the source "image".
 	commitPolicy.Transports[is.Transport.Name()] = storageAllowedPolicyScopes
 
 	policyContext, err := signature.NewPolicyContext(commitPolicy)
 	if err != nil {
-		return imgID, nil, "", errors.Wrapf(err, "error creating new signature policy context")
+		return imgID, nil, "", fmt.Errorf("creating new signature policy context: %w", err)
 	}
 	defer func() {
 		if err2 := policyContext.Destroy(); err2 != nil {
@@ -278,43 +332,52 @@ func (b *Builder) Commit(ctx context.Context, dest types.ImageReference, options
 	}()
 
 	// Check if the commit is blocked by $BUILDER_REGISTRY_SOURCES.
-	if err := checkRegistrySourcesAllows("commit to", dest); err != nil {
+	insecure, err := checkRegistrySourcesAllows("commit to", dest)
+	if err != nil {
 		return imgID, nil, "", err
 	}
-	if len(options.AdditionalTags) > 0 {
-		names, err := util.ExpandNames(options.AdditionalTags, "", systemContext, b.store)
-		if err != nil {
-			return imgID, nil, "", err
+	if insecure {
+		if systemContext.DockerInsecureSkipTLSVerify == types.OptionalBoolFalse {
+			return imgID, nil, "", fmt.Errorf("can't require tls verification on an insecured registry")
 		}
-		for _, name := range names {
-			additionalDest, err := docker.Transport.ParseReference(name)
-			if err != nil {
-				return imgID, nil, "", errors.Wrapf(err, "error parsing image name %q as an image reference", name)
-			}
-			if err := checkRegistrySourcesAllows("commit to", additionalDest); err != nil {
-				return imgID, nil, "", err
-			}
-		}
+		systemContext.DockerInsecureSkipTLSVerify = types.OptionalBoolTrue
+		systemContext.OCIInsecureSkipTLSVerify = true
+		systemContext.DockerDaemonInsecureSkipTLSVerify = true
 	}
 	logrus.Debugf("committing image with reference %q is allowed by policy", transports.ImageName(dest))
 
-	// Check if the base image is already in the destination and it's some kind of local
-	// storage.  If so, we can skip recompressing any layers that come from the base image.
-	exportBaseLayers := true
-	if transport, destIsStorage := dest.Transport().(is.StoreTransport); destIsStorage && options.OciEncryptConfig != nil {
-		return imgID, nil, "", errors.New("unable to use local storage with image encryption")
-	} else if destIsStorage && b.FromImageID != "" {
-		if baseref, err := transport.ParseReference(b.FromImageID); baseref != nil && err == nil {
-			if img, err := transport.GetImage(baseref); img != nil && err == nil {
-				logrus.Debugf("base image %q is already present in local storage, no need to copy its layers", b.FromImageID)
-				exportBaseLayers = false
+	// If we need to scan the rootfs, do it now.
+	options.ExtraImageContent = maps.Clone(options.ExtraImageContent)
+	var extraImageContent, extraLocalContent map[string]string
+	if len(options.SBOMScanOptions) != 0 {
+		var scansDirectory string
+		if extraImageContent, extraLocalContent, scansDirectory, err = b.sbomScan(ctx, options); err != nil {
+			return imgID, nil, "", fmt.Errorf("scanning rootfs to generate SBOM for container %q: %w", b.ContainerID, err)
+		}
+		if scansDirectory != "" {
+			defer func() {
+				if err := os.RemoveAll(scansDirectory); err != nil {
+					logrus.Warnf("removing temporary directory %q: %v", scansDirectory, err)
+				}
+			}()
+		}
+		if len(extraImageContent) > 0 {
+			if options.ExtraImageContent == nil {
+				options.ExtraImageContent = make(map[string]string, len(extraImageContent))
+			}
+			// merge in the scanner-generated content
+			for k, v := range extraImageContent {
+				if _, set := options.ExtraImageContent[k]; !set {
+					options.ExtraImageContent[k] = v
+				}
 			}
 		}
 	}
+
 	// Build an image reference from which we can copy the finished image.
-	src, err := b.makeImageRef(options, exportBaseLayers)
+	src, err = b.makeContainerImageRef(options)
 	if err != nil {
-		return imgID, nil, "", errors.Wrapf(err, "error computing layer digests and building metadata for container %q", b.ContainerID)
+		return imgID, nil, "", fmt.Errorf("computing layer digests and building metadata for container %q: %w", b.ContainerID, err)
 	}
 	// In case we're using caching, decide how to handle compression for a cache.
 	// If we're using blob caching, set it up for the source.
@@ -327,12 +390,12 @@ func (b *Builder) Commit(ctx context.Context, dest types.ImageReference, options
 		}
 		cache, err := blobcache.NewBlobCache(src, options.BlobDirectory, compress)
 		if err != nil {
-			return imgID, nil, "", errors.Wrapf(err, "error wrapping image reference %q in blob cache at %q", transports.ImageName(src), options.BlobDirectory)
+			return imgID, nil, "", fmt.Errorf("wrapping image reference %q in blob cache at %q: %w", transports.ImageName(src), options.BlobDirectory, err)
 		}
 		maybeCachedSrc = cache
 		cache, err = blobcache.NewBlobCache(dest, options.BlobDirectory, compress)
 		if err != nil {
-			return imgID, nil, "", errors.Wrapf(err, "error wrapping image reference %q in blob cache at %q", transports.ImageName(dest), options.BlobDirectory)
+			return imgID, nil, "", fmt.Errorf("wrapping image reference %q in blob cache at %q: %w", transports.ImageName(dest), options.BlobDirectory, err)
 		}
 		maybeCachedDest = cache
 	}
@@ -353,19 +416,19 @@ func (b *Builder) Commit(ctx context.Context, dest types.ImageReference, options
 
 	var manifestBytes []byte
 	if manifestBytes, err = retryCopyImage(ctx, policyContext, maybeCachedDest, maybeCachedSrc, dest, getCopyOptions(b.store, options.ReportWriter, nil, systemContext, "", false, options.SignBy, options.OciEncryptLayers, options.OciEncryptConfig, nil), options.MaxRetries, options.RetryDelay); err != nil {
-		return imgID, nil, "", errors.Wrapf(err, "error copying layers and metadata for container %q", b.ContainerID)
+		return imgID, nil, "", fmt.Errorf("copying layers and metadata for container %q: %w", b.ContainerID, err)
 	}
 	// If we've got more names to attach, and we know how to do that for
 	// the transport that we're writing the new image to, add them now.
 	if len(options.AdditionalTags) > 0 {
 		switch dest.Transport().Name() {
 		case is.Transport.Name():
-			img, err := is.Transport.GetStoreImage(b.store, dest)
+			_, img, err := is.ResolveReference(dest)
 			if err != nil {
-				return imgID, nil, "", errors.Wrapf(err, "error locating just-written image %q", transports.ImageName(dest))
+				return imgID, nil, "", fmt.Errorf("locating just-written image %q: %w", transports.ImageName(dest), err)
 			}
 			if err = util.AddImageNames(b.store, "", systemContext, img, options.AdditionalTags); err != nil {
-				return imgID, nil, "", errors.Wrapf(err, "error setting image names to %v", append(img.Names, options.AdditionalTags...))
+				return imgID, nil, "", fmt.Errorf("setting image names to %v: %w", append(img.Names, options.AdditionalTags...), err)
 			}
 			logrus.Debugf("assigned names %v to image %q", img.Names, img.ID)
 		default:
@@ -373,39 +436,59 @@ func (b *Builder) Commit(ctx context.Context, dest types.ImageReference, options
 		}
 	}
 
-	img, err := is.Transport.GetStoreImage(b.store, dest)
-	if err != nil && errors.Cause(err) != storage.ErrImageUnknown {
-		return imgID, nil, "", errors.Wrapf(err, "error locating image %q in local storage", transports.ImageName(dest))
-	}
-	if err == nil {
+	if dest.Transport().Name() == is.Transport.Name() {
+		dest2, img, err := is.ResolveReference(dest)
+		if err != nil {
+			return imgID, nil, "", fmt.Errorf("locating image %q in local storage: %w", transports.ImageName(dest), err)
+		}
+		dest = dest2
 		imgID = img.ID
-		prunedNames := make([]string, 0, len(img.Names))
+		toPruneNames := make([]string, 0, len(img.Names))
 		for _, name := range img.Names {
-			if !(nameToRemove != "" && strings.Contains(name, nameToRemove)) {
-				prunedNames = append(prunedNames, name)
+			if nameToRemove != "" && strings.Contains(name, nameToRemove) {
+				toPruneNames = append(toPruneNames, name)
 			}
 		}
-		if len(prunedNames) < len(img.Names) {
-			if err = b.store.SetNames(imgID, prunedNames); err != nil {
-				return imgID, nil, "", errors.Wrapf(err, "failed to prune temporary name from image %q", imgID)
+		if len(toPruneNames) > 0 {
+			if err = b.store.RemoveNames(imgID, toPruneNames); err != nil {
+				return imgID, nil, "", fmt.Errorf("failed to remove temporary name from image %q: %w", imgID, err)
 			}
-			logrus.Debugf("reassigned names %v to image %q", prunedNames, img.ID)
-			dest2, err := is.Transport.ParseStoreReference(b.store, "@"+imgID)
-			if err != nil {
-				return imgID, nil, "", errors.Wrapf(err, "error creating unnamed destination reference for image")
-			}
-			dest = dest2
+			logrus.Debugf("removing %v from assigned names to image %q", nameToRemove, img.ID)
 		}
 		if options.IIDFile != "" {
-			if err = ioutil.WriteFile(options.IIDFile, []byte(img.ID), 0644); err != nil {
-				return imgID, nil, "", errors.Wrapf(err, "failed to write image ID to file %q", options.IIDFile)
+			if err = os.WriteFile(options.IIDFile, []byte("sha256:"+img.ID), 0o644); err != nil {
+				return imgID, nil, "", err
 			}
 		}
 	}
+	// If we're supposed to store SBOM or PURL information in local files, write them now.
+	for filename, content := range extraLocalContent {
+		err := func() error {
+			output, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+			if err != nil {
+				return err
+			}
+			defer output.Close()
+			input, err := os.Open(content)
+			if err != nil {
+				return err
+			}
+			defer input.Close()
+			if _, err := io.Copy(output, input); err != nil {
+				return fmt.Errorf("copying from %q to %q: %w", content, filename, err)
+			}
+			return nil
+		}()
+		if err != nil {
+			return imgID, nil, "", err
+		}
+	}
 
+	// Calculate the as-written digest of the image's manifest and build the digested
+	// reference for the image.
 	manifestDigest, err := manifest.Digest(manifestBytes)
 	if err != nil {
-		return imgID, nil, "", errors.Wrapf(err, "error computing digest of manifest of new image %q", transports.ImageName(dest))
+		return imgID, nil, "", fmt.Errorf("computing digest of manifest of new image %q: %w", transports.ImageName(dest), err)
 	}
 
 	var ref reference.Canonical
@@ -416,90 +499,12 @@ func (b *Builder) Commit(ctx context.Context, dest types.ImageReference, options
 		}
 	}
 
+	if options.Manifest != "" {
+		manifestID, err := b.addManifest(ctx, options.Manifest, imgID)
+		if err != nil {
+			return imgID, nil, "", err
+		}
+		logrus.Debugf("added imgID %s to manifestID %s", imgID, manifestID)
+	}
 	return imgID, ref, manifestDigest, nil
-}
-
-// Push copies the contents of the image to a new location.
-func Push(ctx context.Context, image string, dest types.ImageReference, options PushOptions) (reference.Canonical, digest.Digest, error) {
-	systemContext := getSystemContext(options.Store, options.SystemContext, options.SignaturePolicyPath)
-
-	if options.Quiet {
-		options.ReportWriter = nil // Turns off logging output
-	}
-	blocked, err := isReferenceBlocked(dest, systemContext)
-	if err != nil {
-		return nil, "", errors.Wrapf(err, "error checking if pushing to registry for %q is blocked", transports.ImageName(dest))
-	}
-	if blocked {
-		return nil, "", errors.Errorf("push access to registry for %q is blocked by configuration", transports.ImageName(dest))
-	}
-
-	// Load the system signing policy.
-	pushPolicy, err := signature.DefaultPolicy(systemContext)
-	if err != nil {
-		return nil, "", errors.Wrapf(err, "error obtaining default signature policy")
-	}
-	// Override the settings for local storage to make sure that we can always read the source "image".
-	pushPolicy.Transports[is.Transport.Name()] = storageAllowedPolicyScopes
-
-	policyContext, err := signature.NewPolicyContext(pushPolicy)
-	if err != nil {
-		return nil, "", errors.Wrapf(err, "error creating new signature policy context")
-	}
-	defer func() {
-		if err2 := policyContext.Destroy(); err2 != nil {
-			logrus.Debugf("error destroying signature policy context: %v", err2)
-		}
-	}()
-
-	// Look up the image.
-	src, _, err := util.FindImage(options.Store, "", systemContext, image)
-	if err != nil {
-		return nil, "", err
-	}
-	maybeCachedSrc := src
-	if options.BlobDirectory != "" {
-		compress := types.PreserveOriginal
-		if options.Compression != archive.Uncompressed {
-			compress = types.Compress
-		}
-		cache, err := blobcache.NewBlobCache(src, options.BlobDirectory, compress)
-		if err != nil {
-			return nil, "", errors.Wrapf(err, "error wrapping image reference %q in blob cache at %q", transports.ImageName(src), options.BlobDirectory)
-		}
-		maybeCachedSrc = cache
-	}
-
-	// Check if the push is blocked by $BUILDER_REGISTRY_SOURCES.
-	if err := checkRegistrySourcesAllows("push to", dest); err != nil {
-		return nil, "", err
-	}
-	logrus.Debugf("pushing image to reference %q is allowed by policy", transports.ImageName(dest))
-
-	// Copy everything.
-	switch options.Compression {
-	case archive.Uncompressed:
-		systemContext.OCIAcceptUncompressedLayers = true
-	case archive.Gzip:
-		systemContext.DirForceCompress = true
-	}
-	var manifestBytes []byte
-	if manifestBytes, err = retryCopyImage(ctx, policyContext, dest, maybeCachedSrc, dest, getCopyOptions(options.Store, options.ReportWriter, nil, systemContext, options.ManifestType, options.RemoveSignatures, options.SignBy, options.OciEncryptLayers, options.OciEncryptConfig, nil), options.MaxRetries, options.RetryDelay); err != nil {
-		return nil, "", errors.Wrapf(err, "error copying layers and metadata from %q to %q", transports.ImageName(maybeCachedSrc), transports.ImageName(dest))
-	}
-	if options.ReportWriter != nil {
-		fmt.Fprintf(options.ReportWriter, "")
-	}
-	manifestDigest, err := manifest.Digest(manifestBytes)
-	if err != nil {
-		return nil, "", errors.Wrapf(err, "error computing digest of manifest of new image %q", transports.ImageName(dest))
-	}
-	var ref reference.Canonical
-	if name := dest.DockerReference(); name != nil {
-		ref, err = reference.WithDigest(name, manifestDigest)
-		if err != nil {
-			logrus.Warnf("error generating canonical reference with name %q and digest %s: %v", name, manifestDigest.String(), err)
-		}
-	}
-	return ref, manifestDigest, nil
 }

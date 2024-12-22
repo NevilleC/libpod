@@ -1,18 +1,17 @@
 package containers
 
 import (
+	"errors"
 	"fmt"
 	"os"
-	"text/tabwriter"
-	"text/template"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/utils"
-	"github.com/containers/podman/v2/cmd/podman/validate"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/pkg/errors"
+	"github.com/containers/common/pkg/report"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 )
 
 var (
@@ -24,26 +23,29 @@ var (
 `
 
 	mountCommand = &cobra.Command{
-		Use:   "mount [flags] [CONTAINER...]",
+		Annotations: map[string]string{
+			registry.UnshareNSRequired: "",
+			registry.ParentNSRequired:  "",
+			registry.EngineMode:        registry.ABIMode,
+		},
+		Use:   "mount [options] [CONTAINER...]",
 		Short: "Mount a working container's root filesystem",
 		Long:  mountDescription,
 		RunE:  mount,
 		Args: func(cmd *cobra.Command, args []string) error {
-			return validate.CheckAllLatestAndCIDFile(cmd, args, true, false)
+			return validate.CheckAllLatestAndIDFile(cmd, args, true, "")
 		},
-		Annotations: map[string]string{
-			registry.UnshareNSRequired: "",
-			registry.ParentNSRequired:  "",
-		},
+		ValidArgsFunction: common.AutocompleteContainers,
 	}
 
-	containerMountCommmand = &cobra.Command{
-		Use:         mountCommand.Use,
-		Short:       mountCommand.Short,
-		Long:        mountCommand.Long,
-		RunE:        mountCommand.RunE,
-		Args:        mountCommand.Args,
-		Annotations: mountCommand.Annotations,
+	containerMountCommand = &cobra.Command{
+		Annotations:       mountCommand.Annotations,
+		Use:               mountCommand.Use,
+		Short:             mountCommand.Short,
+		Long:              mountCommand.Long,
+		RunE:              mountCommand.RunE,
+		Args:              mountCommand.Args,
+		ValidArgsFunction: mountCommand.ValidArgsFunction,
 	}
 )
 
@@ -51,41 +53,47 @@ var (
 	mountOpts entities.ContainerMountOptions
 )
 
-func mountFlags(flags *pflag.FlagSet) {
+func mountFlags(cmd *cobra.Command) {
+	flags := cmd.Flags()
+
 	flags.BoolVarP(&mountOpts.All, "all", "a", false, "Mount all containers")
-	flags.StringVar(&mountOpts.Format, "format", "", "Print the mounted containers in specified format (json)")
-	flags.BoolVar(&mountOpts.NoTruncate, "notruncate", false, "Do not truncate output")
+
+	formatFlagName := "format"
+	flags.StringVar(&mountOpts.Format, formatFlagName, "", "Print the mounted containers in specified format (json)")
+	_ = cmd.RegisterFlagCompletionFunc(formatFlagName, common.AutocompleteFormat(nil))
+
+	flags.BoolVar(&mountOpts.NoTruncate, "no-trunc", false, "Do not truncate output")
+	flags.SetNormalizeFunc(utils.AliasFlags)
 }
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode},
 		Command: mountCommand,
 	})
-	mountFlags(mountCommand.Flags())
+	mountFlags(mountCommand)
 	validate.AddLatestFlag(mountCommand, &mountOpts.Latest)
 
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode},
-		Command: containerMountCommmand,
+		Command: containerMountCommand,
 		Parent:  containerCmd,
 	})
-	mountFlags(containerMountCommmand.Flags())
-	validate.AddLatestFlag(containerMountCommmand, &mountOpts.Latest)
+	mountFlags(containerMountCommand)
+	validate.AddLatestFlag(containerMountCommand, &mountOpts.Latest)
 }
 
-func mount(_ *cobra.Command, args []string) error {
-	var (
-		errs utils.OutputErrors
-	)
+func mount(cmd *cobra.Command, args []string) error {
 	if len(args) > 0 && mountOpts.Latest {
-		return errors.Errorf("--latest and containers cannot be used together")
+		return errors.New("--latest and containers cannot be used together")
 	}
+	args = utils.RemoveSlash(args)
+
 	reports, err := registry.ContainerEngine().ContainerMount(registry.GetContext(), args, mountOpts)
 	if err != nil {
 		return err
 	}
+
 	if len(args) > 0 || mountOpts.Latest || mountOpts.All {
+		var errs utils.OutputErrors
 		for _, r := range reports {
 			if r.Err == nil {
 				fmt.Println(r.Path)
@@ -96,28 +104,28 @@ func mount(_ *cobra.Command, args []string) error {
 		return errs.PrintErrors()
 	}
 
-	switch mountOpts.Format {
-	case "json":
+	switch {
+	case report.IsJSON(mountOpts.Format):
 		return printJSON(reports)
-	case "":
-		// do nothing
+	case mountOpts.Format == "":
+		break // print defaults
 	default:
-		return errors.Errorf("unknown --format argument: %s", mountOpts.Format)
+		return fmt.Errorf("unknown --format argument: %q", mountOpts.Format)
 	}
 
 	mrs := make([]mountReporter, 0, len(reports))
 	for _, r := range reports {
 		mrs = append(mrs, mountReporter{r})
 	}
-	row := "{{.ID}} {{.Path}}\n"
-	format := "{{range . }}" + row + "{{end}}"
-	tmpl, err := template.New("mounts").Parse(format)
+
+	rpt := report.New(os.Stdout, cmd.Name())
+	defer rpt.Flush()
+
+	rpt, err = rpt.Parse(report.OriginPodman, "{{range . }}{{.ID}}\t{{.Path}}\n{{end -}}")
 	if err != nil {
 		return err
 	}
-	w := tabwriter.NewWriter(os.Stdout, 8, 2, 2, ' ', 0)
-	defer w.Flush()
-	return tmpl.Execute(w, mrs)
+	return rpt.Execute(mrs)
 }
 
 func printJSON(reports []*entities.ContainerMountReport) error {
@@ -139,6 +147,7 @@ func printJSON(reports []*entities.ContainerMountReport) error {
 	if err != nil {
 		return err
 	}
+
 	fmt.Println(string(b))
 	return nil
 }

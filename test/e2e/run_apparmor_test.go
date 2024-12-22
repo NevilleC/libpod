@@ -1,19 +1,19 @@
-// +build !remote
+//go:build !remote_testing && (linux || freebsd)
 
 package integration
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
 	"github.com/containers/common/pkg/apparmor"
-	. "github.com/containers/podman/v2/test/utils"
-	. "github.com/onsi/ginkgo"
+	. "github.com/containers/podman/v5/test/utils"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
+// wip
 func skipIfAppArmorEnabled() {
 	if apparmor.IsEnabled() {
 		Skip("Apparmor is enabled")
@@ -26,63 +26,41 @@ func skipIfAppArmorDisabled() {
 }
 
 var _ = Describe("Podman run", func() {
-	var (
-		tempdir    string
-		err        error
-		podmanTest *PodmanTestIntegration
-	)
-
-	BeforeEach(func() {
-		tempdir, err = CreateTempDirInTempDir()
-		if err != nil {
-			os.Exit(1)
-		}
-		podmanTest = PodmanTestCreate(tempdir)
-		podmanTest.Setup()
-		podmanTest.SeedImages()
-	})
-
-	AfterEach(func() {
-		podmanTest.Cleanup()
-		f := CurrentGinkgoTestDescription()
-		processTestResult(f)
-
-	})
 
 	It("podman run apparmor default", func() {
 		skipIfAppArmorDisabled()
 		session := podmanTest.Podman([]string{"create", ALPINE, "ls"})
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
 		cid := session.OutputToString()
 		// Verify that apparmor.Profile is being set
 		inspect := podmanTest.InspectContainer(cid)
-		Expect(inspect[0].AppArmorProfile).To(Equal(apparmor.Profile))
+		Expect(inspect[0]).To(HaveField("AppArmorProfile", apparmor.Profile))
 	})
 
 	It("podman run no apparmor --privileged", func() {
 		skipIfAppArmorDisabled()
 		session := podmanTest.Podman([]string{"create", "--privileged", ALPINE, "ls"})
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
 		cid := session.OutputToString()
 		// Verify that apparmor.Profile is being set
 		inspect := podmanTest.InspectContainer(cid)
-		Expect(inspect[0].AppArmorProfile).To(Equal(""))
+		Expect(inspect[0]).To(HaveField("AppArmorProfile", ""))
 	})
 
 	It("podman run no apparmor --security-opt=apparmor.Profile --privileged", func() {
 		skipIfAppArmorDisabled()
 		session := podmanTest.Podman([]string{"create", "--security-opt", fmt.Sprintf("apparmor=%s", apparmor.Profile), "--privileged", ALPINE, "ls"})
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
 		cid := session.OutputToString()
 		// Verify that apparmor.Profile is being set
 		inspect := podmanTest.InspectContainer(cid)
-		Expect(inspect[0].AppArmorProfile).To(Equal(apparmor.Profile))
+		Expect(inspect[0]).To(HaveField("AppArmorProfile", apparmor.Profile))
 	})
 
 	It("podman run apparmor aa-test-profile", func() {
@@ -102,37 +80,37 @@ profile aa-test-profile flags=(attach_disconnected,mediate_deleted) {
 }
 `
 		aaFile := filepath.Join(os.TempDir(), "aaFile")
-		Expect(ioutil.WriteFile(aaFile, []byte(aaProfile), 0755)).To(BeNil())
+		Expect(os.WriteFile(aaFile, []byte(aaProfile), 0755)).To(Succeed())
 		parse := SystemExec("apparmor_parser", []string{"-Kr", aaFile})
-		Expect(parse.ExitCode()).To(Equal(0))
+		Expect(parse).Should(ExitCleanly())
 
-		session := podmanTest.Podman([]string{"create", "--security-opt", "apparmor=aa-test-profile", "ls"})
+		session := podmanTest.Podman([]string{"create", "--security-opt", "apparmor=aa-test-profile", ALPINE, "ls"})
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
 		cid := session.OutputToString()
 		// Verify that apparmor.Profile is being set
 		inspect := podmanTest.InspectContainer(cid)
-		Expect(inspect[0].AppArmorProfile).To(Equal("aa-test-profile"))
+		Expect(inspect[0]).To(HaveField("AppArmorProfile", "aa-test-profile"))
 	})
 
 	It("podman run apparmor invalid", func() {
 		skipIfAppArmorDisabled()
 		session := podmanTest.Podman([]string{"run", "--security-opt", "apparmor=invalid", ALPINE, "ls"})
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).ToNot(Equal(0))
+		Expect(session).To(ExitWithError(126, `AppArmor profile "invalid" specified but not loaded`))
 	})
 
 	It("podman run apparmor unconfined", func() {
 		skipIfAppArmorDisabled()
 		session := podmanTest.Podman([]string{"create", "--security-opt", "apparmor=unconfined", ALPINE, "ls"})
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
 		cid := session.OutputToString()
 		// Verify that apparmor.Profile is being set
 		inspect := podmanTest.InspectContainer(cid)
-		Expect(inspect[0].AppArmorProfile).To(Equal("unconfined"))
+		Expect(inspect[0]).To(HaveField("AppArmorProfile", "unconfined"))
 	})
 
 	It("podman run apparmor disabled --security-opt apparmor fails", func() {
@@ -140,7 +118,7 @@ profile aa-test-profile flags=(attach_disconnected,mediate_deleted) {
 		// Should fail if user specifies apparmor on disabled system
 		session := podmanTest.Podman([]string{"create", "--security-opt", fmt.Sprintf("apparmor=%s", apparmor.Profile), ALPINE, "ls"})
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).ToNot(Equal(0))
+		Expect(session).To(ExitWithError(125, fmt.Sprintf(`apparmor profile "%s" specified, but Apparmor is not enabled on this system`, apparmor.Profile)))
 	})
 
 	It("podman run apparmor disabled no default", func() {
@@ -148,12 +126,12 @@ profile aa-test-profile flags=(attach_disconnected,mediate_deleted) {
 		// Should succeed if user specifies apparmor on disabled system
 		session := podmanTest.Podman([]string{"create", ALPINE, "ls"})
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
 		cid := session.OutputToString()
 		// Verify that apparmor.Profile is being set
 		inspect := podmanTest.InspectContainer(cid)
-		Expect(inspect[0].AppArmorProfile).To(Equal(""))
+		Expect(inspect[0]).To(HaveField("AppArmorProfile", ""))
 	})
 
 	It("podman run apparmor disabled unconfined", func() {
@@ -161,11 +139,11 @@ profile aa-test-profile flags=(attach_disconnected,mediate_deleted) {
 
 		session := podmanTest.Podman([]string{"create", "--security-opt", "apparmor=unconfined", ALPINE, "ls"})
 		session.WaitWithDefaultTimeout()
-		Expect(session.ExitCode()).To(Equal(0))
+		Expect(session).Should(ExitCleanly())
 
 		cid := session.OutputToString()
 		// Verify that apparmor.Profile is being set
 		inspect := podmanTest.InspectContainer(cid)
-		Expect(inspect[0].AppArmorProfile).To(Equal(""))
+		Expect(inspect[0]).To(HaveField("AppArmorProfile", ""))
 	})
 })

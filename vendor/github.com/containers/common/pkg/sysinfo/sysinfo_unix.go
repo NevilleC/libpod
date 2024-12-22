@@ -1,4 +1,4 @@
-// +build !linux,!solaris,!windows
+//go:build !linux && !solaris && !windows
 
 package sysinfo
 

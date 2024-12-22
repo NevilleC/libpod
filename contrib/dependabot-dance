@@ -55,8 +55,8 @@ function branch_dance() {
         echo
         echo "Commit author is '$author' (expected 'dependabot')"
         echo -n "Continue? [y/N] "
-        read ans
-        case "$ans" in
+        read answer
+        case "$answer" in
             [yY]*) ;;
             *) exit 1;;
         esac
@@ -83,7 +83,7 @@ function branch_dance() {
 
     # Try to leave things in relatively clean state; remove local branch copy
     local tracking_branch=$(git branch --show-current)
-    git checkout master
+    git checkout main
     git branch -d $tracking_branch
 }
 

@@ -2,16 +2,17 @@ package pods
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
-	"text/tabwriter"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/validate"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/containers/podman/v2/pkg/util"
-	"github.com/pkg/errors"
+	"github.com/containers/common/pkg/report"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/util"
 	"github.com/spf13/cobra"
 )
 
@@ -23,13 +24,13 @@ var (
 	topOptions = entities.PodTopOptions{}
 
 	topCommand = &cobra.Command{
-		Use:   "top [flags] POD [FORMAT-DESCRIPTORS|ARGS...]",
-		Short: "Display the running processes of containers in a pod",
-		Long:  topDescription,
-		RunE:  top,
-		Args:  cobra.ArbitraryArgs,
+		Use:               "top [options] POD [FORMAT-DESCRIPTORS|ARGS...]",
+		Short:             "Display the running processes of containers in a pod",
+		Long:              topDescription,
+		RunE:              top,
+		Args:              cobra.ArbitraryArgs,
+		ValidArgsFunction: common.AutocompleteTopCmd,
 		Example: `podman pod top podID
-podman pod top --latest
 podman pod top podID pid seccomp args %C
 podman pod top podID -eo user,pid,comm`,
 	}
@@ -37,7 +38,6 @@ podman pod top podID -eo user,pid,comm`,
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: topCommand,
 		Parent:  podCmd,
 	})
@@ -66,7 +66,7 @@ func top(_ *cobra.Command, args []string) error {
 	}
 
 	if len(args) < 1 && !topOptions.Latest {
-		return errors.Errorf("you must provide the name or id of a running pod")
+		return errors.New("you must provide the name or id of a running pod")
 	}
 
 	if topOptions.Latest {
@@ -81,7 +81,11 @@ func top(_ *cobra.Command, args []string) error {
 		return err
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 5, 1, 3, ' ', 0)
+	w, err := report.NewWriterDefault(os.Stdout)
+	if err != nil {
+		return err
+	}
+
 	for _, proc := range topResponse.Value {
 		if _, err := fmt.Fprintln(w, proc); err != nil {
 			return err

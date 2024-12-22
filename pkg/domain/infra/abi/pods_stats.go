@@ -1,16 +1,19 @@
+//go:build !remote
+
 package abi
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strconv"
 
-	"github.com/containers/podman/v2/libpod"
-	"github.com/containers/podman/v2/pkg/cgroups"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/containers/podman/v2/pkg/rootless"
-	"github.com/containers/podman/v2/utils"
+	"github.com/containers/common/pkg/cgroups"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/rootless"
 	"github.com/docker/go-units"
-	"github.com/pkg/errors"
 )
 
 // PodStats implements printing stats about pods.
@@ -28,7 +31,7 @@ func (ic *ContainerEngine) PodStats(ctx context.Context, namesOrIds []string, op
 	// Get the (running) pods and convert them to the entities format.
 	pods, err := getPodsByContext(options.All, options.Latest, namesOrIds, ic.Libpod)
 	if err != nil {
-		return nil, errors.Wrap(err, "unable to get list of pods")
+		return nil, fmt.Errorf("unable to get list of pods: %w", err)
 	}
 	return ic.podsToStatsReport(pods)
 }
@@ -37,22 +40,34 @@ func (ic *ContainerEngine) PodStats(ctx context.Context, namesOrIds []string, op
 func (ic *ContainerEngine) podsToStatsReport(pods []*libpod.Pod) ([]*entities.PodStatsReport, error) {
 	reports := []*entities.PodStatsReport{}
 	for i := range pods { // Access by index to prevent potential loop-variable leaks.
-		podStats, err := pods[i].GetPodStats(nil)
+		podStats, err := pods[i].GetPodStats()
 		if err != nil {
+			// pod was removed, skip it
+			if errors.Is(err, define.ErrNoSuchPod) {
+				continue
+			}
 			return nil, err
 		}
 		podID := pods[i].ID()[:12]
 		for j := range podStats {
+			var podNetInput uint64
+			var podNetOutput uint64
+			for _, stats := range podStats[j].Network {
+				podNetInput += stats.RxBytes
+				podNetOutput += stats.TxBytes
+			}
+
 			r := entities.PodStatsReport{
-				CPU:      floatToPercentString(podStats[j].CPU),
-				MemUsage: combineHumanValues(podStats[j].MemUsage, podStats[j].MemLimit),
-				Mem:      floatToPercentString(podStats[j].MemPerc),
-				NetIO:    combineHumanValues(podStats[j].NetInput, podStats[j].NetOutput),
-				BlockIO:  combineHumanValues(podStats[j].BlockInput, podStats[j].BlockOutput),
-				PIDS:     pidsToString(podStats[j].PIDs),
-				CID:      podStats[j].ContainerID[:12],
-				Name:     podStats[j].Name,
-				Pod:      podID,
+				CPU:           floatToPercentString(podStats[j].CPU),
+				MemUsage:      combineHumanValues(podStats[j].MemUsage, podStats[j].MemLimit),
+				MemUsageBytes: combineBytesValues(podStats[j].MemUsage, podStats[j].MemLimit),
+				Mem:           floatToPercentString(podStats[j].MemPerc),
+				NetIO:         combineHumanValues(podNetInput, podNetOutput),
+				BlockIO:       combineHumanValues(podStats[j].BlockInput, podStats[j].BlockOutput),
+				PIDS:          pidsToString(podStats[j].PIDs),
+				CID:           podStats[j].ContainerID[:12],
+				Name:          podStats[j].Name,
+				Pod:           podID,
 			}
 			reports = append(reports, &r)
 		}
@@ -68,13 +83,15 @@ func combineHumanValues(a, b uint64) string {
 	return fmt.Sprintf("%s / %s", units.HumanSize(float64(a)), units.HumanSize(float64(b)))
 }
 
-func floatToPercentString(f float64) string {
-	strippedFloat, err := utils.RemoveScientificNotationFromFloat(f)
-	if err != nil || strippedFloat == 0 {
-		// If things go bazinga, return a safe value
-		return "--"
+func combineBytesValues(a, b uint64) string {
+	if a == 0 && b == 0 {
+		return "-- / --"
 	}
-	return fmt.Sprintf("%.2f", strippedFloat) + "%"
+	return fmt.Sprintf("%s / %s", units.BytesSize(float64(a)), units.BytesSize(float64(b)))
+}
+
+func floatToPercentString(f float64) string {
+	return fmt.Sprintf("%.2f%%", f)
 }
 
 func pidsToString(pid uint64) string {
@@ -82,5 +99,5 @@ func pidsToString(pid uint64) string {
 		// If things go bazinga, return a safe value
 		return "--"
 	}
-	return fmt.Sprintf("%d", pid)
+	return strconv.FormatUint(pid, 10)
 }

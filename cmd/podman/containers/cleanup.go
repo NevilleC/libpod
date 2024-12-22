@@ -1,13 +1,15 @@
 package containers
 
 import (
+	"errors"
 	"fmt"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/utils"
-	"github.com/containers/podman/v2/cmd/podman/validate"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	"github.com/pkg/errors"
+	"github.com/containers/common/pkg/completion"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
@@ -19,15 +21,16 @@ var (
    Cleans up mount points and network stacks on one or more containers from the host. The container name or ID can be used. This command is used internally when running containers, but can also be used if container cleanup has failed when a container exits.
 `
 	cleanupCommand = &cobra.Command{
-		Use:   "cleanup [flags] CONTAINER [CONTAINER...]",
-		Short: "Cleanup network and mountpoints of one or more containers",
-		Long:  cleanupDescription,
-		RunE:  cleanup,
+		Annotations: map[string]string{registry.EngineMode: registry.ABIMode},
+		Use:         "cleanup [options] CONTAINER [CONTAINER...]",
+		Short:       "Clean up network and mountpoints of one or more containers",
+		Long:        cleanupDescription,
+		RunE:        cleanup,
 		Args: func(cmd *cobra.Command, args []string) error {
-			return validate.CheckAllLatestAndCIDFile(cmd, args, false, false)
+			return validate.CheckAllLatestAndIDFile(cmd, args, false, "")
 		},
-		Example: `podman container cleanup --latest
-  podman container cleanup ctrID1 ctrID2 ctrID3
+		ValidArgsFunction: common.AutocompleteContainersExited,
+		Example: `podman container cleanup ctrID1 ctrID2 ctrID3
   podman container cleanup --all`,
 	}
 )
@@ -38,15 +41,23 @@ var (
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode},
 		Parent:  containerCmd,
 		Command: cleanupCommand,
 	})
 	flags := cleanupCommand.Flags()
 	flags.BoolVarP(&cleanupOptions.All, "all", "a", false, "Cleans up all containers")
-	flags.StringVar(&cleanupOptions.Exec, "exec", "", "Clean up the given exec session instead of the container")
+
+	execFlagName := "exec"
+	flags.StringVar(&cleanupOptions.Exec, execFlagName, "", "Clean up the given exec session instead of the container")
+	_ = cleanupCommand.RegisterFlagCompletionFunc(execFlagName, completion.AutocompleteNone)
+
 	flags.BoolVar(&cleanupOptions.Remove, "rm", false, "After cleanup, remove the container entirely")
 	flags.BoolVar(&cleanupOptions.RemoveImage, "rmi", false, "After cleanup, remove the image entirely")
+
+	stoppedOnlyFlag := "stopped-only"
+	flags.BoolVar(&cleanupOptions.StoppedOnly, stoppedOnlyFlag, false, "Only cleanup when the container is in the stopped state")
+	_ = flags.MarkHidden(stoppedOnlyFlag)
+
 	validate.AddLatestFlag(cleanupCommand, &cleanupOptions.Latest)
 }
 
@@ -58,11 +69,11 @@ func cleanup(cmd *cobra.Command, args []string) error {
 	if cleanupOptions.Exec != "" {
 		switch {
 		case cleanupOptions.All:
-			return errors.Errorf("exec and all options conflict")
+			return errors.New("--all and --exec cannot be set together")
 		case len(args) > 1:
-			return errors.Errorf("cannot use exec option when more than one container is given")
+			return errors.New("cannot use exec option when more than one container is given")
 		case cleanupOptions.RemoveImage:
-			return errors.Errorf("exec and rmi options conflict")
+			return errors.New("--exec and --rmi cannot be set together")
 		}
 	}
 
@@ -73,25 +84,24 @@ func cleanup(cmd *cobra.Command, args []string) error {
 		// is via syslog.
 		// As such, we need to logrus.Errorf our errors to ensure they
 		// are properly printed if --syslog is set.
-		logrus.Errorf("Error running container cleanup: %v", err)
+		logrus.Errorf("Running container cleanup: %v", err)
 		return err
 	}
 	for _, r := range responses {
-		if r.CleanErr == nil && r.RmErr == nil && r.RmiErr == nil {
-			fmt.Println(r.Id)
-			continue
-		}
-		if r.RmErr != nil {
-			logrus.Errorf("Error removing container: %v", r.RmErr)
+		switch {
+		case r.RmErr != nil:
+			logrus.Errorf("Removing container: %v", r.RmErr)
 			errs = append(errs, r.RmErr)
-		}
-		if r.RmiErr != nil {
-			logrus.Errorf("Error removing image: %v", r.RmiErr)
+		case r.RmiErr != nil:
+			logrus.Errorf("Removing image: %v", r.RmiErr)
 			errs = append(errs, r.RmiErr)
-		}
-		if r.CleanErr != nil {
-			logrus.Errorf("Error cleaning up container: %v", r.CleanErr)
+		case r.CleanErr != nil:
+			logrus.Errorf("Cleaning up container: %v", r.CleanErr)
 			errs = append(errs, r.CleanErr)
+		case r.RawInput != "":
+			fmt.Println(r.RawInput)
+		default:
+			fmt.Println(r.Id)
 		}
 	}
 	return errs.PrintErrors()

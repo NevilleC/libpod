@@ -1,21 +1,17 @@
 package images
 
 import (
-	"context"
 	"fmt"
 	"os"
-	"strings"
-	"text/tabwriter"
-	"text/template"
 	"time"
-	"unicode"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/pkg/domain/entities"
+	"github.com/containers/common/pkg/report"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/docker/go-units"
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 )
 
 var (
@@ -25,21 +21,23 @@ var (
 
 	// podman _history_
 	historyCmd = &cobra.Command{
-		Use:     "history [flags] IMAGE",
-		Short:   "Show history of a specified image",
-		Long:    long,
-		Example: "podman history quay.io/fedora/fedora",
-		Args:    cobra.ExactArgs(1),
-		RunE:    history,
+		Use:               "history [options] IMAGE",
+		Short:             "Show history of a specified image",
+		Long:              long,
+		Args:              cobra.ExactArgs(1),
+		RunE:              history,
+		ValidArgsFunction: common.AutocompleteImages,
+		Example:           "podman history quay.io/fedora/fedora",
 	}
 
 	imageHistoryCmd = &cobra.Command{
-		Args:    historyCmd.Args,
-		Use:     historyCmd.Use,
-		Short:   historyCmd.Short,
-		Long:    historyCmd.Long,
-		RunE:    historyCmd.RunE,
-		Example: `podman image history imageID`,
+		Args:              historyCmd.Args,
+		Use:               historyCmd.Use,
+		Short:             historyCmd.Short,
+		Long:              historyCmd.Long,
+		ValidArgsFunction: historyCmd.ValidArgsFunction,
+		RunE:              historyCmd.RunE,
+		Example:           `podman image history quay.io/fedora/fedora`,
 	}
 
 	opts = struct {
@@ -52,34 +50,37 @@ var (
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: historyCmd,
 	})
-	historyFlags(historyCmd.Flags())
+	historyFlags(historyCmd)
 
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: imageHistoryCmd,
 		Parent:  imageCmd,
 	})
-	historyFlags(imageHistoryCmd.Flags())
+	historyFlags(imageHistoryCmd)
 }
 
-func historyFlags(flags *pflag.FlagSet) {
-	flags.StringVar(&opts.format, "format", "", "Change the output to JSON or a Go template")
+func historyFlags(cmd *cobra.Command) {
+	flags := cmd.Flags()
+
+	formatFlagName := "format"
+	flags.StringVar(&opts.format, formatFlagName, "", "Change the output to JSON or a Go template")
+	_ = cmd.RegisterFlagCompletionFunc(formatFlagName, common.AutocompleteFormat(&historyReporter{}))
+
 	flags.BoolVarP(&opts.human, "human", "H", true, "Display sizes and dates in human readable format")
 	flags.BoolVar(&opts.noTrunc, "no-trunc", false, "Do not truncate the output")
-	flags.BoolVar(&opts.noTrunc, "notruncate", false, "Do not truncate the output")
 	flags.BoolVarP(&opts.quiet, "quiet", "q", false, "Display the numeric IDs only")
+	flags.SetNormalizeFunc(utils.AliasFlags)
 }
 
 func history(cmd *cobra.Command, args []string) error {
-	results, err := registry.ImageEngine().History(context.Background(), args[0], entities.ImageHistoryOptions{})
+	results, err := registry.ImageEngine().History(registry.Context(), args[0], entities.ImageHistoryOptions{})
 	if err != nil {
 		return err
 	}
 
-	if opts.format == "json" {
+	if report.IsJSON(opts.format) {
 		var err error
 		if len(results.Layers) == 0 {
 			_, err = fmt.Fprintf(os.Stdout, "[]\n")
@@ -100,71 +101,73 @@ func history(cmd *cobra.Command, args []string) error {
 		}
 		return err
 	}
-	hr := make([]historyreporter, 0, len(results.Layers))
+
+	hr := make([]historyReporter, 0, len(results.Layers))
 	for _, l := range results.Layers {
-		hr = append(hr, historyreporter{l})
+		hr = append(hr, historyReporter{l})
 	}
-	// Defaults
-	hdr := "ID\tCREATED\tCREATED BY\tSIZE\tCOMMENT\n"
-	row := "{{.ID}}\t{{.Created}}\t{{.CreatedBy}}\t{{.Size}}\t{{.Comment}}\n"
+
+	rpt := report.New(os.Stdout, cmd.Name())
+	defer rpt.Flush()
 
 	switch {
-	case len(opts.format) > 0:
-		hdr = ""
-		row = opts.format
-		if !strings.HasSuffix(opts.format, "\n") {
-			row += "\n"
-		}
 	case opts.quiet:
-		hdr = ""
-		row = "{{.ID}}\n"
-	case opts.human:
-		row = "{{.ID}}\t{{.Created}}\t{{.CreatedBy}}\t{{.Size}}\t{{.Comment}}\n"
-	case opts.noTrunc:
-		row = "{{.ID}}\t{{.Created}}\t{{.CreatedBy}}\t{{.Size}}\t{{.Comment}}\n"
+		rpt, err = rpt.Parse(report.OriginUser, "{{range .}}{{.ID}}\n{{end -}}")
+	case cmd.Flags().Changed("format"):
+		rpt, err = rpt.Parse(report.OriginUser, cmd.Flag("format").Value.String())
+	default:
+		format := "{{range .}}{{.ID}}\t{{.Created}}\t{{.CreatedBy}}\t{{.Size}}\t{{.Comment}}\n{{end -}}"
+		rpt, err = rpt.Parse(report.OriginPodman, format)
 	}
-	format := hdr + "{{range . }}" + row + "{{end}}"
-
-	tmpl, err := template.New("report").Parse(format)
 	if err != nil {
 		return err
 	}
-	w := tabwriter.NewWriter(os.Stdout, 8, 2, 2, ' ', 0)
-	err = tmpl.Execute(w, hr)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "Failed to print report"))
+
+	if rpt.RenderHeaders {
+		hdrs := report.Headers(historyReporter{}, map[string]string{
+			"CreatedBy": "CREATED BY",
+		})
+
+		if err := rpt.Execute(hdrs); err != nil {
+			return fmt.Errorf("failed to write report column headers: %w", err)
+		}
 	}
-	w.Flush()
-	return nil
+	return rpt.Execute(hr)
 }
 
-type historyreporter struct {
+type historyReporter struct {
 	entities.ImageHistoryLayer
 }
 
-func (h historyreporter) Created() string {
+func (h historyReporter) Created() string {
 	if opts.human {
 		return units.HumanDuration(time.Since(h.ImageHistoryLayer.Created)) + " ago"
 	}
 	return h.ImageHistoryLayer.Created.Format(time.RFC3339)
 }
 
-func (h historyreporter) Size() string {
-	s := units.HumanSizeWithPrecision(float64(h.ImageHistoryLayer.Size), 3)
-	i := strings.LastIndexFunc(s, unicode.IsNumber)
-	return s[:i+1] + " " + s[i+1:]
+func (h historyReporter) Size() string {
+	return units.HumanSizeWithPrecision(float64(h.ImageHistoryLayer.Size), 3)
 }
 
-func (h historyreporter) CreatedBy() string {
-	if len(h.ImageHistoryLayer.CreatedBy) > 45 {
+func (h historyReporter) CreatedBy() string {
+	if !opts.noTrunc && len(h.ImageHistoryLayer.CreatedBy) > 45 {
 		return h.ImageHistoryLayer.CreatedBy[:45-3] + "..."
 	}
 	return h.ImageHistoryLayer.CreatedBy
 }
 
-func (h historyreporter) ID() string {
+func (h historyReporter) ID() string {
 	if !opts.noTrunc && len(h.ImageHistoryLayer.ID) >= 12 {
 		return h.ImageHistoryLayer.ID[0:12]
 	}
 	return h.ImageHistoryLayer.ID
+}
+
+func (h historyReporter) CreatedAt() string {
+	return time.Unix(h.ImageHistoryLayer.Created.Unix(), 0).Format(time.RFC3339)
+}
+
+func (h historyReporter) CreatedSince() string {
+	return h.Created()
 }

@@ -2,15 +2,19 @@ package images
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"os"
+	"strings"
 
-	"github.com/containers/podman/v2/cmd/podman/parse"
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/pkg/domain/entities"
+	"github.com/containers/common/pkg/completion"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/parse"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/hashicorp/go-multierror"
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 )
 
 var (
@@ -19,22 +23,25 @@ var (
   Note remote tar balls can be specified, via web address.
   Optionally tag the image. You can specify the instructions using the --change option.`
 	importCommand = &cobra.Command{
-		Use:   "import [flags] PATH [REFERENCE]",
-		Short: "Import a tarball to create a filesystem image",
-		Long:  importDescription,
-		RunE:  importCon,
-		Example: `podman import http://example.com/ctr.tar url-image
+		Use:               "import [options] PATH [REFERENCE]",
+		Short:             "Import a tarball to create a filesystem image",
+		Long:              importDescription,
+		RunE:              importCon,
+		Args:              cobra.RangeArgs(1, 2),
+		ValidArgsFunction: common.AutocompleteDefaultOneArg,
+		Example: `podman import https://example.com/ctr.tar url-image
   cat ctr.tar | podman -q import --message "importing the ctr.tar tarball" - image-imported
   cat ctr.tar | podman import -`,
 	}
 
 	imageImportCommand = &cobra.Command{
-		Args:  cobra.MinimumNArgs(1),
-		Use:   importCommand.Use,
-		Short: importCommand.Short,
-		Long:  importCommand.Long,
-		RunE:  importCommand.RunE,
-		Example: `podman image import http://example.com/ctr.tar url-image
+		Use:               importCommand.Use,
+		Short:             importCommand.Short,
+		Long:              importCommand.Long,
+		RunE:              importCommand.RunE,
+		Args:              importCommand.Args,
+		ValidArgsFunction: importCommand.ValidArgsFunction,
+		Example: `podman image import https://example.com/ctr.tar url-image
   cat ctr.tar | podman -q image import --message "importing the ctr.tar tarball" - image-imported
   cat ctr.tar | podman image import -`,
 	}
@@ -46,25 +53,45 @@ var (
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: importCommand,
 	})
-	importFlags(importCommand.Flags())
+	importFlags(importCommand)
 
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: imageImportCommand,
 		Parent:  imageCmd,
 	})
-	importFlags(imageImportCommand.Flags())
+	importFlags(imageImportCommand)
 }
 
-func importFlags(flags *pflag.FlagSet) {
-	flags.StringArrayVarP(&importOpts.Changes, "change", "c", []string{}, "Apply the following possible instructions to the created image (default []): CMD | ENTRYPOINT | ENV | EXPOSE | LABEL | STOPSIGNAL | USER | VOLUME | WORKDIR")
-	flags.StringVarP(&importOpts.Message, "message", "m", "", "Set commit message for imported image")
+func importFlags(cmd *cobra.Command) {
+	flags := cmd.Flags()
+
+	changeFlagName := "change"
+	flags.StringArrayVarP(&importOpts.Changes, changeFlagName, "c", []string{}, "Apply the following possible instructions to the created image (default []): "+strings.Join(common.ChangeCmds, " | "))
+	_ = cmd.RegisterFlagCompletionFunc(changeFlagName, common.AutocompleteChangeInstructions)
+
+	messageFlagName := "message"
+	flags.StringVarP(&importOpts.Message, messageFlagName, "m", "", "Set commit message for imported image")
+	_ = cmd.RegisterFlagCompletionFunc(messageFlagName, completion.AutocompleteNone)
+
+	osFlagName := "os"
+	flags.StringVar(&importOpts.OS, osFlagName, "", "Set the OS of the imported image")
+	_ = cmd.RegisterFlagCompletionFunc(osFlagName, completion.AutocompleteNone)
+
+	archFlagName := "arch"
+	flags.StringVar(&importOpts.Architecture, archFlagName, "", "Set the architecture of the imported image")
+	_ = cmd.RegisterFlagCompletionFunc(archFlagName, completion.AutocompleteNone)
+
+	variantFlagName := "variant"
+	flags.StringVar(&importOpts.Variant, variantFlagName, "", "Set the variant of the imported image")
+	_ = cmd.RegisterFlagCompletionFunc(variantFlagName, completion.AutocompleteNone)
+
 	flags.BoolVarP(&importOpts.Quiet, "quiet", "q", false, "Suppress output")
-	flags.StringVar(&importOpts.SignaturePolicy, "signature-policy", "", "Path to a signature-policy file")
-	_ = flags.MarkHidden("signature-policy")
+	if !registry.IsRemote() {
+		flags.StringVar(&importOpts.SignaturePolicy, "signature-policy", "", "Path to a signature-policy file")
+		_ = flags.MarkHidden("signature-policy")
+	}
 }
 
 func importCon(cmd *cobra.Command, args []string) error {
@@ -74,7 +101,7 @@ func importCon(cmd *cobra.Command, args []string) error {
 	)
 	switch len(args) {
 	case 0:
-		return errors.Errorf("need to give the path to the tarball, or must specify a tarball of '-' for stdin")
+		return errors.New("need to give the path to the tarball, or must specify a tarball of '-' for stdin")
 	case 1:
 		source = args[0]
 	case 2:
@@ -84,8 +111,24 @@ func importCon(cmd *cobra.Command, args []string) error {
 		// instead of the localhost ones
 		reference = args[1]
 	default:
-		return errors.Errorf("too many arguments. Usage TARBALL [REFERENCE]")
+		return errors.New("too many arguments. Usage TARBALL [REFERENCE]")
 	}
+
+	if source == "-" {
+		outFile, err := os.CreateTemp("", "podman")
+		if err != nil {
+			return fmt.Errorf("creating file %v", err)
+		}
+		defer os.Remove(outFile.Name())
+		defer outFile.Close()
+
+		_, err = io.Copy(outFile, os.Stdin)
+		if err != nil {
+			return fmt.Errorf("copying file %v", err)
+		}
+		source = outFile.Name()
+	}
+
 	errFileName := parse.ValidateFileName(source)
 	errURL := parse.ValidURL(source)
 	if errURL == nil {

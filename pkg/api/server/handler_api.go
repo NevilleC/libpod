@@ -1,60 +1,107 @@
+//go:build !remote
+
 package server
 
 import (
-	"context"
+	"bufio"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"runtime"
 
-	"github.com/containers/podman/v2/pkg/api/handlers/utils"
-	log "github.com/sirupsen/logrus"
+	"github.com/containers/podman/v5/version"
+	"github.com/sirupsen/logrus"
 )
+
+type BufferedResponseWriter struct {
+	b *bufio.Writer
+	w http.ResponseWriter
+}
 
 // APIHandler is a wrapper to enhance HandlerFunc's and remove redundant code
 func (s *APIServer) APIHandler(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// http.Server hides panics, we want to see them and fix the cause.
-		defer func() {
-			err := recover()
-			if err != nil {
-				buf := make([]byte, 1<<20)
-				n := runtime.Stack(buf, true)
-				log.Warnf("Recovering from API handler panic: %v, %s", err, buf[:n])
-				// Try to inform client things went south... won't work if handler already started writing response body
-				utils.InternalServerError(w, fmt.Errorf("%v", err))
-			}
-		}()
-
-		// Wrapper to hide some boiler plate
-		fn := func(w http.ResponseWriter, r *http.Request) {
-			log.Debugf("APIHandler -- Method: %s URL: %s", r.Method, r.URL.String())
-
-			if err := r.ParseForm(); err != nil {
-				log.Infof("Failed Request: unable to parse form: %q", err)
-			}
-
-			// TODO: Use r.ConnContext when ported to go 1.13
-			c := context.WithValue(r.Context(), "decoder", s.Decoder) // nolint
-			c = context.WithValue(c, "runtime", s.Runtime)            // nolint
-			c = context.WithValue(c, "shutdownFunc", s.Shutdown)      // nolint
-			c = context.WithValue(c, "idletracker", s.idleTracker)    // nolint
-			r = r.WithContext(c)
-
-			cv := utils.APIVersion[utils.CompatTree][utils.CurrentAPIVersion]
-			w.Header().Set("API-Version", fmt.Sprintf("%d.%d", cv.Major, cv.Minor))
-
-			lv := utils.APIVersion[utils.LibpodTree][utils.CurrentAPIVersion].String()
-			w.Header().Set("Libpod-API-Version", lv)
-			w.Header().Set("Server", "Libpod/"+lv+" ("+runtime.GOOS+")")
-
-			h(w, r)
-		}
-		fn(w, r)
+		// Wrapper to hide some boilerplate
+		s.apiWrapper(h, w, r, false)
 	}
+}
+
+// An API Handler to help historical clients with broken parsing that expect
+// streaming JSON payloads to be reliably messaged framed (full JSON record
+// always fits in each read())
+func (s *APIServer) StreamBufferedAPIHandler(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Wrapper to hide some boilerplate
+		s.apiWrapper(h, w, r, true)
+	}
+}
+
+func (s *APIServer) apiWrapper(h http.HandlerFunc, w http.ResponseWriter, r *http.Request, buffer bool) {
+	if err := r.ParseForm(); err != nil {
+		logrus.WithFields(logrus.Fields{
+			"X-Reference-Id": r.Header.Get("X-Reference-Id"),
+		}).Info("Failed Request: unable to parse form: " + err.Error())
+	}
+
+	cv := version.APIVersion[version.Compat][version.CurrentAPI]
+	w.Header().Set("API-Version", fmt.Sprintf("%d.%d", cv.Major, cv.Minor))
+
+	lv := version.APIVersion[version.Libpod][version.CurrentAPI].String()
+	w.Header().Set("Libpod-API-Version", lv)
+	w.Header().Set("Server", "Libpod/"+lv+" ("+runtime.GOOS+")")
+
+	if s.CorsHeaders != "" {
+		w.Header().Set("Access-Control-Allow-Origin", s.CorsHeaders)
+		w.Header().Set("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, X-Registry-Auth, Connection, Upgrade, X-Registry-Config")
+		w.Header().Set("Access-Control-Allow-Methods", "HEAD, GET, POST, DELETE, PUT, OPTIONS")
+	}
+
+	if buffer {
+		bw := newBufferedResponseWriter(w)
+		defer bw.b.Flush()
+		w = bw
+	}
+
+	h(w, r)
 }
 
 // VersionedPath prepends the version parsing code
 // any handler may override this default when registering URL(s)
 func VersionedPath(p string) string {
-	return "/v{version:[0-9][0-9.]*}" + p
+	return "/v{version:[0-9][0-9A-Za-z.-]*}" + p
+}
+
+func (w *BufferedResponseWriter) Header() http.Header {
+	return w.w.Header()
+}
+
+func (w *BufferedResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	_ = w.b.Flush()
+	if wrapped, ok := w.w.(http.Hijacker); ok {
+		return wrapped.Hijack()
+	}
+
+	return nil, nil, errors.New("ResponseWriter does not support hijacking")
+}
+
+func (w *BufferedResponseWriter) Write(b []byte) (int, error) {
+	return w.b.Write(b)
+}
+
+func (w *BufferedResponseWriter) WriteHeader(statusCode int) {
+	w.w.WriteHeader(statusCode)
+}
+
+func (w *BufferedResponseWriter) Flush() {
+	_ = w.b.Flush()
+	if wrapped, ok := w.w.(http.Flusher); ok {
+		wrapped.Flush()
+	}
+}
+func newBufferedResponseWriter(rw http.ResponseWriter) *BufferedResponseWriter {
+	return &BufferedResponseWriter{
+		bufio.NewWriterSize(rw, 8192),
+		rw,
+	}
 }

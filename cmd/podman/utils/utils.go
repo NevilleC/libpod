@@ -1,10 +1,15 @@
 package utils
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"strings"
 
-	"github.com/containers/podman/v2/pkg/domain/entities"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/entities/reports"
 )
 
 // IsDir returns true if the specified path refers to a directory.
@@ -26,8 +31,11 @@ func FileExists(path string) bool {
 	return !file.IsDir()
 }
 
-func PrintPodPruneResults(podPruneReports []*entities.PodPruneReport) error {
+func PrintPodPruneResults(podPruneReports []*entities.PodPruneReport, heading bool) error {
 	var errs OutputErrors
+	if heading && len(podPruneReports) > 0 {
+		fmt.Println("Deleted Pods")
+	}
 	for _, r := range podPruneReports {
 		if r.Err == nil {
 			fmt.Println(r.Id)
@@ -38,19 +46,25 @@ func PrintPodPruneResults(podPruneReports []*entities.PodPruneReport) error {
 	return errs.PrintErrors()
 }
 
-func PrintContainerPruneResults(containerPruneReport *entities.ContainerPruneReport) error {
+func PrintContainerPruneResults(containerPruneReports []*reports.PruneReport, heading bool) error {
 	var errs OutputErrors
-	for k := range containerPruneReport.ID {
-		fmt.Println(k)
+	if heading && len(containerPruneReports) > 0 {
+		fmt.Println("Deleted Containers")
 	}
-	for _, v := range containerPruneReport.Err {
-		errs = append(errs, v)
+	for _, v := range containerPruneReports {
+		fmt.Println(v.Id)
+		if v.Err != nil {
+			errs = append(errs, v.Err)
+		}
 	}
 	return errs.PrintErrors()
 }
 
-func PrintVolumePruneResults(volumePruneReport []*entities.VolumePruneReport) error {
+func PrintVolumePruneResults(volumePruneReport []*reports.PruneReport, heading bool) error {
 	var errs OutputErrors
+	if heading && len(volumePruneReport) > 0 {
+		fmt.Println("Deleted Volumes")
+	}
 	for _, r := range volumePruneReport {
 		if r.Err == nil {
 			fmt.Println(r.Id)
@@ -61,15 +75,76 @@ func PrintVolumePruneResults(volumePruneReport []*entities.VolumePruneReport) er
 	return errs.PrintErrors()
 }
 
-func PrintImagePruneResults(imagePruneReport *entities.ImagePruneReport) error {
-	for _, i := range imagePruneReport.Report.Id {
-		fmt.Println(i)
+func PrintImagePruneResults(imagePruneReports []*reports.PruneReport, heading bool) error {
+	if heading && len(imagePruneReports) > 0 {
+		fmt.Println("Deleted Images")
 	}
-	for _, e := range imagePruneReport.Report.Err {
-		fmt.Fprint(os.Stderr, e.Error()+"\n")
+	for _, r := range imagePruneReports {
+		fmt.Println(r.Id)
+		if r.Err != nil {
+			fmt.Fprint(os.Stderr, r.Err.Error()+"\n")
+		}
 	}
-	if imagePruneReport.Size > 0 {
-		fmt.Fprintf(os.Stdout, "Size: %d\n", imagePruneReport.Size)
-	}
+
 	return nil
+}
+
+func PrintNetworkPruneResults(networkPruneReport []*entities.NetworkPruneReport, heading bool) error {
+	var errs OutputErrors
+	if heading && len(networkPruneReport) > 0 {
+		fmt.Println("Deleted Networks")
+	}
+	for _, r := range networkPruneReport {
+		if r.Error == nil {
+			fmt.Println(r.Name)
+		} else {
+			errs = append(errs, r.Error)
+		}
+	}
+	return errs.PrintErrors()
+}
+
+// IsCheckpointImage returns true with no error only if all values in
+// namesOrIDs correspond to checkpoint images AND these images are
+// compatible with the container runtime that is currently in use,
+// e.g., crun or runc.
+//
+// IsCheckpointImage returns false with no error when none of the values
+// in namesOrIDs corresponds to an ID or name of an image.
+//
+// Otherwise, IsCheckpointImage returns false with appropriate error.
+func IsCheckpointImage(ctx context.Context, namesOrIDs []string) (bool, error) {
+	inspectOpts := entities.InspectOptions{}
+	imgData, _, err := registry.ImageEngine().Inspect(ctx, namesOrIDs, inspectOpts)
+	if err != nil {
+		return false, err
+	}
+	if len(imgData) == 0 {
+		return false, nil
+	}
+	imgID := imgData[0].ID
+
+	hostInfo, err := registry.ContainerEngine().Info(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	for i := range imgData {
+		checkpointRuntimeName, found := imgData[i].Annotations[define.CheckpointAnnotationRuntimeName]
+		if !found {
+			return false, fmt.Errorf("image is not a checkpoint: %s", imgID)
+		}
+		if hostInfo.Host.OCIRuntime.Name != checkpointRuntimeName {
+			return false, fmt.Errorf("container image \"%s\" requires runtime: \"%s\"", imgID, checkpointRuntimeName)
+		}
+	}
+	return true, nil
+}
+
+func RemoveSlash(input []string) []string {
+	output := make([]string, 0, len(input))
+	for _, in := range input {
+		output = append(output, strings.TrimPrefix(in, "/"))
+	}
+	return output
 }

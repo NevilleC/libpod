@@ -1,45 +1,65 @@
+//go:build !remote
+
 package compat
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 
-	"github.com/containers/podman/v2/libpod"
-	"github.com/containers/podman/v2/pkg/api/handlers/utils"
-	"github.com/gorilla/schema"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/infra/abi"
 )
 
 func RestartContainer(w http.ResponseWriter, r *http.Request) {
-	runtime := r.Context().Value("runtime").(*libpod.Runtime)
-	decoder := r.Context().Value("decoder").(*schema.Decoder)
+	runtime := r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
+	decoder := utils.GetDecoder(r)
+	// Now use the ABI implementation to prevent us from having duplicate
+	// code.
+	containerEngine := abi.ContainerEngine{Libpod: runtime}
+
 	// /{version}/containers/(name)/restart
 	query := struct {
-		Timeout int `schema:"t"`
+		All           bool `schema:"all"`
+		DockerTimeout uint `schema:"t"`
+		LibpodTimeout uint `schema:"timeout"`
 	}{
-		// Override golang default values for types
+		// override any golang type defaults
 	}
 	if err := decoder.Decode(&query, r.URL.Query()); err != nil {
-		utils.BadRequest(w, "url", r.URL.String(), errors.Wrapf(err, "Failed to parse parameters for %s", r.URL.String()))
+		utils.Error(w, http.StatusBadRequest, fmt.Errorf("failed to parse parameters for %s: %w", r.URL.String(), err))
 		return
 	}
 
 	name := utils.GetName(r)
-	con, err := runtime.LookupContainer(name)
+
+	options := entities.RestartOptions{
+		All:     query.All,
+		Timeout: &query.DockerTimeout,
+	}
+	if utils.IsLibpodRequest(r) {
+		options.Timeout = &query.LibpodTimeout
+	}
+	report, err := containerEngine.ContainerRestart(r.Context(), []string{name}, options)
 	if err != nil {
-		utils.ContainerNotFound(w, name, err)
-		return
-	}
+		if errors.Is(err, define.ErrNoSuchCtr) {
+			utils.ContainerNotFound(w, name, err)
+			return
+		}
 
-	timeout := con.StopTimeout()
-	if _, found := r.URL.Query()["t"]; found {
-		timeout = uint(query.Timeout)
-	}
-
-	if err := con.RestartWithTimeout(r.Context(), timeout); err != nil {
 		utils.InternalServerError(w, err)
 		return
 	}
 
+	if len(report) > 0 && report[0].Err != nil {
+		utils.InternalServerError(w, report[0].Err)
+		return
+	}
+
 	// Success
-	utils.WriteResponse(w, http.StatusNoContent, "")
+	utils.WriteResponse(w, http.StatusNoContent, nil)
 }

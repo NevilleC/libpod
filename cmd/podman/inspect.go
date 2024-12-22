@@ -1,9 +1,10 @@
 package main
 
 import (
-	"github.com/containers/podman/v2/cmd/podman/inspect"
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/pkg/domain/entities"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/inspect"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
 )
 
@@ -19,11 +20,12 @@ var (
 
 	// Command: podman _inspect_ Object_ID
 	inspectCmd = &cobra.Command{
-		Use:              "inspect [flags] {CONTAINER_ID | IMAGE_ID} [...]",
-		Short:            "Display the configuration of object denoted by ID",
-		RunE:             inspectExec,
-		Long:             inspectDescription,
-		TraverseChildren: true,
+		Use:               "inspect [options] {CONTAINER|IMAGE|POD|NETWORK|VOLUME} [...]",
+		Short:             "Display the configuration of object denoted by ID",
+		RunE:              inspectExec,
+		Long:              inspectDescription,
+		TraverseChildren:  true,
+		ValidArgsFunction: common.AutocompleteInspect,
 		Example: `podman inspect fedora
   podman inspect --type image fedora
   podman inspect CtrID ImgID
@@ -34,7 +36,6 @@ var (
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: inspectCmd,
 	})
 	inspectOpts = inspect.AddInspectFlagSet(inspectCmd)

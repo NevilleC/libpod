@@ -17,17 +17,18 @@
 package ocicrypt
 
 import (
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/pkg/errors"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 // GPGVersion enum representing the GPG client version to use.
@@ -78,9 +79,8 @@ func GuessGPGVersion() GPGVersion {
 		return GPGv2
 	} else if err := exec.Command("gpg", "--version").Run(); err == nil {
 		return GPGv1
-	} else {
-		return GPGVersionUndetermined
 	}
+	return GPGVersionUndetermined
 }
 
 // NewGPGClient creates a new GPGClient object representing the given version
@@ -132,7 +132,7 @@ func (gc *gpgv2Client) GetGPGPrivateKey(keyid uint64, passphrase string) ([]byte
 
 	rfile, wfile, err := os.Pipe()
 	if err != nil {
-		return nil, errors.Wrapf(err, "could not create pipe")
+		return nil, fmt.Errorf("could not create pipe: %w", err)
 	}
 	defer func() {
 		rfile.Close()
@@ -180,13 +180,13 @@ func (gc *gpgv2Client) getKeyDetails(option string, keyid uint64) ([]byte, bool,
 	return keydata, err == nil, err
 }
 
-// GetSecretKeyDetails retrives the secret key details of key with keyid.
+// GetSecretKeyDetails retrieves the secret key details of key with keyid.
 // returns a byte array of the details and a bool if the key exists
 func (gc *gpgv2Client) GetSecretKeyDetails(keyid uint64) ([]byte, bool, error) {
 	return gc.getKeyDetails("-K", keyid)
 }
 
-// GetKeyDetails retrives the public key details of key with keyid.
+// GetKeyDetails retrieves the public key details of key with keyid.
 // returns a byte array of the details and a bool if the key exists
 func (gc *gpgv2Client) GetKeyDetails(keyid uint64) ([]byte, bool, error) {
 	return gc.getKeyDetails("-k", keyid)
@@ -240,13 +240,13 @@ func (gc *gpgv1Client) getKeyDetails(option string, keyid uint64) ([]byte, bool,
 	return keydata, err == nil, err
 }
 
-// GetSecretKeyDetails retrives the secret key details of key with keyid.
+// GetSecretKeyDetails retrieves the secret key details of key with keyid.
 // returns a byte array of the details and a bool if the key exists
 func (gc *gpgv1Client) GetSecretKeyDetails(keyid uint64) ([]byte, bool, error) {
 	return gc.getKeyDetails("-K", keyid)
 }
 
-// GetKeyDetails retrives the public key details of key with keyid.
+// GetKeyDetails retrieves the public key details of key with keyid.
 // returns a byte array of the details and a bool if the key exists
 func (gc *gpgv1Client) GetKeyDetails(keyid uint64) ([]byte, bool, error) {
 	return gc.getKeyDetails("-k", keyid)
@@ -272,8 +272,8 @@ func runGPGGetOutput(cmd *exec.Cmd) ([]byte, error) {
 		return nil, err
 	}
 
-	stdoutstr, err2 := ioutil.ReadAll(stdout)
-	stderrstr, _ := ioutil.ReadAll(stderr)
+	stdoutstr, err2 := io.ReadAll(stdout)
+	stderrstr, _ := io.ReadAll(stderr)
 
 	if err := cmd.Wait(); err != nil {
 		return nil, fmt.Errorf("error from %s: %s", cmd.Path, string(stderrstr))
@@ -310,9 +310,15 @@ func resolveRecipients(gc GPGClient, recipients []string) []string {
 	return result
 }
 
-var emailPattern = regexp.MustCompile(`uid\s+\[.*\]\s.*\s<(?P<email>.+)>`)
+var (
+	onceRegexp   sync.Once
+	emailPattern *regexp.Regexp
+)
 
 func extractEmailFromDetails(details []byte) string {
+	onceRegexp.Do(func() {
+		emailPattern = regexp.MustCompile(`uid\s+\[.*\]\s.*\s<(?P<email>.+)>`)
+	})
 	loc := emailPattern.FindSubmatchIndex(details)
 	if len(loc) == 0 {
 		return ""
@@ -352,7 +358,7 @@ func GPGGetPrivateKey(descs []ocispec.Descriptor, gpgClient GPGClient, gpgVault 
 			}
 			keywrapper := GetKeyWrapper(scheme)
 			if keywrapper == nil {
-				return nil, nil, errors.Errorf("could not get KeyWrapper for %s\n", scheme)
+				return nil, nil, fmt.Errorf("could not get KeyWrapper for %s", scheme)
 			}
 			keyIds, err := keywrapper.GetKeyIdsFromPacket(b64pgpPackets)
 			if err != nil {
@@ -387,7 +393,7 @@ func GPGGetPrivateKey(descs []ocispec.Descriptor, gpgClient GPGClient, gpgVault 
 						fmt.Printf("Passphrase required for Key id 0x%x: \n%v", keyid, string(keyinfo))
 						fmt.Printf("Enter passphrase for key with Id 0x%x: ", keyid)
 
-						password, err := terminal.ReadPassword(int(os.Stdin.Fd()))
+						password, err := term.ReadPassword(int(os.Stdin.Fd()))
 						fmt.Printf("\n")
 						if err != nil {
 							return nil, nil, err
@@ -411,7 +417,7 @@ func GPGGetPrivateKey(descs []ocispec.Descriptor, gpgClient GPGClient, gpgVault 
 			if !found && len(b64pgpPackets) > 0 && mustFindKey {
 				ids := uint64ToStringArray("0x%x", keyIds)
 
-				return nil, nil, errors.Errorf("missing key for decryption of layer %x of %s. Need one of the following keys: %s", desc.Digest, desc.Platform, strings.Join(ids, ", "))
+				return nil, nil, fmt.Errorf("missing key for decryption of layer %x of %s. Need one of the following keys: %s", desc.Digest, desc.Platform, strings.Join(ids, ", "))
 			}
 		}
 	}

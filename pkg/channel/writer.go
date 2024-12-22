@@ -1,13 +1,12 @@
 package channel
 
 import (
+	"errors"
 	"io"
 	"sync"
-
-	"github.com/pkg/errors"
 )
 
-// WriteCloser is an io.WriteCloser that that proxies Write() calls to a channel
+// WriteCloser is an io.WriteCloser that proxies Write() calls to a channel
 // The []byte buffer of the Write() is queued on the channel as one message.
 type WriteCloser interface {
 	io.WriteCloser
@@ -32,22 +31,31 @@ func (w *writeCloser) Chan() <-chan []byte {
 }
 
 // Write method for WriteCloser
-func (w *writeCloser) Write(b []byte) (int, error) {
-	if w == nil || w.ch == nil {
+func (w *writeCloser) Write(b []byte) (bLen int, err error) {
+	if w == nil {
 		return 0, errors.New("use channel.NewWriter() to initialize a WriteCloser")
 	}
 
 	w.mux.Lock()
+	defer w.mux.Unlock()
+
+	if w.ch == nil {
+		return 0, errors.New("the channel is closed for Write")
+	}
+
 	buf := make([]byte, len(b))
 	copy(buf, b)
 	w.ch <- buf
-	w.mux.Unlock()
 
 	return len(b), nil
 }
 
 // Close method for WriteCloser
 func (w *writeCloser) Close() error {
+	w.mux.Lock()
+	defer w.mux.Unlock()
+
 	close(w.ch)
+	w.ch = nil
 	return nil
 }

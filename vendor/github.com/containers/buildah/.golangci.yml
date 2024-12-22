@@ -7,38 +7,10 @@ run:
   # Don't exceed number of threads available when running under CI
   concurrency: 4
 linters:
-  disable-all: true
   enable:
-    - bodyclose
-    - deadcode
-    - depguard
-    - dupl
-    - errcheck
     - gofmt
-    - goimports
-    - golint
-    # Broken? Unpredictably dies w/o any error well before deadline/timeout expires
-    # - gosimple
-    - govet
-    - ineffassign
-    - interfacer
-    - misspell
-    - nakedret
-    - staticcheck
-    - structcheck
-    - stylecheck
-    - typecheck
+    - gofumpt
+    - revive
     - unconvert
     - unparam
-    - unused
-    - varcheck
-    # - gochecknoglobals
-    # - gochecknoinits
-    # - goconst
-    # - gocritic
-    # - gocyclo
-    # - gosec
-    # - lll
-    # - maligned
-    # - prealloc
-    # - scopelint
+    - whitespace

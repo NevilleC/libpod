@@ -1,4 +1,4 @@
-// +build !linux
+//go:build !linux && !(freebsd && cgo)
 
 package mount
 

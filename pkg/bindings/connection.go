@@ -1,32 +1,27 @@
 package bindings
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/user"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/blang/semver"
-	"github.com/containers/podman/v2/pkg/terminal"
-	jsoniter "github.com/json-iterator/go"
-	"github.com/pkg/errors"
+	"github.com/blang/semver/v4"
+	"github.com/containers/common/pkg/ssh"
+	"github.com/containers/podman/v5/version"
+	"github.com/kevinburke/ssh_config"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
-)
-
-var (
-	BasePath = &url.URL{
-		Scheme: "http",
-		Host:   "d",
-		Path:   "/v" + APIVersion.String() + "/libpod",
-	}
+	"golang.org/x/net/proxy"
 )
 
 type APIResponse struct {
@@ -42,16 +37,40 @@ type Connection struct {
 type valueKey string
 
 const (
-	clientKey = valueKey("Client")
+	clientKey  = valueKey("Client")
+	versionKey = valueKey("ServiceVersion")
 )
+
+type ConnectError struct {
+	Err error
+}
+
+func (c ConnectError) Error() string {
+	return "unable to connect to Podman socket: " + c.Err.Error()
+}
+
+func (c ConnectError) Unwrap() error {
+	return c.Err
+}
+
+func newConnectError(err error) error {
+	return ConnectError{Err: err}
+}
 
 // GetClient from context build by NewConnection()
 func GetClient(ctx context.Context) (*Connection, error) {
-	c, ok := ctx.Value(clientKey).(*Connection)
-	if !ok {
-		return nil, errors.Errorf("ClientKey not set in context")
+	if c, ok := ctx.Value(clientKey).(*Connection); ok {
+		return c, nil
 	}
-	return c, nil
+	return nil, fmt.Errorf("%s not set in context", clientKey)
+}
+
+// ServiceVersion from context build by NewConnection()
+func ServiceVersion(ctx context.Context) *semver.Version {
+	if v, ok := ctx.Value(versionKey).(*semver.Version); ok {
+		return v
+	}
+	return new(semver.Version)
 }
 
 // JoinURL elements with '/'
@@ -59,22 +78,22 @@ func JoinURL(elements ...string) string {
 	return "/" + strings.Join(elements, "/")
 }
 
+// NewConnection creates a new service connection without an identity
 func NewConnection(ctx context.Context, uri string) (context.Context, error) {
-	return NewConnectionWithIdentity(ctx, uri, "")
+	return NewConnectionWithIdentity(ctx, uri, "", false)
 }
 
-// NewConnection takes a URI as a string and returns a context with the
+// NewConnectionWithIdentity takes a URI as a string and returns a context with the
 // Connection embedded as a value.  This context needs to be passed to each
 // endpoint to work correctly.
 //
 // A valid URI connection should be scheme://
 // For example tcp://localhost:<port>
 // or unix:///run/podman/podman.sock
-// or ssh://<user>@<host>[:port]/run/podman/podman.sock?secure=True
-func NewConnectionWithIdentity(ctx context.Context, uri string, identity string) (context.Context, error) {
+// or ssh://<user>@<host>[:port]/run/podman/podman.sock
+func NewConnectionWithIdentity(ctx context.Context, uri string, identity string, machine bool) (context.Context, error) {
 	var (
-		err    error
-		secure bool
+		err error
 	)
 	if v, found := os.LookupEnv("CONTAINER_HOST"); found && uri == "" {
 		uri = v
@@ -84,25 +103,20 @@ func NewConnectionWithIdentity(ctx context.Context, uri string, identity string)
 		identity = v
 	}
 
-	passPhrase := ""
-	if v, found := os.LookupEnv("CONTAINER_PASSPHRASE"); found {
-		passPhrase = v
-	}
-
 	_url, err := url.Parse(uri)
 	if err != nil {
-		return nil, errors.Wrapf(err, "Value of CONTAINER_HOST is not a valid url: %s", uri)
+		return nil, fmt.Errorf("value of CONTAINER_HOST is not a valid url: %s: %w", uri, err)
 	}
 
-	// Now we setup the http Client to use the connection above
+	// Now we set up the http Client to use the connection above
 	var connection Connection
 	switch _url.Scheme {
 	case "ssh":
-		secure, err = strconv.ParseBool(_url.Query().Get("secure"))
+		conn, err := sshClient(_url, uri, identity, machine)
 		if err != nil {
-			secure = false
+			return nil, err
 		}
-		connection, err = sshClient(_url, secure, passPhrase, identity)
+		connection = conn
 	case "unix":
 		if !strings.HasPrefix(uri, "unix:///") {
 			// autofix unix://path_element vs unix:///path_element
@@ -114,148 +128,220 @@ func NewConnectionWithIdentity(ctx context.Context, uri string, identity string)
 		if !strings.HasPrefix(uri, "tcp://") {
 			return nil, errors.New("tcp URIs should begin with tcp://")
 		}
-		connection = tcpClient(_url)
+		conn, err := tcpClient(_url)
+		if err != nil {
+			return nil, newConnectError(err)
+		}
+		connection = conn
 	default:
-		return nil, errors.Errorf("unable to create connection. %q is not a supported schema", _url.Scheme)
-	}
-	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to create %sClient", _url.Scheme)
+		return nil, fmt.Errorf("unable to create connection. %q is not a supported schema", _url.Scheme)
 	}
 
 	ctx = context.WithValue(ctx, clientKey, &connection)
-	if err := pingNewConnection(ctx); err != nil {
-		return nil, err
+	serviceVersion, err := pingNewConnection(ctx)
+	if err != nil {
+		return nil, newConnectError(err)
 	}
+	ctx = context.WithValue(ctx, versionKey, serviceVersion)
 	return ctx, nil
 }
 
-func tcpClient(_url *url.URL) Connection {
+func sshClient(_url *url.URL, uri string, identity string, machine bool) (Connection, error) {
+	var (
+		err  error
+		port int
+	)
 	connection := Connection{
 		URI: _url,
 	}
+	userinfo := _url.User
+
+	if _url.Port() != "" {
+		port, err = strconv.Atoi(_url.Port())
+		if err != nil {
+			return connection, err
+		}
+	}
+
+	// only parse ssh_config when we are not connecting to a machine
+	// For machine connections we always have the full URL in the
+	// system connection so reading the file is just unnecessary.
+	if !machine {
+		alias := _url.Hostname()
+		cfg := ssh_config.DefaultUserSettings
+		cfg.IgnoreErrors = true
+		found := false
+
+		if userinfo == nil {
+			if val := cfg.Get(alias, "User"); val != "" {
+				userinfo = url.User(val)
+				found = true
+			}
+		}
+		// not in url or ssh_config so default to current user
+		if userinfo == nil {
+			u, err := user.Current()
+			if err != nil {
+				return connection, fmt.Errorf("current user could not be determined: %w", err)
+			}
+			userinfo = url.User(u.Username)
+		}
+
+		if val := cfg.Get(alias, "Hostname"); val != "" {
+			uri = val
+			found = true
+		}
+
+		if port == 0 {
+			if val := cfg.Get(alias, "Port"); val != "" {
+				if val != ssh_config.Default("Port") {
+					port, err = strconv.Atoi(val)
+					if err != nil {
+						return connection, fmt.Errorf("port is not an int: %s: %w", val, err)
+					}
+					found = true
+				}
+			}
+		}
+		// not in ssh config or url so use default 22 port
+		if port == 0 {
+			port = 22
+		}
+
+		if identity == "" {
+			if val := cfg.Get(alias, "IdentityFile"); val != "" {
+				identity = strings.Trim(val, "\"")
+				if strings.HasPrefix(identity, "~/") {
+					homedir, err := os.UserHomeDir()
+					if err != nil {
+						return connection, fmt.Errorf("failed to find home dir: %w", err)
+					}
+					identity = filepath.Join(homedir, identity[2:])
+				}
+				found = true
+			}
+		}
+
+		if found {
+			logrus.Debugf("ssh_config alias found: %s", alias)
+			logrus.Debugf("  User: %s", userinfo.Username())
+			logrus.Debugf("  Hostname: %s", uri)
+			logrus.Debugf("  Port: %d", port)
+			logrus.Debugf("  IdentityFile: %q", identity)
+		}
+	}
+	conn, err := ssh.Dial(&ssh.ConnectionDialOptions{
+		Host:                        uri,
+		Identity:                    identity,
+		User:                        userinfo,
+		Port:                        port,
+		InsecureIsMachineConnection: machine,
+	}, ssh.GolangMode)
+	if err != nil {
+		return connection, newConnectError(err)
+	}
+	if _url.Path == "" {
+		session, err := conn.NewSession()
+		if err != nil {
+			return connection, err
+		}
+		defer session.Close()
+
+		var b bytes.Buffer
+		session.Stdout = &b
+		if err := session.Run(
+			"podman info --format '{{.Host.RemoteSocket.Path}}'"); err != nil {
+			return connection, err
+		}
+		val := strings.TrimSuffix(b.String(), "\n")
+		_url.Path = val
+	}
+	dialContext := func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return ssh.DialNet(conn, "unix", _url)
+	}
 	connection.Client = &http.Client{
 		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return net.Dial("tcp", _url.Host)
-			},
+			DialContext: dialContext,
+		}}
+	return connection, nil
+}
+
+func tcpClient(_url *url.URL) (Connection, error) {
+	connection := Connection{
+		URI: _url,
+	}
+	dialContext := func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return net.Dial("tcp", _url.Host)
+	}
+	// use proxy if env `CONTAINER_PROXY` set
+	if proxyURI, found := os.LookupEnv("CONTAINER_PROXY"); found {
+		proxyURL, err := url.Parse(proxyURI)
+		if err != nil {
+			return connection, fmt.Errorf("value of CONTAINER_PROXY is not a valid url: %s: %w", proxyURI, err)
+		}
+		proxyDialer, err := proxy.FromURL(proxyURL, proxy.Direct)
+		if err != nil {
+			return connection, fmt.Errorf("unable to dial to proxy %s, %w", proxyURI, err)
+		}
+		dialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			logrus.Debugf("use proxy %s, but proxy dialer does not support dial timeout", proxyURI)
+			return proxyDialer.Dial("tcp", _url.Host)
+		}
+		if f, ok := proxyDialer.(proxy.ContextDialer); ok {
+			dialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+				// the default tcp dial timeout seems to be 75s, podman-remote will retry 3 times before exit.
+				// here we change proxy dial timeout to 3s
+				logrus.Debugf("use proxy %s with dial timeout 3s", proxyURI)
+				ctx, cancel := context.WithTimeout(ctx, time.Second*3)
+				defer cancel() // It's safe to cancel, `f.DialContext` only use ctx for returning the Conn, not the lifetime of the Conn.
+				return f.DialContext(ctx, "tcp", _url.Host)
+			}
+		}
+	}
+	connection.Client = &http.Client{
+		Transport: &http.Transport{
+			DialContext:        dialContext,
 			DisableCompression: true,
 		},
 	}
-	return connection
+	return connection, nil
 }
 
 // pingNewConnection pings to make sure the RESTFUL service is up
 // and running. it should only be used when initializing a connection
-func pingNewConnection(ctx context.Context) error {
+func pingNewConnection(ctx context.Context) (*semver.Version, error) {
 	client, err := GetClient(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// the ping endpoint sits at / in this case
-	response, err := client.DoRequest(nil, http.MethodGet, "../../../_ping", nil, nil)
+	response, err := client.DoRequest(ctx, nil, http.MethodGet, "/_ping", nil, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	defer response.Body.Close()
 
 	if response.StatusCode == http.StatusOK {
 		versionHdr := response.Header.Get("Libpod-API-Version")
 		if versionHdr == "" {
-			logrus.Info("Service did not provide Libpod-API-Version Header")
-			return nil
+			logrus.Warn("Service did not provide Libpod-API-Version Header")
+			return new(semver.Version), nil
 		}
 		versionSrv, err := semver.ParseTolerant(versionHdr)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
-		switch APIVersion.Compare(versionSrv) {
+		switch version.APIVersion[version.Libpod][version.MinimalAPI].Compare(versionSrv) {
 		case -1, 0:
 			// Server's job when Client version is equal or older
-			return nil
+			return &versionSrv, nil
 		case 1:
-			return errors.Errorf("server API version is too old. Client %q server %q", APIVersion.String(), versionSrv.String())
+			return nil, fmt.Errorf("server API version is too old. Client %q server %q",
+				version.APIVersion[version.Libpod][version.MinimalAPI].String(), versionSrv.String())
 		}
 	}
-	return errors.Errorf("ping response was %q", response.StatusCode)
-}
-
-func sshClient(_url *url.URL, secure bool, passPhrase string, identity string) (Connection, error) {
-	// if you modify the authmethods or their conditionals, you will also need to make similar
-	// changes in the client (currently cmd/podman/system/connection/add getUDS).
-	authMethods := []ssh.AuthMethod{}
-	if len(identity) > 0 {
-		auth, err := terminal.PublicKey(identity, []byte(passPhrase))
-		if err != nil {
-			return Connection{}, errors.Wrapf(err, "failed to parse identity %q", identity)
-		}
-		logrus.Debugf("public key signer enabled for identity %q", identity)
-		authMethods = append(authMethods, auth)
-	}
-
-	if sock, found := os.LookupEnv("SSH_AUTH_SOCK"); found {
-		logrus.Debugf("Found SSH_AUTH_SOCK %q, ssh-agent signer enabled", sock)
-
-		c, err := net.Dial("unix", sock)
-		if err != nil {
-			return Connection{}, err
-		}
-		a := agent.NewClient(c)
-		authMethods = append(authMethods, ssh.PublicKeysCallback(a.Signers))
-	}
-
-	if pw, found := _url.User.Password(); found {
-		authMethods = append(authMethods, ssh.Password(pw))
-	}
-	if len(authMethods) == 0 {
-		pass, err := terminal.ReadPassword("Login password:")
-		if err != nil {
-			return Connection{}, err
-		}
-		authMethods = append(authMethods, ssh.Password(string(pass)))
-	}
-
-	callback := ssh.InsecureIgnoreHostKey()
-	if secure {
-		key := terminal.HostKey(_url.Hostname())
-		if key != nil {
-			callback = ssh.FixedHostKey(key)
-		}
-	}
-
-	port := _url.Port()
-	if port == "" {
-		port = "22"
-	}
-
-	bastion, err := ssh.Dial("tcp",
-		net.JoinHostPort(_url.Hostname(), port),
-		&ssh.ClientConfig{
-			User:            _url.User.Username(),
-			Auth:            authMethods,
-			HostKeyCallback: callback,
-			HostKeyAlgorithms: []string{
-				ssh.KeyAlgoRSA,
-				ssh.KeyAlgoDSA,
-				ssh.KeyAlgoECDSA256,
-				ssh.KeyAlgoECDSA384,
-				ssh.KeyAlgoECDSA521,
-				ssh.KeyAlgoED25519,
-			},
-			Timeout: 5 * time.Second,
-		},
-	)
-	if err != nil {
-		return Connection{}, errors.Wrapf(err, "Connection to bastion host (%s) failed.", _url.String())
-	}
-
-	connection := Connection{URI: _url}
-	connection.Client = &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return bastion.Dial("unix", _url.Path)
-			},
-		}}
-	return connection, nil
+	return nil, fmt.Errorf("ping response was %d", response.StatusCode)
 }
 
 func unixClient(_url *url.URL) Connection {
@@ -271,35 +357,59 @@ func unixClient(_url *url.URL) Connection {
 	return connection
 }
 
-// DoRequest assembles the http request and returns the response
-func (c *Connection) DoRequest(httpBody io.Reader, httpMethod, endpoint string, queryParams url.Values, header map[string]string, pathValues ...string) (*APIResponse, error) {
+// DoRequest assembles the http request and returns the response.
+// The caller must close the response body.
+func (c *Connection) DoRequest(ctx context.Context, httpBody io.Reader, httpMethod, endpoint string, queryParams url.Values, headers http.Header, pathValues ...string) (*APIResponse, error) {
 	var (
 		err      error
 		response *http.Response
 	)
-	safePathValues := make([]interface{}, len(pathValues))
-	// Make sure path values are http url safe
-	for i, pv := range pathValues {
-		safePathValues[i] = url.PathEscape(pv)
+
+	params := make([]interface{}, len(pathValues)+1)
+
+	if v := headers.Values("API-Version"); len(v) > 0 {
+		params[0] = v[0]
+	} else {
+		// Including the semver suffices breaks older services... so do not include them
+		v := version.APIVersion[version.Libpod][version.CurrentAPI]
+		params[0] = fmt.Sprintf("%d.%d.%d", v.Major, v.Minor, v.Patch)
 	}
-	// Lets eventually use URL for this which might lead to safer
-	// usage
-	safeEndpoint := fmt.Sprintf(endpoint, safePathValues...)
-	e := BasePath.String() + safeEndpoint
-	req, err := http.NewRequest(httpMethod, e, httpBody)
+
+	for i, pv := range pathValues {
+		// url.URL lacks the semantics for escaping embedded path parameters... so we manually
+		//   escape each one and assume the caller included the correct formatting in "endpoint"
+		params[i+1] = url.PathEscape(pv)
+	}
+
+	baseURL := "http://d"
+	if c.URI.Scheme == "tcp" {
+		// Allow path prefixes for tcp connections to match Docker behavior
+		baseURL = "http://" + c.URI.Host + c.URI.Path
+	}
+	uri := fmt.Sprintf(baseURL+"/v%s/libpod"+endpoint, params...)
+	logrus.Debugf("DoRequest Method: %s URI: %v", httpMethod, uri)
+
+	req, err := http.NewRequestWithContext(ctx, httpMethod, uri, httpBody)
 	if err != nil {
 		return nil, err
 	}
 	if len(queryParams) > 0 {
 		req.URL.RawQuery = queryParams.Encode()
 	}
-	for key, val := range header {
-		req.Header.Set(key, val)
+
+	for key, val := range headers {
+		if key == "API-Version" {
+			continue
+		}
+
+		for _, v := range val {
+			req.Header.Add(key, v)
+		}
 	}
-	req = req.WithContext(context.WithValue(context.Background(), clientKey, c))
+
 	// Give the Do three chances in the case of a comm/service hiccup
-	for i := 0; i < 3; i++ {
-		response, err = c.Client.Do(req) // nolint
+	for i := 1; i <= 3; i++ {
+		response, err = c.Client.Do(req) //nolint:bodyclose // The caller has to close the body.
 		if err == nil {
 			break
 		}
@@ -308,37 +418,48 @@ func (c *Connection) DoRequest(httpBody io.Reader, httpMethod, endpoint string, 
 	return &APIResponse{response, req}, err
 }
 
-// FiltersToString converts our typical filter format of a
-// map[string][]string to a query/html safe string.
-func FiltersToString(filters map[string][]string) (string, error) {
-	lowerCaseKeys := make(map[string][]string)
-	for k, v := range filters {
-		lowerCaseKeys[strings.ToLower(k)] = v
+// GetDialer returns raw Transport.DialContext from client
+func (c *Connection) GetDialer(ctx context.Context) (net.Conn, error) {
+	client := c.Client
+	transport := client.Transport.(*http.Transport)
+	if transport.DialContext != nil && transport.TLSClientConfig == nil {
+		return transport.DialContext(ctx, c.URI.Scheme, c.URI.String())
 	}
-	return jsoniter.MarshalToString(lowerCaseKeys)
+
+	return nil, errors.New("unable to get dial context")
 }
 
-// IsInformation returns true if the response code is 1xx
+// IsInformational returns true if the response code is 1xx
 func (h *APIResponse) IsInformational() bool {
+	//nolint:usestdlibvars // linter wants to use http.StatusContinue over 100 but that makes less readable IMO
 	return h.Response.StatusCode/100 == 1
 }
 
 // IsSuccess returns true if the response code is 2xx
 func (h *APIResponse) IsSuccess() bool {
+	//nolint:usestdlibvars // linter wants to use http.StatusContinue over 100 but that makes less readable IMO
 	return h.Response.StatusCode/100 == 2
 }
 
 // IsRedirection returns true if the response code is 3xx
 func (h *APIResponse) IsRedirection() bool {
+	//nolint:usestdlibvars // linter wants to use http.StatusContinue over 100 but that makes less readable IMO
 	return h.Response.StatusCode/100 == 3
 }
 
 // IsClientError returns true if the response code is 4xx
 func (h *APIResponse) IsClientError() bool {
+	//nolint:usestdlibvars // linter wants to use http.StatusContinue over 100 but that makes less readable IMO
 	return h.Response.StatusCode/100 == 4
+}
+
+// IsConflictError returns true if the response code is 409
+func (h *APIResponse) IsConflictError() bool {
+	return h.Response.StatusCode == http.StatusConflict
 }
 
 // IsServerError returns true if the response code is 5xx
 func (h *APIResponse) IsServerError() bool {
+	//nolint:usestdlibvars // linter wants to use http.StatusContinue over 100 but that makes less readable IMO
 	return h.Response.StatusCode/100 == 5
 }

@@ -4,10 +4,11 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containers/podman/v2/cmd/podman/registry"
-	"github.com/containers/podman/v2/cmd/podman/utils"
-	"github.com/containers/podman/v2/cmd/podman/validate"
-	"github.com/containers/podman/v2/pkg/domain/entities"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
 )
 
@@ -16,16 +17,16 @@ var (
 
   The pod name or ID can be used.`
 	unpauseCommand = &cobra.Command{
-		Use:   "unpause [flags] POD [POD...]",
+		Use:   "unpause [options] POD [POD...]",
 		Short: "Unpause one or more pods",
 		Long:  podUnpauseDescription,
 		RunE:  unpause,
 		Args: func(cmd *cobra.Command, args []string) error {
-			return validate.CheckAllLatestAndCIDFile(cmd, args, false, false)
+			return validate.CheckAllLatestAndIDFile(cmd, args, false, "")
 		},
+		ValidArgsFunction: common.AutoCompletePodsPause,
 		Example: `podman pod unpause podID1 podID2
-  podman pod unpause --all
-  podman pod unpause --latest`,
+  podman pod unpause --all`,
 	}
 )
 
@@ -35,12 +36,11 @@ var (
 
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
-		Mode:    []entities.EngineMode{entities.ABIMode, entities.TunnelMode},
 		Command: unpauseCommand,
 		Parent:  podCmd,
 	})
 	flags := unpauseCommand.Flags()
-	flags.BoolVarP(&unpauseOptions.All, "all", "a", false, "Pause all running pods")
+	flags.BoolVarP(&unpauseOptions.All, "all", "a", false, "Unpause all running pods")
 	validate.AddLatestFlag(unpauseCommand, &unpauseOptions.Latest)
 }
 

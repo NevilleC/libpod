@@ -1,35 +1,70 @@
+//go:build !remote
+
 package abi
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/containers/podman/v2/libpod/define"
-	"github.com/containers/podman/v2/libpod/image"
-	"github.com/containers/podman/v2/pkg/domain/entities"
-	envLib "github.com/containers/podman/v2/pkg/env"
-	"github.com/containers/podman/v2/utils"
+	"github.com/containers/common/libimage"
+	"github.com/containers/common/pkg/config"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	envLib "github.com/containers/podman/v5/pkg/env"
+	"github.com/containers/podman/v5/utils"
+	"github.com/containers/storage/pkg/fileutils"
 	"github.com/google/shlex"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
 func (ic *ContainerEngine) ContainerRunlabel(ctx context.Context, label string, imageRef string, args []string, options entities.ContainerRunlabelOptions) error {
-	// First, get the image and pull it if needed.
-	img, err := ic.runlabelImage(ctx, label, imageRef, options)
-	if err != nil {
-		return err
+	pullOptions := &libimage.PullOptions{}
+	pullOptions.AuthFilePath = options.Authfile
+	pullOptions.CertDirPath = options.CertDir
+	pullOptions.Credentials = options.Credentials
+	pullOptions.SignaturePolicyPath = options.SignaturePolicy
+	pullOptions.InsecureSkipTLSVerify = options.SkipTLSVerify
+
+	pullPolicy := config.PullPolicyNever
+	if options.Pull {
+		pullPolicy = config.PullPolicyMissing
 	}
-	// Extract the runlabel from the image.
-	runlabel, err := img.GetLabel(ctx, label)
+	if !options.Quiet {
+		pullOptions.Writer = os.Stderr
+	}
+
+	pulledImages, err := ic.Libpod.LibimageRuntime().Pull(ctx, imageRef, pullPolicy, pullOptions)
 	if err != nil {
 		return err
 	}
 
-	cmd, env, err := generateRunlabelCommand(runlabel, img, args, options)
+	if len(pulledImages) != 1 {
+		return errors.New("internal error: expected an image to be pulled (or an error)")
+	}
+
+	// Extract the runlabel from the image.
+	labels, err := pulledImages[0].Labels(ctx)
+	if err != nil {
+		return err
+	}
+
+	var runlabel string
+	for k, v := range labels {
+		if strings.EqualFold(k, label) {
+			runlabel = v
+			break
+		}
+	}
+	if runlabel == "" {
+		return fmt.Errorf("cannot find the value of label: %s in image: %s", label, imageRef)
+	}
+
+	cmd, env, err := generateRunlabelCommand(runlabel, pulledImages[0], imageRef, args, options)
 	if err != nil {
 		return err
 	}
@@ -55,13 +90,14 @@ func (ic *ContainerEngine) ContainerRunlabel(ctx context.Context, label string, 
 				name := cmd[i+1]
 				ctr, err := ic.Libpod.LookupContainer(name)
 				if err != nil {
-					if errors.Cause(err) != define.ErrNoSuchCtr {
-						logrus.Debugf("Error occurred searching for container %s: %s", name, err.Error())
+					if !errors.Is(err, define.ErrNoSuchCtr) {
+						logrus.Debugf("Error occurred searching for container %s: %v", name, err)
 						return err
 					}
 				} else {
 					logrus.Debugf("Runlabel --replace option given. Container %s will be deleted. The new container will be named %s", ctr.ID(), name)
-					if err := ic.Libpod.RemoveContainer(ctx, ctr, true, false); err != nil {
+					var timeout *uint
+					if err := ic.Libpod.RemoveContainer(ctx, ctr, true, false, timeout); err != nil {
 						return err
 					}
 				}
@@ -73,61 +109,37 @@ func (ic *ContainerEngine) ContainerRunlabel(ctx context.Context, label string, 
 	return utils.ExecCmdWithStdStreams(stdIn, stdOut, stdErr, env, cmd[0], cmd[1:]...)
 }
 
-// runlabelImage returns an image based on the specified image AND options.
-func (ic *ContainerEngine) runlabelImage(ctx context.Context, label string, imageRef string, options entities.ContainerRunlabelOptions) (*image.Image, error) {
-	// First, look up the image locally. If we get an error and requested
-	// to pull, fallthrough and pull it.
-	img, err := ic.Libpod.ImageRuntime().NewFromLocal(imageRef)
-	switch {
-	case err == nil:
-		return img, nil
-	case !options.Pull:
-		return nil, err
-	default:
-		// Fallthrough and pull!
-	}
-
-	pullOptions := entities.ImagePullOptions{
-		Quiet:           options.Quiet,
-		CertDir:         options.CertDir,
-		SkipTLSVerify:   options.SkipTLSVerify,
-		SignaturePolicy: options.SignaturePolicy,
-		Authfile:        options.Authfile,
-	}
-	if _, err := pull(ctx, ic.Libpod.ImageRuntime(), imageRef, pullOptions, &label); err != nil {
-		return nil, err
-	}
-	return ic.Libpod.ImageRuntime().NewFromLocal(imageRef)
-}
-
 // generateRunlabelCommand generates the to-be-executed command as a string
 // slice along with a base environment.
-func generateRunlabelCommand(runlabel string, img *image.Image, args []string, options entities.ContainerRunlabelOptions) ([]string, []string, error) {
+func generateRunlabelCommand(runlabel string, img *libimage.Image, inputName string, args []string, options entities.ContainerRunlabelOptions) ([]string, []string, error) {
 	var (
 		err             error
 		name, imageName string
-		globalOpts      string
 		cmd             []string
 	)
 
-	// TODO: How do we get global opts as done in v1?
-
 	// Extract the imageName (or ID).
-	imgNames := img.Names()
+	imgNames := img.NamesHistory()
 	if len(imgNames) == 0 {
 		imageName = img.ID()
 	} else {
+		// The newest name is the first entry in the `NamesHistory`
+		// slice.
 		imageName = imgNames[0]
 	}
 
 	// Use the user-specified name or extract one from the image.
-	if options.Name != "" {
-		name = options.Name
-	} else {
-		name, err = image.GetImageBaseName(imageName)
-		if err != nil {
-			return nil, nil, err
+	name = options.Name
+	if name == "" {
+		normalize := imageName
+		if !strings.HasPrefix(img.ID(), inputName) {
+			normalize = inputName
 		}
+		splitImageName := strings.Split(normalize, "/")
+		name = splitImageName[len(splitImageName)-1]
+		// make sure to remove the tag from the image name, otherwise the name cannot
+		// be used as container name because a colon is an illegal character
+		name, _, _ = strings.Cut(name, ":")
 	}
 
 	// Append the user-specified arguments to the runlabel (command).
@@ -135,7 +147,7 @@ func generateRunlabelCommand(runlabel string, img *image.Image, args []string, o
 		runlabel = fmt.Sprintf("%s %s", runlabel, strings.Join(args, " "))
 	}
 
-	cmd, err = generateCommand(runlabel, imageName, name, globalOpts)
+	cmd, err = generateCommand(runlabel, imageName, name)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -159,10 +171,17 @@ func generateRunlabelCommand(runlabel string, img *image.Image, args []string, o
 			// I would prefer to use os.getenv but it appears PWD is not in the os env list.
 			d, err := os.Getwd()
 			if err != nil {
-				logrus.Error("unable to determine current working directory")
+				logrus.Error("Unable to determine current working directory")
 				return ""
 			}
 			return d
+		case "HOME":
+			h, err := os.UserHomeDir()
+			if err != nil {
+				logrus.Warnf("Unable to determine user's home directory: %s", err)
+				return ""
+			}
+			return h
 		}
 		return ""
 	}
@@ -174,8 +193,33 @@ func generateRunlabelCommand(runlabel string, img *image.Image, args []string, o
 	return cmd, env, nil
 }
 
+func replaceName(arg, name string) string {
+	if arg == "NAME" {
+		return name
+	}
+
+	newarg := strings.ReplaceAll(arg, "$NAME", name)
+	newarg = strings.ReplaceAll(newarg, "${NAME}", name)
+	if strings.HasSuffix(newarg, "=NAME") {
+		newarg = strings.ReplaceAll(newarg, "=NAME", fmt.Sprintf("=%s", name))
+	}
+	return newarg
+}
+
+func replaceImage(arg, image string) string {
+	if arg == "IMAGE" {
+		return image
+	}
+	newarg := strings.ReplaceAll(arg, "$IMAGE", image)
+	newarg = strings.ReplaceAll(newarg, "${IMAGE}", image)
+	if strings.HasSuffix(newarg, "=IMAGE") {
+		newarg = strings.ReplaceAll(newarg, "=IMAGE", fmt.Sprintf("=%s", image))
+	}
+	return newarg
+}
+
 // generateCommand takes a label (string) and converts it to an executable command
-func generateCommand(command, imageName, name, globalOpts string) ([]string, error) {
+func generateCommand(command, imageName, name string) ([]string, error) {
 	if name == "" {
 		name = imageName
 	}
@@ -193,26 +237,13 @@ func generateCommand(command, imageName, name, globalOpts string) ([]string, err
 	for _, arg := range cmd[1:] {
 		var newArg string
 		switch arg {
-		case "IMAGE":
-			newArg = imageName
-		case "$IMAGE":
-			newArg = imageName
 		case "IMAGE=IMAGE":
 			newArg = fmt.Sprintf("IMAGE=%s", imageName)
-		case "IMAGE=$IMAGE":
-			newArg = fmt.Sprintf("IMAGE=%s", imageName)
-		case "NAME":
-			newArg = name
 		case "NAME=NAME":
 			newArg = fmt.Sprintf("NAME=%s", name)
-		case "NAME=$NAME":
-			newArg = fmt.Sprintf("NAME=%s", name)
-		case "$NAME":
-			newArg = name
-		case "$GLOBAL_OPTS":
-			newArg = globalOpts
 		default:
-			newArg = arg
+			newArg = replaceName(arg, name)
+			newArg = replaceImage(newArg, imageName)
 		}
 		newCommand = append(newCommand, newArg)
 	}
@@ -256,7 +287,7 @@ func substituteCommand(cmd string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if _, err := os.Stat(res); !os.IsNotExist(err) {
+		if err := fileutils.Exists(res); !errors.Is(err, fs.ErrNotExist) {
 			return res, nil
 		} else if err != nil {
 			return "", err

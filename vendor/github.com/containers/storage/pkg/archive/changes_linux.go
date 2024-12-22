@@ -2,6 +2,7 @@ package archive
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -29,8 +30,8 @@ type walker struct {
 	dir2   string
 	root1  *FileInfo
 	root2  *FileInfo
-	idmap1 *idtools.IDMappings
-	idmap2 *idtools.IDMappings
+	idmap1 *idtools.IDMappings //nolint:unused
+	idmap2 *idtools.IDMappings //nolint:unused
 }
 
 // collectFileInfoForChanges returns a complete representation of the trees
@@ -86,21 +87,21 @@ func walkchunk(path string, fi os.FileInfo, dir string, root *FileInfo) error {
 	}
 	info.stat = stat
 	info.capability, err = system.Lgetxattr(cpath, "security.capability") // lgetxattr(2): fs access
-	if err != nil && err != system.EOPNOTSUPP {
+	if err != nil && !errors.Is(err, system.EOPNOTSUPP) {
 		return err
 	}
 	xattrs, err := system.Llistxattr(cpath)
-	if err != nil && err != system.EOPNOTSUPP {
+	if err != nil && !errors.Is(err, system.EOPNOTSUPP) {
 		return err
 	}
 	for _, key := range xattrs {
 		if strings.HasPrefix(key, "user.") {
 			value, err := system.Lgetxattr(cpath, key)
-			if err == system.E2BIG {
-				logrus.Errorf("archive: Skipping xattr for file %s since value is too big: %s", cpath, key)
-				continue
-			}
 			if err != nil {
+				if errors.Is(err, system.E2BIG) {
+					logrus.Errorf("archive: Skipping xattr for file %s since value is too big: %s", cpath, key)
+					continue
+				}
 				return err
 			}
 			if info.xattrs == nil {
@@ -295,8 +296,14 @@ func parseDirent(buf []byte, names []nameIno) (consumed int, newnames []nameIno)
 		if dirent.Ino == 0 { // File absent in directory.
 			continue
 		}
-		bytes := (*[10000]byte)(unsafe.Pointer(&dirent.Name[0]))
-		var name = string(bytes[0:clen(bytes[:])])
+		builder := make([]byte, 0, dirent.Reclen)
+		for i := 0; i < len(dirent.Name); i++ {
+			if dirent.Name[i] == 0 {
+				break
+			}
+			builder = append(builder, byte(dirent.Name[i]))
+		}
+		name := string(builder)
 		if name == "." || name == ".." { // Useless names
 			continue
 		}
@@ -305,20 +312,15 @@ func parseDirent(buf []byte, names []nameIno) (consumed int, newnames []nameIno)
 	return origlen - len(buf), names
 }
 
-func clen(n []byte) int {
-	for i := 0; i < len(n); i++ {
-		if n[i] == 0 {
-			return i
-		}
-	}
-	return len(n)
-}
-
 // OverlayChanges walks the path rw and determines changes for the files in the path,
 // with respect to the parent layers
 func OverlayChanges(layers []string, rw string) ([]Change, error) {
 	dc := func(root, path string, fi os.FileInfo) (string, error) {
-		return overlayDeletedFile(layers, root, path, fi)
+		r, err := overlayDeletedFile(layers, root, path, fi)
+		if err != nil {
+			return "", fmt.Errorf("overlay deleted file query: %w", err)
+		}
+		return r, nil
 	}
 	return changes(layers, rw, dc, nil, overlayLowerContainsWhiteout)
 }
@@ -351,9 +353,9 @@ func overlayDeletedFile(layers []string, root, path string, fi os.FileInfo) (str
 		return "", nil
 	}
 	// If the directory isn't marked as opaque, then it's just a normal directory.
-	opaque, err := system.Lgetxattr(filepath.Join(root, path), "trusted.overlay.opaque")
+	opaque, err := system.Lgetxattr(filepath.Join(root, path), getOverlayOpaqueXattrName())
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed querying overlay opaque xattr: %w", err)
 	}
 	if len(opaque) != 1 || opaque[0] != 'y' {
 		return "", err
@@ -399,5 +401,4 @@ func overlayDeletedFile(layers []string, root, path string, fi os.FileInfo) (str
 
 	// We didn't find the same path in any older layers, so it was new in this one.
 	return "", nil
-
 }

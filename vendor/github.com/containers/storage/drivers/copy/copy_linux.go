@@ -1,4 +1,4 @@
-// +build cgo
+//go:build cgo
 
 package copy
 
@@ -10,8 +10,10 @@ package copy
 #endif
 */
 import "C"
+
 import (
 	"container/list"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -23,7 +25,7 @@ import (
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/containers/storage/pkg/pools"
 	"github.com/containers/storage/pkg/system"
-	rsystem "github.com/opencontainers/runc/libcontainer/system"
+	"github.com/containers/storage/pkg/unshare"
 	"golang.org/x/sys/unix"
 )
 
@@ -37,28 +39,22 @@ const (
 	Hardlink
 )
 
-func copyRegular(srcPath, dstPath string, fileinfo os.FileInfo, copyWithFileRange, copyWithFileClone *bool) error {
+// CopyRegularToFile copies the content of a file to another
+func CopyRegularToFile(srcPath string, dstFile *os.File, fileinfo os.FileInfo, copyWithFileRange, copyWithFileClone *bool) error { // nolint: revive,golint
 	srcFile, err := os.Open(srcPath)
 	if err != nil {
 		return err
 	}
 	defer srcFile.Close()
 
-	// If the destination file already exists, we shouldn't blow it away
-	dstFile, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, fileinfo.Mode())
-	if err != nil {
-		return err
-	}
-	defer dstFile.Close()
-
 	if *copyWithFileClone {
-		_, _, err = unix.Syscall(unix.SYS_IOCTL, dstFile.Fd(), C.FICLONE, srcFile.Fd())
-		if err == nil {
+		_, _, errno := unix.Syscall(unix.SYS_IOCTL, dstFile.Fd(), C.FICLONE, srcFile.Fd())
+		if errno == 0 {
 			return nil
 		}
 
 		*copyWithFileClone = false
-		if err == unix.EXDEV {
+		if errno == unix.EXDEV {
 			*copyWithFileRange = false
 		}
 	}
@@ -73,6 +69,18 @@ func copyRegular(srcPath, dstPath string, fileinfo os.FileInfo, copyWithFileRang
 		}
 	}
 	return legacyCopy(srcFile, dstFile)
+}
+
+// CopyRegular copies the content of a file to another
+func CopyRegular(srcPath, dstPath string, fileinfo os.FileInfo, copyWithFileRange, copyWithFileClone *bool) error { // nolint: revive,golint
+	// If the destination file already exists, we shouldn't blow it away
+	dstFile, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, fileinfo.Mode())
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	return CopyRegularToFile(srcPath, dstFile, fileinfo, copyWithFileRange, copyWithFileClone)
 }
 
 func doCopyWithFileRange(srcFile, dstFile *os.File, fileinfo os.FileInfo) error {
@@ -98,7 +106,7 @@ func legacyCopy(srcFile io.Reader, dstFile io.Writer) error {
 
 func copyXattr(srcPath, dstPath, attr string) error {
 	data, err := system.Lgetxattr(srcPath, attr)
-	if err != nil && err != unix.EOPNOTSUPP {
+	if err != nil && !errors.Is(err, unix.EOPNOTSUPP) {
 		return err
 	}
 	if data != nil {
@@ -145,7 +153,7 @@ func DirCopy(srcDir, dstDir string, copyMode Mode, copyXattrs bool) error {
 		dstPath := filepath.Join(dstDir, relPath)
 		stat, ok := f.Sys().(*syscall.Stat_t)
 		if !ok {
-			return fmt.Errorf("Unable to get raw syscall.Stat_t data for %s", srcPath)
+			return fmt.Errorf("unable to get raw syscall.Stat_t data for %s", srcPath)
 		}
 
 		isHardlink := false
@@ -163,7 +171,7 @@ func DirCopy(srcDir, dstDir string, copyMode Mode, copyXattrs bool) error {
 					return err2
 				}
 			} else {
-				if err2 := copyRegular(srcPath, dstPath, f, &copyWithFileRange, &copyWithFileClone); err2 != nil {
+				if err2 := CopyRegular(srcPath, dstPath, f, &copyWithFileRange, &copyWithFileClone); err2 != nil {
 					return err2
 				}
 				copiedFiles[id] = dstPath
@@ -185,15 +193,17 @@ func DirCopy(srcDir, dstDir string, copyMode Mode, copyXattrs bool) error {
 			}
 
 		case mode&os.ModeNamedPipe != 0:
-			fallthrough
-
-		case mode&os.ModeSocket != 0:
 			if err := unix.Mkfifo(dstPath, stat.Mode); err != nil {
 				return err
 			}
 
+		case mode&os.ModeSocket != 0:
+			if err := unix.Mknod(dstPath, stat.Mode, int(stat.Rdev)); err != nil {
+				return err
+			}
+
 		case mode&os.ModeDevice != 0:
-			if rsystem.RunningInUserNS() {
+			if unshare.IsRootless() {
 				// cannot create a device if running in user namespace
 				return nil
 			}
@@ -269,7 +279,7 @@ func doCopyXattrs(srcPath, dstPath string) error {
 	}
 
 	xattrs, err := system.Llistxattr(srcPath)
-	if err != nil && err != unix.EOPNOTSUPP {
+	if err != nil && !errors.Is(err, unix.EOPNOTSUPP) {
 		return err
 	}
 
@@ -279,6 +289,10 @@ func doCopyXattrs(srcPath, dstPath string) error {
 				return err
 			}
 		}
+	}
+
+	if unshare.IsRootless() {
+		return nil
 	}
 
 	// We need to copy this attribute if it appears in an overlay upper layer, as

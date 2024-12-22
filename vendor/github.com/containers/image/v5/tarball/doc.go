@@ -2,14 +2,17 @@
 // tarballs and an optional template configuration.
 //
 // An example:
+//
 //	package main
 //
 //	import (
-//		"fmt"
+//		"context"
 //
 //		cp "github.com/containers/image/v5/copy"
+//		"github.com/containers/image/v5/signature"
 //		"github.com/containers/image/v5/tarball"
 //		"github.com/containers/image/v5/transports/alltransports"
+//		"github.com/containers/image/v5/types"
 //		imgspecv1 "github.com/opencontainers/image-spec/specs-go/v1"
 //	)
 //
@@ -39,7 +42,18 @@
 //		if err != nil {
 //			panic(err)
 //		}
-//		err = cp.Image(nil, dest, src, nil)
+//
+//		policy, err := signature.DefaultPolicy(nil)
+//		if err != nil {
+//			panic(err)
+//		}
+//
+//		pc, err := signature.NewPolicyContext(policy)
+//		if err != nil {
+//			panic(err)
+//		}
+//		defer pc.Destroy()
+//		_, err = cp.Image(context.TODO(), pc, dest, src, nil)
 //		if err != nil {
 //			panic(err)
 //		}

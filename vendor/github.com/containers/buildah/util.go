@@ -1,6 +1,8 @@
 package buildah
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -16,7 +18,6 @@ import (
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/selinux/go-selinux/label"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -25,20 +26,6 @@ import (
 // immediately.
 func InitReexec() bool {
 	return reexec.Init()
-}
-
-func copyStringStringMap(m map[string]string) map[string]string {
-	n := map[string]string{}
-	for k, v := range m {
-		n[k] = v
-	}
-	return n
-}
-
-func copyStringSlice(s []string) []string {
-	t := make([]string, len(s))
-	copy(t, s)
-	return t
 }
 
 func copyHistory(history []v1.History) []v1.History {
@@ -107,7 +94,7 @@ func convertRuntimeIDMaps(UIDMap, GIDMap []rspec.LinuxIDMapping) ([]idtools.IDMa
 func isRegistryBlocked(registry string, sc *types.SystemContext) (bool, error) {
 	reginfo, err := sysregistriesv2.FindRegistry(sc, registry)
 	if err != nil {
-		return false, errors.Wrapf(err, "unable to parse the registries configuration (%s)", sysregistriesv2.ConfigPath(sc))
+		return false, fmt.Errorf("unable to parse the registries configuration (%s): %w", sysregistriesv2.ConfigPath(sc), err)
 	}
 	if reginfo != nil {
 		if reginfo.Blocked {
@@ -123,8 +110,8 @@ func isRegistryBlocked(registry string, sc *types.SystemContext) (bool, error) {
 
 // isReferenceSomething checks if the registry part of a reference is insecure or blocked
 func isReferenceSomething(ref types.ImageReference, sc *types.SystemContext, what func(string, *types.SystemContext) (bool, error)) (bool, error) {
-	if ref != nil && ref.DockerReference() != nil {
-		if named, ok := ref.DockerReference().(reference.Named); ok {
+	if ref != nil {
+		if named := ref.DockerReference(); named != nil {
 			if domain := reference.Domain(named); domain != "" {
 				return what(domain, sc)
 			}
@@ -150,26 +137,25 @@ func ReserveSELinuxLabels(store storage.Store, id string) error {
 	if selinuxGetEnabled() {
 		containers, err := store.Containers()
 		if err != nil {
-			return errors.Wrapf(err, "error getting list of containers")
+			return fmt.Errorf("getting list of containers: %w", err)
 		}
 
 		for _, c := range containers {
 			if id == c.ID {
 				continue
-			} else {
-				b, err := OpenBuilder(store, c.ID)
-				if err != nil {
-					if os.IsNotExist(errors.Cause(err)) {
-						// Ignore not exist errors since containers probably created by other tool
-						// TODO, we need to read other containers json data to reserve their SELinux labels
-						continue
-					}
-					return err
+			}
+			b, err := OpenBuilder(store, c.ID)
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					// Ignore not exist errors since containers probably created by other tool
+					// TODO, we need to read other containers json data to reserve their SELinux labels
+					continue
 				}
-				// Prevent different containers from using same MCS label
-				if err := label.ReserveLabel(b.ProcessLabel); err != nil {
-					return errors.Wrapf(err, "error reserving SELinux label %q", b.ProcessLabel)
-				}
+				return err
+			}
+			// Prevent different containers from using same MCS label
+			if err := label.ReserveLabel(b.ProcessLabel); err != nil {
+				return fmt.Errorf("reserving SELinux label %q: %w", b.ProcessLabel, err)
 			}
 		}
 	}
@@ -186,10 +172,10 @@ func IsContainer(id string, store storage.Store) (bool, error) {
 	// Assuming that if the stateFile exists, that this is a Buildah
 	// container.
 	if _, err = os.Stat(filepath.Join(cdir, stateFile)); err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return false, nil
 		}
-		return false, errors.Wrapf(err, "error stating %q", filepath.Join(cdir, stateFile))
+		return false, err
 	}
 	return true, nil
 }
@@ -218,10 +204,10 @@ func extractWithTar(root, src, dest string) error {
 	wg.Wait()
 
 	if getErr != nil {
-		return errors.Wrapf(getErr, "error reading %q", src)
+		return fmt.Errorf("reading %q: %w", src, getErr)
 	}
 	if putErr != nil {
-		return errors.Wrapf(putErr, "error copying contents of %q to %q", src, dest)
+		return fmt.Errorf("copying contents of %q to %q: %w", src, dest, putErr)
 	}
 	return nil
 }
